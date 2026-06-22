@@ -1,0 +1,800 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spectrum Overview — 2 year viewer</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  /* make the `hidden` attribute authoritative even when an element also has a
+     display rule (e.g. #overlay{display:flex}, .group{display:flex}). Without
+     this the overlay stays visible and covers the heatmap. */
+  [hidden] { display: none !important; }
+  html, body { margin: 0; height: 100%; background: #0d0f14; color: #d7dae0;
+               font: 13px/1.4 ui-sans-serif, system-ui, Segoe UI, sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  header { display: flex; gap: 16px; align-items: center; padding: 8px 14px;
+           background: #151922; border-bottom: 1px solid #232836; flex-wrap: wrap; }
+  header label { color: #8b93a3; margin-right: 4px; }
+  select, button { background: #1d2330; color: #d7dae0; border: 1px solid #2c3344;
+                   border-radius: 6px; padding: 5px 9px; font: inherit; cursor: pointer; }
+  button.active { background: #2d5fd0; border-color: #3d72e8; color: #fff; }
+  .group { display: flex; gap: 6px; align-items: center; }
+  #stage { position: relative; flex: 1; overflow: hidden; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block;
+           cursor: grab; }
+  canvas.drag { cursor: grabbing; }
+  footer { padding: 6px 14px; background: #151922; border-top: 1px solid #232836;
+           color: #9aa3b4; display: flex; gap: 22px; flex-wrap: wrap; }
+  footer b { color: #d7dae0; font-weight: 600; }
+  .hint { color:#69718a; }
+  #legend { display:flex; align-items:center; gap:6px; }
+  #legend canvas { position: static; width: 120px; height: 12px; border-radius: 3px; }
+  #freqslider { position: absolute; left: 0; width: 18px; z-index: 12; cursor: pointer; }
+  #freqtrack { position: absolute; left: 7px; top: 0; width: 4px; height: 100%;
+               background: #2c3344; border-radius: 2px; }
+  #freqknob { position: absolute; left: 0; width: 18px; height: 16px; background: #2d5fd0;
+              border: 1px solid #5a86ec; border-radius: 4px; cursor: grab;
+              box-shadow: 0 1px 4px rgba(0,0,0,.6); }
+  #freqknob:hover { background: #3a6fe0; }
+  #freqknob.grab { cursor: grabbing; }
+  #loadbar { position: absolute; left: 64px; right: 14px; top: 10px; height: 2px; z-index: 14;
+             overflow: hidden; opacity: 0; transition: opacity .15s; pointer-events: none; }
+  #loadbar.on { opacity: 1; }
+  #loadbar::before { content:''; position:absolute; left:0; top:0; height:100%; width:35%;
+             background: linear-gradient(90deg, transparent, #4a7ae8, transparent);
+             animation: lb 1s linear infinite; }
+  @keyframes lb { 0%{ left:-35%; } 100%{ left:100%; } }
+  #drillMenu { position: absolute; z-index: 20; top: 6px; left: 6px; background: #1d2330;
+               border: 1px solid #2c3344; border-radius: 8px; padding: 8px; min-width: 220px;
+               box-shadow: 0 8px 24px rgba(0,0,0,.5); max-height: 70%; overflow:auto; }
+  #drillMenu h4 { margin: 6px 4px 4px; color: #8b93a3; font-size: 11px; font-weight: 600;
+                  text-transform: uppercase; letter-spacing: .04em; }
+  #drillMenu .row { padding: 5px 8px; border-radius: 5px; cursor: pointer; color:#d7dae0; }
+  #drillMenu .row:hover { background: #2d5fd0; }
+  #drillMenu .empty { padding: 5px 8px; color: #69718a; font-style: italic; }
+  #overlay { position: absolute; inset: 0; z-index: 15; background: #0d0f14;
+             display: flex; flex-direction: column; }
+  #ovBar { display: flex; align-items: center; gap: 10px; padding: 7px 12px;
+           background: #151922; border-bottom: 1px solid #232836; }
+  #crumb { color: #d7dae0; font-weight: 600; }
+  #crumb .sep { color: #69718a; font-weight: 400; margin: 0 6px; }
+  #ovCanvasWrap { flex: 1; position: relative; min-height: 0; }
+  #ovcv { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; }
+  #ovFoot { padding: 6px 12px; background: #151922; border-top: 1px solid #232836; color:#9aa3b4; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="group"><label>Sensor</label><select id="sensor"></select></div>
+    <div class="group"><label>Show</label>
+      <button data-stat="max" class="active">max</button>
+      <button data-stat="median">median</button>
+      <button data-stat="mean">mean</button>
+    </div>
+    <div class="group"><button id="reset">⤢ Full span</button></div>
+    <div class="group" id="legend"><span id="lo"></span><canvas id="cbar"></canvas><span id="hi"></span><span style="color:#69718a">dBm</span></div>
+    <div class="group" style="color:#69718a">scroll = zoom · drag = pan · zoom in for full PSD detail</div>
+  </header>
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div id="freqslider" title="Frequency zoom — drag up to zoom in, down for full band. Drag the heatmap up/down to pan frequency."><div id="freqtrack"></div><div id="freqknob"></div></div>
+    <div id="loadbar"></div>
+    <div id="drillMenu" hidden></div>
+    <div id="overlay" hidden>
+      <div id="ovBar">
+        <span id="crumb"></span>
+        <span style="flex:1"></span>
+        <span class="group" id="ovChanWrap" hidden><label>Channel</label><select id="ovChan"></select></span>
+        <button id="ovClose">✕ Close</button>
+      </div>
+      <div id="ovCanvasWrap"><canvas id="ovcv"></canvas></div>
+      <div id="ovFoot"><span id="ovReadout">—</span></div>
+    </div>
+  </div>
+  <footer>
+    <div>Window: <b id="winRange">—</b></div>
+    <div>Span: <b id="winSpan">—</b></div>
+    <div>Detail level: <b id="level">—</b></div>
+    <div>Cursor: <b id="cursor">—</b></div>
+  </footer>
+</div>
+<script>
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const stage = document.getElementById('stage');
+// Offscreen cache of the last crisp render (for stretch-while-loading).
+const cache = document.createElement('canvas');
+const cctx = cache.getContext('2d');
+
+let DPR = Math.max(1, window.devicePixelRatio || 1);
+const PAD = { l: 64, r: 14, t: 10, b: 26 };   // plot area margins (CSS px)
+
+let meta = null;
+let sensor = null;
+let stat = 'max';
+let view = { t0: 0, t1: 1 };          // epoch seconds
+let cacheView = null;                  // {t0,t1} of what's drawn in `cache`
+let data = null;                       // last fetched payload
+let scale = { lo: -110, hi: -50 };     // dBm color range
+let fetchTimer = null, fetchSeq = 0;
+
+// Second layer: the PSD detail heatmap, rendered from data server-side and
+// drawn on this same canvas when zoomed in past the summaries' usefulness.
+let layerMode = 'summary';             // 'summary' | 'psd'
+let psdImg = null, psdView = null;     // last PSD layer image + its window
+let psdAvail = false;                  // does the current sensor have PSD data?
+// Locked colour scales so colours stay fixed across zoom (reset on sensor change).
+let psdScale = null;                   // {vmin,vmax} for the PSD layer (per sensor)
+let pfpScale = {};                     // channel-freq -> {vmin,vmax} for PFP
+let summaryLock = {};                  // stat -> {lo,hi} for the summary
+const PSD_THRESHOLD = 3 * 86400;       // below this span (s), switch to PSD layer
+const enc = encodeURIComponent;
+
+// Frequency view window (Hz), independent of the time zoom. Low freq at top.
+const FULL_F0 = 3530040000, FULL_F1 = 3530040000 + 2249 * 80000;   // 3530.04..3709.96 MHz
+let viewF = { f0: FULL_F0, f1: FULL_F1 };
+const MIN_FSPAN = 1e6;                  // don't zoom frequency below 1 MHz
+
+// PFP (deepest layer): when narrowed to ~one channel AND zoomed time deep, show
+// that channel's 10 ms frame structure. X stays time; Y = frame position.
+let pfpAvail = false, pfpImg = null, pfpView = null, pfpFrameMs = 10;
+const ONE_CHANNEL = 12e6;               // freq window <= this -> focused on one channel
+const PFP_TIME_THRESHOLD = 6 * 3600;    // and time span <= this -> show the frame layer
+const DEEP_TIME = 30 * 60;              // zoom time below this -> auto-drop into PFP (PSD can't go finer)
+function nearestChannelHz(){            // channel centre nearest the freq-window centre
+  const cMHz = (viewF.f0 + viewF.f1) / 2 / 1e6;
+  return (Math.round((cMHz - 3535) / 10) * 10 + 3535) * 1e6;
+}
+
+// ---- Turbo-ish colormap (compact) -------------------------------------
+function turbo(x){
+  x = Math.min(1, Math.max(0, x));
+  const r = Math.round(255*Math.min(1,Math.max(0, 34.61 + x*(1172.33 + x*(-10793.56 + x*(33300.12 + x*(-38394.49 + x*14825.05)))))/255));
+  const g = Math.round(255*Math.min(1,Math.max(0, 23.31 + x*(557.33 + x*(1225.33 + x*(-3574.96 + x*(3520.99 + x*-1300.91)))))/255));
+  const b = Math.round(255*Math.min(1,Math.max(0, 27.2 + x*(3211.1 + x*(-15327.97 + x*(27814.0 + x*(-22569.18 + x*6838.66)))))/255));
+  return [r,g,b];
+}
+
+function fmtTs(sec){
+  const d = new Date(sec*1000);
+  return d.toISOString().replace('T',' ').replace('.000Z',' UTC').replace('Z',' UTC');
+}
+function fmtSpan(s){
+  if (s < 90) return s.toFixed(1)+' s';
+  if (s < 5400) return (s/60).toFixed(1)+' min';
+  if (s < 172800) return (s/3600).toFixed(1)+' h';
+  if (s < 63072000) return (s/86400).toFixed(1)+' days';
+  return (s/31536000).toFixed(2)+' yr';
+}
+
+function plotW(){ return cv.clientWidth - PAD.l - PAD.r; }
+function plotH(){ return cv.clientHeight - PAD.t - PAD.b; }
+function timeToX(t){ return PAD.l + (t - view.t0)/(view.t1 - view.t0) * plotW(); }
+function xToTime(x){ return view.t0 + (x - PAD.l)/plotW() * (view.t1 - view.t0); }
+function freqToY(fHz){ return PAD.t + (fHz - viewF.f0)/(viewF.f1 - viewF.f0) * plotH(); }  // low freq at top
+function yToFreq(y){ return viewF.f0 + (y - PAD.t)/plotH() * (viewF.f1 - viewF.f0); }
+
+function freqRow(freq){
+  const fs = meta.freqs, i = fs.indexOf(freq);
+  const h = plotH()/fs.length;
+  return { y: PAD.t + i*h, h: h };
+}
+
+// ---- Rendering --------------------------------------------------------
+function syncCanvasSize(){
+  const sw = stage.clientWidth, sh = stage.clientHeight;
+  if (sw === 0 || sh === 0) return false;            // stage not laid out yet
+  DPR = Math.max(1, window.devicePixelRatio || 1);
+  const w = sw*DPR, h = sh*DPR;
+  if (cv.width !== w || cv.height !== h){
+    cv.width = w; cv.height = h; cache.width = w; cache.height = h;
+  }
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  return true;
+}
+function resize(){
+  if (!syncCanvasSize()) return;
+  drawAll(true);
+  if (typeof layoutFreqSlider==='function') layoutFreqSlider();
+}
+
+function drawCrisp(){
+  if (!meta) return;
+  if (!syncCanvasSize()) return;   // size the canvas to the stage before drawing
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  ctx.clearRect(0,0,cv.clientWidth,cv.clientHeight);
+  ctx.fillStyle = '#05070b';
+  ctx.fillRect(PAD.l,PAD.t,plotW(),plotH());
+
+  // clip to the plot area so partial cells/images don't bleed into the margins
+  ctx.save();
+  ctx.beginPath(); ctx.rect(PAD.l, PAD.t, plotW(), plotH()); ctx.clip();
+  if (layerMode==='pfp' && pfpImg && pfpView){
+    // PFP frame layer: X = capture time (continuous), Y = frame position (0..10 ms, full height)
+    const x0 = timeToX(pfpView.t0), x1 = timeToX(pfpView.t1);
+    ctx.imageSmoothingEnabled = false;   // crisp frame/time columns, not blurred
+    ctx.drawImage(pfpImg, x0, PAD.t, Math.max(1, x1-x0), plotH());
+  } else if (layerMode==='psd' && psdImg && psdView){
+    // PSD detail layer: image mapped to its time window AND freq band.
+    const x0 = timeToX(psdView.t0), x1 = timeToX(psdView.t1);
+    const yT = freqToY(psdView.fmin), yB = freqToY(psdView.fmax);
+    ctx.imageSmoothingEnabled = false;   // crisp time/freq detail, not blurred
+    ctx.drawImage(psdImg, x0, yT, Math.max(1, x1-x0), Math.max(1, yB-yT));
+  } else if (data){
+    const vals = data[stat];
+    const bucket = data.bucket || 0;
+    const span = view.t1 - view.t0;
+    const bw = bucket>0 ? Math.max(1, bucket/span*plotW()) : Math.max(1, plotW()/Math.max(1,data.count/meta.freqs.length));
+    // sample-and-hold: each channel's cell extends to its next sample so data
+    // gaps fill with the adjacent colour instead of showing black (capped so a
+    // cell before a huge gap doesn't smear across the whole plot).
+    const lastIdx = {}, cellW = new Array(data.t.length), maxFill = plotW()*0.2;
+    for (let i=0;i<data.t.length;i++){
+      const f = data.freq[i];
+      if (lastIdx[f]!==undefined) cellW[lastIdx[f]] = timeToX(data.t[i]) - timeToX(data.t[lastIdx[f]]);
+      lastIdx[f] = i;
+    }
+    for (let i=0;i<data.t.length;i++){
+      const v = vals[i]; if (v==null) continue;
+      const x = timeToX(data.t[i]);
+      const w = Math.max(bw, Math.min(maxFill, cellW[i]||bw)) + 0.6;
+      if (x > cv.clientWidth || x+w < PAD.l) continue;
+      const fHz = data.freq[i]*1e6;                    // channel centre
+      const yT = freqToY(fHz - 5e6), yB = freqToY(fHz + 5e6);  // ±5 MHz channel band
+      if (yB < PAD.t || yT > PAD.t+plotH()) continue;  // outside freq window
+      const c = turbo((v - scale.lo)/(scale.hi - scale.lo));
+      ctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`;
+      ctx.fillRect(x, yT, w, (yB-yT)+0.6);
+    }
+  } else { ctx.restore(); return; }
+  ctx.restore();
+  drawAxes();
+  // snapshot for stretch-preview on next interaction
+  cctx.setTransform(1,0,0,1,0,0);
+  cctx.clearRect(0,0,cache.width,cache.height);
+  cctx.drawImage(cv,0,0);
+  cacheView = { t0: view.t0, t1: view.t1, f0: viewF.f0, f1: viewF.f1 };
+}
+
+// Cheap preview: stretch the cached bitmap onto the new time AND freq window.
+function drawPreview(){
+  if (!cacheView || cache.width === 0 || cache.height === 0) { drawCrisp(); return; }
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  ctx.clearRect(0,0,cv.clientWidth,cv.clientHeight);
+  ctx.fillStyle = '#05070b'; ctx.fillRect(PAD.l,PAD.t,plotW(),plotH());
+  // map cached window onto current axes (time = x; y = freq, or full height in PFP)
+  const sx0 = timeToX(cacheView.t0), sx1 = timeToX(cacheView.t1);
+  const sy0 = (layerMode==='pfp') ? PAD.t : freqToY(cacheView.f0);
+  const sy1 = (layerMode==='pfp') ? PAD.t+plotH() : freqToY(cacheView.f1);
+  // source plot region in cache (device px)
+  const srcL = PAD.l*DPR, srcT = PAD.t*DPR;
+  const srcW = (cache.width/DPR - PAD.l - PAD.r)*DPR, srcH = (cache.height/DPR - PAD.t - PAD.b)*DPR;
+  ctx.imageSmoothingEnabled = false;   // keep the stretch sharp (no blur) while crisp loads
+  ctx.save();
+  ctx.beginPath(); ctx.rect(PAD.l, PAD.t, plotW(), plotH()); ctx.clip();
+  ctx.drawImage(cache, srcL, srcT, srcW, srcH, sx0, sy0, sx1-sx0, sy1-sy0);
+  // extend the cached edge columns to fill the newly-revealed time range while
+  // the crisp render loads (no black left/right edge while zooming out).
+  const edge = Math.max(1, 2*DPR), plotRight = PAD.l + plotW();
+  if (sx0 > PAD.l)      ctx.drawImage(cache, srcL, srcT, edge, srcH, PAD.l, sy0, sx0-PAD.l, sy1-sy0);
+  if (sx1 < plotRight)  ctx.drawImage(cache, srcL+srcW-edge, srcT, edge, srcH, sx1, sy0, plotRight-sx1, sy1-sy0);
+  ctx.restore();
+  drawAxes();
+}
+
+function niceTimeTicks(){
+  const span = view.t1 - view.t0, steps = [
+    1,2,5,10,15,30,60,120,300,600,1800,3600,7200,21600,43200,86400,
+    172800,604800,2592000,7776000,15552000,31536000];
+  const target = plotW()/110;
+  let step = steps[steps.length-1];
+  for (const s of steps){ if (span/s <= target){ step = s; break; } }
+  const ticks = [];
+  let start = Math.ceil(view.t0/step)*step;
+  for (let t=start; t<=view.t1; t+=step) ticks.push(t);
+  return { ticks, step };
+}
+function tickLabel(t, step){
+  const d = new Date(t*1000);
+  if (step >= 2592000) return d.toISOString().slice(0,7);
+  if (step >= 86400) return d.toISOString().slice(0,10);
+  if (step >= 60) return d.toISOString().slice(5,16).replace('T',' ');
+  return d.toISOString().slice(11,19);
+}
+
+function drawAxes(){
+  const W = cv.clientWidth, H = cv.clientHeight;
+  ctx.fillStyle = '#0d0f14';
+  ctx.fillRect(0,0,PAD.l,H); ctx.fillRect(0,H-PAD.b,W,PAD.b);
+  // frequency labels
+  ctx.fillStyle = '#8b93a3'; ctx.font = '11px ui-sans-serif'; ctx.textAlign='right'; ctx.textBaseline='middle';
+  let yLabel = 'Frequency (MHz)';
+  if (layerMode==='pfp' && pfpView){
+    for (let k=0;k<=5;k++){ const fr=k/5; ctx.fillText((fr*pfpFrameMs).toFixed(0), PAD.l-6, PAD.t+fr*plotH()); }  // 0..10 ms
+    yLabel = 'Frame position (ms)';
+  } else {
+    const fmin=viewF.f0/1e6, fmax=viewF.f1/1e6, dec = (fmax-fmin) < 20 ? 2 : 0;  // low freq at top
+    for (let k=0;k<=6;k++){ const fr=k/6; ctx.fillText((fmin+fr*(fmax-fmin)).toFixed(dec), PAD.l-6, PAD.t+fr*plotH()); }
+  }
+  ctx.save(); ctx.translate(12, PAD.t+plotH()/2); ctx.rotate(-Math.PI/2);
+  ctx.textAlign='center'; ctx.fillStyle='#69718a'; ctx.fillText(yLabel,0,0); ctx.restore();
+  // time ticks
+  const {ticks, step} = niceTimeTicks();
+  ctx.textAlign='center'; ctx.textBaseline='top'; ctx.fillStyle='#8b93a3';
+  ctx.strokeStyle='rgba(255,255,255,0.08)'; ctx.lineWidth=1;
+  for (const t of ticks){
+    const x = timeToX(t); if (x<PAD.l||x>W-PAD.r) continue;
+    ctx.beginPath(); ctx.moveTo(x,PAD.t); ctx.lineTo(x,H-PAD.b); ctx.stroke();
+    ctx.fillText(tickLabel(t,step), x, H-PAD.b+5);
+  }
+}
+
+function drawAll(crisp){ crisp ? drawCrisp() : drawPreview(); updateReadout(); }
+
+// ---- Data fetch -------------------------------------------------------
+let loadTimer=null;
+function setLoading(on){
+  const el=document.getElementById('loadbar');
+  if (on){ clearTimeout(loadTimer); loadTimer=setTimeout(()=>el.classList.add('on'), 150); }  // only show if slow
+  else { clearTimeout(loadTimer); el.classList.remove('on'); }
+}
+let previewRAF=null;
+function schedulePreview(){     // coalesce rapid zoom/pan into one draw per frame (60fps)
+  if (previewRAF) return;
+  previewRAF = requestAnimationFrame(()=>{ previewRAF=null; drawPreview(); });
+}
+function requestData(){
+  schedulePreview();           // instant, smooth stretch
+  clearTimeout(fetchTimer);
+  fetchTimer = setTimeout(async ()=>{
+    const seq = ++fetchSeq;
+    setLoading(true);
+    const span = view.t1 - view.t0;
+    // PSD time can't resolve below the ~4-min capture cadence; once zoomed past
+    // that, auto-narrow to the channel at the centre and drop into the PFP frame
+    // layer (real ~18µs detail) instead of just stretching the PSD image.
+    if (pfpAvail && span <= DEEP_TIME && (viewF.f1-viewF.f0) > ONE_CHANNEL){
+      const ch = nearestChannelHz();
+      viewF.f0 = Math.max(FULL_F0, ch-6e6); viewF.f1 = Math.min(FULL_F1, ch+6e6);
+      layoutFreqSlider();
+    }
+    const freqSpan = viewF.f1 - viewF.f0;
+    const w = Math.round(plotW()), h = Math.round(plotH());
+    try{
+      if (pfpAvail && freqSpan <= ONE_CHANNEL && span <= PFP_TIME_THRESHOLD){
+        // deepest layer: one channel's 10 ms frame structure
+        const ch = nearestChannelHz();
+        let url = `/api/pfp_frame?sensor=${enc(sensor)}&freq=${ch}&t0=${view.t0}&t1=${view.t1}&h=${h}`;
+        if (pfpScale[ch]) url += `&vmin=${pfpScale[ch].vmin}&vmax=${pfpScale[ch].vmax}`;   // locked per channel
+        const r = await fetch(url);
+        const j = await r.json();
+        if (seq !== fetchSeq) return;
+        if (j.error){ await fetchPsdOrSummary(seq, span, w, h); return; }
+        if (!pfpScale[ch]) pfpScale[ch] = {vmin:j.vmin, vmax:j.vmax};
+        const sc = pfpScale[ch];
+        const im = new Image();
+        im.onload = ()=>{ if (seq!==fetchSeq) return; pfpImg=im; pfpView=j; pfpFrameMs=j.frame_ms; layerMode='pfp';
+          document.getElementById('lo').textContent=sc.vmin.toFixed(0);
+          document.getElementById('hi').textContent=sc.vmax.toFixed(0);
+          drawCrisp(); updateReadout(); setLoading(false); };
+        im.src = j.png;
+      } else {
+        await fetchPsdOrSummary(seq, span, w, h);
+      }
+    }catch(e){ console.error(e); setLoading(false); }
+  }, 70);
+}
+async function fetchPsdOrSummary(seq, span, w, h){
+  if (psdAvail && span <= PSD_THRESHOLD){
+    let url = `/api/psd_layer?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&f0=${viewF.f0}&f1=${viewF.f1}`;
+    if (psdScale) url += `&vmin=${psdScale.vmin}&vmax=${psdScale.vmax}`;   // locked colours
+    const r = await fetch(url);
+    const j = await r.json();
+    if (seq !== fetchSeq) return;
+    if (j.error){ await fetchSummary(seq); return; }
+    if (!psdScale) psdScale = {vmin:j.vmin, vmax:j.vmax};                  // lock on first render
+    const im = new Image();
+    im.onload = ()=>{ if (seq!==fetchSeq) return; psdImg=im; psdView=j; layerMode='psd';
+      document.getElementById('lo').textContent=psdScale.vmin.toFixed(0);
+      document.getElementById('hi').textContent=psdScale.vmax.toFixed(0);
+      drawCrisp(); updateReadout(); setLoading(false); };
+    im.src = j.png;
+  } else {
+    await fetchSummary(seq);
+  }
+}
+async function fetchSummary(seq){
+  const w = Math.round(plotW());
+  const r = await fetch(`/api/heatmap?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&width=${w}`);
+  const j = await r.json();
+  if (seq !== fetchSeq) return;
+  data = j; layerMode = 'summary'; autoScale(); drawCrisp(); updateReadout(); setLoading(false);
+}
+
+function autoScale(){
+  if (summaryLock[stat]){                        // locked colours: reuse, don't recompute
+    scale.lo = summaryLock[stat].lo; scale.hi = summaryLock[stat].hi;
+  } else {
+    const v = data[stat].filter(x=>x!=null);
+    if (!v.length) return;
+    v.sort((a,b)=>a-b);
+    const lo = v[Math.floor(v.length*0.02)], hi = v[Math.floor(v.length*0.98)];
+    scale.lo = Math.min(lo, hi-5); scale.hi = Math.max(hi, lo+5);
+    summaryLock[stat] = {lo:scale.lo, hi:scale.hi};   // lock on first render of this stat
+  }
+  document.getElementById('lo').textContent = scale.lo.toFixed(0);
+  document.getElementById('hi').textContent = scale.hi.toFixed(0);
+}
+
+function updateReadout(){
+  document.getElementById('winRange').textContent = fmtTs(view.t0)+'  →  '+fmtTs(view.t1);
+  document.getElementById('winSpan').textContent = fmtSpan(view.t1-view.t0);
+  document.getElementById('level').textContent =
+    (layerMode==='pfp' && pfpView) ? `PFP frame · ${(pfpView.freq/1e6).toFixed(0)} MHz · ${pfpView.ncap} captures × ${pfpView.npos} pts (≈${(pfpFrameMs*1000/pfpView.npos).toFixed(1)} µs)`
+    : (layerMode==='psd' && psdView) ? (psdView.gap ? `PSD detail · ⚠ data gap — holding last capture` : `PSD detail · ${psdView.ncap} captures × 2250 bins @ 80 kHz`)
+    : (data ? `${data.level} (${data.count.toLocaleString()} cells)` : '—');
+}
+
+// ---- Interaction ------------------------------------------------------
+// Keep the time view inside the data range so the left/right edges always have
+// data (no black margins when zoomed/panned out).
+function clampTimeView(){
+  const range = meta.tmax - meta.tmin;
+  let span = Math.max(1, Math.min(view.t1 - view.t0, range));
+  let t0 = view.t0;
+  if (t0 + span > meta.tmax) t0 = meta.tmax - span;
+  if (t0 < meta.tmin) t0 = meta.tmin;
+  view.t0 = t0; view.t1 = t0 + span;
+}
+stage.addEventListener('wheel', e=>{
+  e.preventDefault();
+  const tc = xToTime(e.offsetX);
+  const f = Math.pow(1.0015, e.deltaY);      // >1 zoom out
+  view.t0 = tc - (tc-view.t0)*f; view.t1 = tc + (view.t1-tc)*f;
+  clampTimeView();
+  requestData();
+}, {passive:false});
+
+let drag=null;
+stage.addEventListener('pointerdown', e=>{ drag={x:e.offsetX, y:e.offsetY, t0:view.t0, t1:view.t1, f0:viewF.f0, f1:viewF.f1}; cv.classList.add('drag'); cv.setPointerCapture(e.pointerId); });
+stage.addEventListener('pointermove', e=>{
+  document.getElementById('cursor').textContent = fmtTs(xToTime(e.offsetX));
+  if (!drag) return;
+  const dt = (e.offsetX-drag.x)/plotW()*(drag.t1-drag.t0);
+  view.t0=drag.t0-dt; view.t1=drag.t1-dt; clampTimeView();
+  if (layerMode!=='pfp'){            // vertical drag pans frequency (Y means frame-pos in PFP)
+    const df = (e.offsetY-drag.y)/plotH()*(drag.f1-drag.f0);
+    let n0=drag.f0-df, n1=drag.f1-df;
+    if (n0<FULL_F0){ n1+=FULL_F0-n0; n0=FULL_F0; }
+    if (n1>FULL_F1){ n0-=n1-FULL_F1; n1=FULL_F1; }
+    viewF.f0=Math.max(FULL_F0,n0); viewF.f1=Math.min(FULL_F1,n1);
+    layoutFreqSlider();
+  }
+  requestData();
+});
+stage.addEventListener('pointerup', e=>{ drag=null; cv.classList.remove('drag'); });
+
+// ---- Frequency zoom slider (left): drag up = zoom in, bottom = full band ---
+const FULL_SPAN = FULL_F1 - FULL_F0;
+function spanToZoom(span){ return Math.log(FULL_SPAN/Math.max(span,MIN_FSPAN)) / Math.log(FULL_SPAN/MIN_FSPAN); }
+function zoomToSpan(z){ return FULL_SPAN * Math.pow(MIN_FSPAN/FULL_SPAN, Math.max(0,Math.min(1,z))); }
+function layoutFreqSlider(){
+  const sl=document.getElementById('freqslider'), knob=document.getElementById('freqknob');
+  const ph=plotH(); if (ph<=0) return;
+  sl.style.top=PAD.t+'px'; sl.style.height=ph+'px';
+  const z=Math.max(0,Math.min(1, spanToZoom(viewF.f1-viewF.f0)));
+  const knobH=16;
+  knob.style.top=((1-z)*(ph-knobH))+'px';           // z=0 (full) bottom, z=1 (finest) top
+}
+function onFreqChange(){
+  if (viewF.f1-viewF.f0 < MIN_FSPAN){ const m=(viewF.f0+viewF.f1)/2; viewF.f0=m-MIN_FSPAN/2; viewF.f1=m+MIN_FSPAN/2; }
+  if (viewF.f0 < FULL_F0){ viewF.f1+=FULL_F0-viewF.f0; viewF.f0=FULL_F0; }
+  if (viewF.f1 > FULL_F1){ viewF.f0-=viewF.f1-FULL_F1; viewF.f1=FULL_F1; }
+  viewF.f0=Math.max(FULL_F0,viewF.f0); viewF.f1=Math.min(FULL_F1,viewF.f1);
+  layoutFreqSlider(); requestData();
+}
+function resetFreq(){ viewF.f0=FULL_F0; viewF.f1=FULL_F1; layoutFreqSlider(); }
+function setFreqZoom(z){
+  z=Math.max(0,Math.min(1,z));
+  const span=zoomToSpan(z), c=(viewF.f0+viewF.f1)/2;
+  viewF.f0=c-span/2; viewF.f1=c+span/2; onFreqChange();
+}
+(function(){
+  const sl=document.getElementById('freqslider'), knob=document.getElementById('freqknob');
+  let sdrag=false; const knobH=16;
+  function zFromY(clientY){
+    const r=sl.getBoundingClientRect();
+    const frac=Math.max(0,Math.min(1,(clientY-r.top-knobH/2)/Math.max(1,r.height-knobH)));
+    return 1-frac;                                   // top of slider -> z=1 (zoom in)
+  }
+  sl.addEventListener('pointerdown', e=>{ e.stopPropagation(); e.preventDefault(); sdrag=true; knob.classList.add('grab'); sl.setPointerCapture(e.pointerId); setFreqZoom(zFromY(e.clientY)); });
+  sl.addEventListener('pointermove', e=>{ if(sdrag) setFreqZoom(zFromY(e.clientY)); });
+  sl.addEventListener('pointerup', ()=>{ sdrag=false; knob.classList.remove('grab'); });
+  sl.addEventListener('wheel', e=>{ e.preventDefault(); setFreqZoom(spanToZoom(viewF.f1-viewF.f0) - e.deltaY*0.0006); }, {passive:false});
+})();
+
+// ---- Controls ---------------------------------------------------------
+document.querySelectorAll('[data-stat]').forEach(b=>b.addEventListener('click', ()=>{
+  document.querySelectorAll('[data-stat]').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active'); stat=b.dataset.stat;
+  if (data){ autoScale(); drawCrisp(); }
+}));
+document.getElementById('sensor').addEventListener('change', async e=>{
+  sensor=e.target.value; const s=meta.sensors.find(x=>x.sensor===sensor);
+  meta.tmin=s.t_min; meta.tmax=s.t_max; view={t0:s.t_min,t1:s.t_max}; cacheView=null;
+  psdImg=null; psdView=null; pfpImg=null; pfpView=null; layerMode='summary'; resetFreq();
+  psdScale=null; pfpScale={}; summaryLock={};        // recompute locked colours for the new sensor
+  await checkPsd(); await checkPfp(); requestData();
+});
+document.getElementById('reset').addEventListener('click', ()=>{
+  view={t0:meta.tmin,t1:meta.tmax}; resetFreq(); requestData();
+});
+
+function drawLegend(){
+  const c=document.getElementById('cbar'); c.width=120;c.height=12;
+  const g=c.getContext('2d');
+  for (let x=0;x<120;x++){ const col=turbo(x/119); g.fillStyle=`rgb(${col[0]},${col[1]},${col[2]})`; g.fillRect(x,0,1,12);} }
+
+// ===== Tier 2 drill-in: PSD spectrogram + PFP frame view ===============
+const ov = { mode:null, sensor:null, date:null, stat:null, data:null, img:null, pfpFreqs:[],
+             zoom:{x0:0,x1:1,y0:0,y1:1} };   // normalized sub-rect of the day image
+const ovcv = document.getElementById('ovcv'), octx = ovcv.getContext('2d');
+const OVP = { l:62, r:16, t:10, b:28 };
+
+function midDate(){
+  const d = new Date(((view.t0+view.t1)/2)*1000);
+  return d.toISOString().slice(0,10);
+}
+
+// Continuous zoom: when the overview is zoomed into ~a day, automatically
+// sharpen to the PSD spectrogram for that day (no button). Zoom back out
+// (scroll up inside the detail view) to return to the overview.
+const AUTO_DETAIL_SPAN = 30 * 3600;   // seconds (~1.25 days)
+function maybeAutoDetail(){
+  const span = view.t1 - view.t0;
+  if (span <= AUTO_DETAIL_SPAN && document.getElementById('overlay').hidden){
+    openPSD(midDate(), 'max');
+  }
+}
+function ovZoomOutToOverview(){
+  closeOverlay();
+  const c = (view.t0 + view.t1) / 2, span = (view.t1 - view.t0);
+  view.t0 = c - span * 3; view.t1 = c + span * 3;   // widen so auto-detail doesn't re-fire
+  requestData();
+}
+// clamp a [a,b] window to [0,1] keeping its width, with a minimum size
+function clampWin(a, b){
+  if (b - a > 1){ a = 0; b = 1; }
+  if (a < 0){ b -= a; a = 0; }
+  if (b > 1){ a -= (b - 1); b = 1; }
+  const minw = 0.008;
+  if (b - a < minw){ const m = (a + b) / 2; a = m - minw/2; b = m + minw/2; }
+  return [Math.max(0, a), Math.min(1, b)];
+}
+// Zoom/pan INSIDE the PSD day image. Scroll out past the full day -> overview.
+ovcv.addEventListener('wheel', e=>{
+  if (ov.mode !== 'psd' || !ov.img) return;
+  e.preventDefault();
+  const z = ov.zoom, P = ovPlot();
+  // already fully zoomed out and scrolling out more -> back to the overview
+  if (e.deltaY > 0 && (z.x1 - z.x0) >= 0.98 && (z.y1 - z.y0) >= 0.98){
+    ovZoomOutToOverview(); return;
+  }
+  const fx = Math.min(1, Math.max(0, (e.offsetX - OVP.l) / P.w));
+  const fy = Math.min(1, Math.max(0, (e.offsetY - OVP.t) / P.h));
+  const cx = z.x0 + fx*(z.x1 - z.x0), cy = z.y0 + fy*(z.y1 - z.y0);
+  const f = Math.pow(1.0015, e.deltaY);           // >1 zoom out
+  [z.x0, z.x1] = clampWin(cx - (cx - z.x0)*f, cx + (z.x1 - cx)*f);
+  [z.y0, z.y1] = clampWin(cy - (cy - z.y0)*f, cy + (z.y1 - cy)*f);
+  // snap to full when nearly out, so the next scroll-out exits cleanly
+  if (z.x1 - z.x0 >= 0.98){ z.x0 = 0; z.x1 = 1; }
+  if (z.y1 - z.y0 >= 0.98){ z.y0 = 0; z.y1 = 1; }
+  drawOverlay();
+}, {passive:false});
+
+let ovDrag = null;
+ovcv.addEventListener('pointerdown', e=>{
+  if (ov.mode !== 'psd') return;
+  ovDrag = { x:e.offsetX, y:e.offsetY, z:{...ov.zoom} };
+  ovcv.setPointerCapture(e.pointerId); ovcv.style.cursor='grabbing';
+});
+ovcv.addEventListener('pointermove', e=>{
+  if (!ovDrag) return;
+  const P = ovPlot(), z = ovDrag.z;
+  const dxf = (e.offsetX - ovDrag.x)/P.w * (z.x1 - z.x0);
+  const dyf = (e.offsetY - ovDrag.y)/P.h * (z.y1 - z.y0);
+  [ov.zoom.x0, ov.zoom.x1] = clampWin(z.x0 - dxf, z.x1 - dxf);
+  [ov.zoom.y0, ov.zoom.y1] = clampWin(z.y0 - dyf, z.y1 - dyf);
+  drawOverlay();
+});
+ovcv.addEventListener('pointerup', ()=>{ ovDrag = null; ovcv.style.cursor='crosshair'; });
+
+const _drillBtn = document.getElementById('drillBtn');
+if (_drillBtn) _drillBtn.addEventListener('click', async (e)=>{
+  e.stopPropagation();
+  const menu = document.getElementById('drillMenu');
+  if (!menu.hidden){ menu.hidden = true; return; }
+  menu.innerHTML = 'Loading…';
+  menu.hidden = false;
+  const idx = await (await fetch('/api/drill/index?sensor='+encodeURIComponent(sensor))).json();
+  const near = midDate();
+  const sortByNear = ds => ds.slice().sort((a,b)=>Math.abs(Date.parse(a)-Date.parse(near))-Math.abs(Date.parse(b)-Date.parse(near)));
+  let html = `<h4>PSD spectrogram · ${sensor}</h4>`;
+  const pd = sortByNear(idx.psd.dates);
+  html += pd.length ? pd.slice(0,12).map(d=>`<div class="row" data-k="psd" data-d="${d}">${d}  <span style="color:#9aa3b4">(${idx.psd.stats.join('/')})</span></div>`).join('') : '<div class="empty">none for this sensor</div>';
+  html += `<h4>PFP frame (≈18µs) · ${sensor}</h4>`;
+  const fd = sortByNear(idx.pfp.dates);
+  html += fd.length ? fd.slice(0,12).map(d=>`<div class="row" data-k="pfp" data-d="${d}">${d}  <span style="color:#9aa3b4">(${idx.pfp.stats.join('/')})</span></div>`).join('') : '<div class="empty">none for this sensor</div>';
+  menu.innerHTML = html;
+  menu.querySelectorAll('.row').forEach(r=>r.addEventListener('click',()=>{
+    menu.hidden = true;
+    if (r.dataset.k==='psd') openPSD(r.dataset.d);
+    else openPFP(r.dataset.d, null);
+  }));
+});
+document.addEventListener('click', ()=>{ document.getElementById('drillMenu').hidden = true; });
+document.getElementById('drillMenu').addEventListener('click', e=>e.stopPropagation());
+document.getElementById('ovClose').addEventListener('click', closeOverlay);
+
+function showOverlay(){ document.getElementById('overlay').hidden = false; document.querySelector('footer').style.display='none'; }
+function closeOverlay(){ document.getElementById('overlay').hidden = true; document.querySelector('footer').style.display=''; ov.mode=null; ov.img=null; }
+
+function fitOverlay(){
+  const r = ovcv.getBoundingClientRect();
+  ovcv.width = r.width*DPR; ovcv.height = r.height*DPR;
+  octx.setTransform(DPR,0,0,DPR,0,0);
+}
+
+async function openPSD(date, stat){
+  ov.mode='psd'; ov.sensor=sensor; ov.date=date;
+  ov.zoom={x0:0,x1:1,y0:0,y1:1};
+  setCrumb(`${sensor}<span class="sep">›</span>PSD spectrogram<span class="sep">›</span>${date}`);
+  document.getElementById('ovChanWrap').hidden = true;
+  showOverlay();
+  const j = await (await fetch(`/api/psd?sensor=${encodeURIComponent(sensor)}&date=${date}&stat=${stat||'max'}`)).json();
+  if (j.error){ document.getElementById('ovReadout').textContent = j.error; return; }
+  ov.data=j; ov.stat=j.stat;
+  ov.pfpFreqs = [];   // PFP drill-in disabled for now (PSD-only phase)
+  loadOvImage(j.png);
+}
+
+async function openPFP(date, freq, stat){
+  ov.mode='pfp'; ov.sensor=sensor; ov.date=date;
+  showOverlay();
+  document.getElementById('ovReadout').textContent = 'Loading…';
+  // first call without freq -> channel list
+  const base = `/api/pfp?sensor=${encodeURIComponent(sensor)}&date=${date}`+(stat?`&stat=${stat}`:'');
+  const list = await (await fetch(base)).json();
+  if (list.error){ setCrumb(`${sensor}<span class="sep">›</span>PFP`); document.getElementById('ovReadout').textContent=list.error; return; }
+  ov.pfpFreqs = list.freqs; ov.stat = list.stat;
+  const f = freq || list.freqs[Math.floor(list.freqs.length/2)];
+  // channel dropdown
+  const wrap = document.getElementById('ovChanWrap'); wrap.hidden = false;
+  const sel = document.getElementById('ovChan'); sel.innerHTML='';
+  list.freqs.forEach(fr=>{ const o=document.createElement('option'); o.value=fr; o.textContent=(fr/1e6).toFixed(0)+' MHz'; if(fr===f)o.selected=true; sel.appendChild(o); });
+  sel.onchange = ()=> loadPFPFreq(parseFloat(sel.value));
+  loadPFPFreq(f);
+}
+
+async function loadPFPFreq(f){
+  setCrumb(`${ov.sensor}<span class="sep">›</span>PFP frame<span class="sep">›</span>${ov.date}<span class="sep">›</span>${(f/1e6).toFixed(0)} MHz`);
+  const j = await (await fetch(`/api/pfp?sensor=${encodeURIComponent(ov.sensor)}&date=${ov.date}&stat=${ov.stat}&freq=${f}`)).json();
+  if (j.error){ document.getElementById('ovReadout').textContent=j.error; return; }
+  ov.data=j; loadOvImage(j.png);
+}
+
+function loadOvImage(src){
+  const im = new Image();
+  im.onload = ()=>{ ov.img = im; fitOverlay(); drawOverlay(); };
+  im.src = src;
+}
+function setCrumb(html){ document.getElementById('crumb').innerHTML = html; }
+
+function ovPlot(){ return { w: ovcv.clientWidth-OVP.l-OVP.r, h: ovcv.clientHeight-OVP.t-OVP.b }; }
+
+function drawOverlay(){
+  if (!ov.img || !ov.data) return;
+  fitOverlay();
+  const P = ovPlot();
+  octx.clearRect(0,0,ovcv.clientWidth,ovcv.clientHeight);
+  octx.fillStyle='#05070b'; octx.fillRect(OVP.l,OVP.t,P.w,P.h);
+  if (ov.mode==='psd'){
+    const z=ov.zoom, iw=ov.img.naturalWidth, ih=ov.img.naturalHeight;
+    octx.imageSmoothingEnabled = (z.x1-z.x0 < 0.999 || z.y1-z.y0 < 0.999); // smooth when magnifying
+    octx.drawImage(ov.img, z.x0*iw, z.y0*ih, (z.x1-z.x0)*iw, (z.y1-z.y0)*ih, OVP.l, OVP.t, P.w, P.h);
+  } else {
+    octx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    octx.drawImage(ov.img, OVP.l, OVP.t, P.w, P.h);
+  }
+  octx.font='11px ui-sans-serif'; octx.fillStyle='#0d0f14';
+  octx.fillRect(0,0,OVP.l,ovcv.clientHeight); octx.fillRect(0,ovcv.clientHeight-OVP.b,ovcv.clientWidth,OVP.b);
+  const d = ov.data;
+  if (ov.mode==='psd'){
+    // axes follow the zoom window. Y = frequency (top=fmax), X = time.
+    const z=ov.zoom;
+    const t0z=d.t0+z.x0*(d.t1-d.t0), t1z=d.t0+z.x1*(d.t1-d.t0);
+    const fTop=d.fmax-z.y0*(d.fmax-d.fmin), fBot=d.fmax-z.y1*(d.fmax-d.fmin);
+    ovYticks([[fTop,(fTop/1e6).toFixed(1)],[(fTop+fBot)/2,(((fTop+fBot)/2)/1e6).toFixed(1)],[fBot,(fBot/1e6).toFixed(1)]], fTop,fBot,'MHz');
+    ovXtimeTicks(t0z,t1z);
+    const zoomed = (z.x1-z.x0<0.999 || z.y1-z.y0<0.999);
+    document.getElementById('ovReadout').textContent =
+      `${d.nt} captures × ${d.nf} freq bins (80 kHz) · ${(d.vmin)}…${(d.vmax)} dBm/Hz · scroll = zoom · drag = pan` + (zoomed?' · scroll out fully → overview':'');
+  } else {
+    // X = 0..10 ms, Y = time
+    ovXframeTicks(d.frame_ms);
+    ovTimeAxisY(d.t0,d.t1);
+    document.getElementById('ovReadout').textContent =
+      `${d.nt} captures × ${d.npos} points across ${d.frame_ms} ms (≈${(d.frame_ms*1000/d.npos).toFixed(1)} µs/pt) · ${(d.vmin)}…${(d.vmax)} dBm`;
+  }
+}
+
+function ovYticks(ticks, top, bot, unit){
+  const P=ovPlot();
+  octx.fillStyle='#8b93a3'; octx.textAlign='right'; octx.textBaseline='middle';
+  for (const [val,lab] of ticks){ const yf=(top-val)/(top-bot); const y=OVP.t+yf*P.h; octx.fillText(lab, OVP.l-6, y); }
+  octx.save(); octx.translate(12,OVP.t+P.h/2); octx.rotate(-Math.PI/2); octx.textAlign='center'; octx.fillStyle='#69718a'; octx.fillText('Frequency ('+unit+')',0,0); octx.restore();
+}
+function ovTimeAxisY(t0,t1){
+  const P=ovPlot(); octx.fillStyle='#8b93a3'; octx.textAlign='right'; octx.textBaseline='middle';
+  for (let k=0;k<=4;k++){ const tf=k/4; const t=t1-(t1-t0)*tf; const y=OVP.t+tf*P.h*0+ (k/4)*P.h; const tt=t1-(t1-t0)*(k/4);
+    octx.fillText(new Date(tt*1000).toISOString().slice(11,16), OVP.l-6, OVP.t+(k/4)*P.h); }
+  octx.save(); octx.translate(12,OVP.t+P.h/2); octx.rotate(-Math.PI/2); octx.textAlign='center'; octx.fillStyle='#69718a'; octx.fillText('Capture time (UTC)',0,0); octx.restore();
+}
+function ovXtimeTicks(t0,t1){
+  const P=ovPlot(); octx.fillStyle='#8b93a3'; octx.textAlign='center'; octx.textBaseline='top';
+  for (let k=0;k<=6;k++){ const x=OVP.l+(k/6)*P.w; const t=t0+(t1-t0)*(k/6);
+    octx.fillText(new Date(t*1000).toISOString().slice(11,16), x, ovcv.clientHeight-OVP.b+5); }
+}
+function ovXframeTicks(ms){
+  const P=ovPlot(); octx.fillStyle='#8b93a3'; octx.textAlign='center'; octx.textBaseline='top'; octx.strokeStyle='rgba(255,255,255,0.10)';
+  for (let k=0;k<=10;k++){ const x=OVP.l+(k/10)*P.w; octx.beginPath(); octx.moveTo(x,OVP.t); octx.lineTo(x,OVP.t+P.h); octx.stroke();
+    octx.fillText((ms*k/10).toFixed(0), x, ovcv.clientHeight-OVP.b+5); }
+  octx.fillStyle='#69718a'; octx.fillText('Periodic frame time (ms)', OVP.l+P.w/2, ovcv.clientHeight-OVP.b+16);
+}
+
+// click on PSD band -> open PFP for nearest 10 MHz channel (if available)
+// (PFP click-through disabled during the PSD-only phase; zoom/pan own the canvas.)
+window.addEventListener('resize', ()=>{ if(!document.getElementById('overlay').hidden) drawOverlay(); });
+
+// ---- Boot -------------------------------------------------------------
+function showNoBackend(){
+  document.body.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:center;height:100%;padding:30px;text-align:center">'
+    + '<div><h2 style="color:#e8b">⚠ No data server</h2>'
+    + '<p style="color:#d7dae0">This page must be opened through the running server, not as a file.</p>'
+    + '<p style="font-size:18px;color:#7db">Open <b>http://localhost:8090</b> in your browser.</p></div></div>';
+}
+
+async function boot(){
+  drawLegend();
+  let r;
+  try { r = await fetch('/api/meta'); if (!r.ok) throw new Error('bad status '+r.status); }
+  catch(e){ showNoBackend(); return; }
+  meta = await r.json();
+  meta.freqs.sort((a,b)=>a-b);
+  const sel = document.getElementById('sensor');
+  meta.sensors.forEach(s=>{ const o=document.createElement('option'); o.value=s.sensor; o.textContent=s.sensor; sel.appendChild(o); });
+  sensor = meta.sensors[0].sensor;
+  meta.tmin = meta.sensors[0].t_min; meta.tmax = meta.sensors[0].t_max;
+  view = { t0: meta.tmin, t1: meta.tmax };
+  await checkPsd(); await checkPfp();
+  new ResizeObserver(resize).observe(stage);
+  resize(); requestData();
+}
+async function checkPsd(){
+  psdAvail = false;
+  try { const j = await (await fetch('/api/psd_meta?sensor='+enc(sensor))).json(); psdAvail = !!j.has; }
+  catch(e){}
+}
+async function checkPfp(){
+  pfpAvail = false;
+  try { const j = await (await fetch('/api/pfp_meta?sensor='+enc(sensor))).json(); pfpAvail = !!j.has; if (j.frame_ms) pfpFrameMs=j.frame_ms; }
+  catch(e){}
+}
+boot();
+</script>
+</body>
+</html>
