@@ -34,6 +34,9 @@
   #freqslider { position: absolute; left: 0; width: 18px; z-index: 12; cursor: pointer; }
   #freqtrack { position: absolute; left: 7px; top: 0; width: 4px; height: 100%;
                background: #2c3344; border-radius: 2px; }
+  /* highlighted top segment of the track = the "PFP zone" (narrow to ~1 channel) */
+  #freqpfp { position: absolute; left: 6px; width: 6px; background: #e8a23d;
+             opacity: .55; border-radius: 3px; pointer-events: none; }
   #freqknob { position: absolute; left: 0; width: 18px; height: 16px; background: #2d5fd0;
               border: 1px solid #5a86ec; border-radius: 4px; cursor: grab;
               box-shadow: 0 1px 4px rgba(0,0,0,.6); }
@@ -75,12 +78,13 @@
       <button data-stat="mean">mean</button>
     </div>
     <div class="group"><button id="reset">⤢ Full span</button></div>
-    <div class="group" id="legend"><span id="lo"></span><canvas id="cbar"></canvas><span id="hi"></span><span style="color:#69718a">dBm</span></div>
+    <div class="group"><label>Colors</label><select id="cmap"><option value="inferno">Inferno</option><option value="turbo">Turbo</option></select></div>
+    <div class="group" id="legend"><span id="lo"></span><canvas id="cbar"></canvas><span id="hi"></span><span id="unit" style="color:#69718a">dBm</span></div>
     <div class="group" style="color:#69718a">scroll = zoom · drag = pan · zoom in for full PSD detail</div>
   </header>
   <div id="stage">
     <canvas id="cv"></canvas>
-    <div id="freqslider" title="Frequency zoom — drag up to zoom in, down for full band. Drag the heatmap up/down to pan frequency."><div id="freqtrack"></div><div id="freqknob"></div></div>
+    <div id="freqslider" title="Frequency zoom — knob at BOTTOM = full band; drag UP to zoom into frequency. The amber zone near the top = one channel, where the PFP (~18µs frame) layer appears. Drag the heatmap up/down to pan frequency."><div id="freqtrack"></div><div id="freqpfp" title="PFP zone — narrow to one channel here for ~18µs frame detail"></div><div id="freqknob"></div></div>
     <div id="loadbar"></div>
     <div id="drillMenu" hidden></div>
     <div id="overlay" hidden>
@@ -149,14 +153,36 @@ function nearestChannelHz(){            // channel centre nearest the freq-windo
   return (Math.round((cMHz - 3535) / 10) * 10 + 3535) * 1e6;
 }
 
-// ---- Turbo-ish colormap (compact) -------------------------------------
-function turbo(x){
-  x = Math.min(1, Math.max(0, x));
-  const r = Math.round(255*Math.min(1,Math.max(0, 34.61 + x*(1172.33 + x*(-10793.56 + x*(33300.12 + x*(-38394.49 + x*14825.05)))))/255));
-  const g = Math.round(255*Math.min(1,Math.max(0, 23.31 + x*(557.33 + x*(1225.33 + x*(-3574.96 + x*(3520.99 + x*-1300.91)))))/255));
-  const b = Math.round(255*Math.min(1,Math.max(0, 27.2 + x*(3211.1 + x*(-15327.97 + x*(27814.0 + x*(-22569.18 + x*6838.66)))))/255));
-  return [r,g,b];
+// ---- Colormaps (selectable via the Colors dropdown) --------------------
+// Same maths mirrored server-side in tier2.py so this client-drawn summary and
+// the server-rendered PSD/PFP PNGs match. 'inferno' = dark→bright (low power
+// dark); 'turbo' = the classic blue-green-yellow-red.
+const INFERNO_ANCHORS = [
+  [0,0,4],[20,11,52],[57,9,98],[95,19,110],[133,33,107],[169,46,94],
+  [203,65,73],[230,93,47],[247,131,17],[252,173,18],[250,205,42],[252,255,164]];
+function buildAnchorLUT(anchors){
+  const seg=anchors.length-1, lut=new Array(256);
+  for (let i=0;i<256;i++){
+    const xs=i/255*seg, k=Math.min(seg-1,Math.floor(xs)), f=xs-k;
+    const a=anchors[k], b=anchors[k+1];
+    lut[i]=[Math.round(a[0]+(b[0]-a[0])*f),Math.round(a[1]+(b[1]-a[1])*f),Math.round(a[2]+(b[2]-a[2])*f)];
+  }
+  return lut;
 }
+function buildTurboLUT(){
+  const cl=v=>Math.round(Math.min(255,Math.max(0,v))), lut=new Array(256);
+  for (let i=0;i<256;i++){ const x=i/255;
+    lut[i]=[
+      cl(34.61 + x*(1172.33 + x*(-10793.56 + x*(33300.12 + x*(-38394.49 + x*14825.05))))),
+      cl(23.31 + x*(557.33 + x*(1225.33 + x*(-3574.96 + x*(3520.99 + x*-1300.91))))),
+      cl(27.2 + x*(3211.1 + x*(-15327.97 + x*(27814.0 + x*(-22569.18 + x*6838.66)))))];
+  }
+  return lut;
+}
+const CMAP_LUTS = { inferno: buildAnchorLUT(INFERNO_ANCHORS), turbo: buildTurboLUT() };
+let cmapName = 'inferno';
+try { const s=localStorage.getItem('cmap'); if (s && CMAP_LUTS[s]) cmapName=s; } catch(e){}
+function cmap(x){ return CMAP_LUTS[cmapName][Math.max(0,Math.min(255,Math.floor((x||0)*255)))]; }
 
 function fmtTs(sec){
   const d = new Date(sec*1000);
@@ -213,7 +239,8 @@ function drawCrisp(){
   ctx.save();
   ctx.beginPath(); ctx.rect(PAD.l, PAD.t, plotW(), plotH()); ctx.clip();
   if (layerMode==='pfp' && pfpImg && pfpView){
-    // PFP frame layer: X = capture time (continuous), Y = frame position (0..10 ms, full height)
+    // PFP frame layer: X = capture time (positioned by timeToX like the other layers
+    // so zooming gives live feedback), Y = frame position (0..10 ms, full height).
     const x0 = timeToX(pfpView.t0), x1 = timeToX(pfpView.t1);
     ctx.imageSmoothingEnabled = false;   // crisp frame/time columns, not blurred
     ctx.drawImage(pfpImg, x0, PAD.t, Math.max(1, x1-x0), plotH());
@@ -228,24 +255,18 @@ function drawCrisp(){
     const bucket = data.bucket || 0;
     const span = view.t1 - view.t0;
     const bw = bucket>0 ? Math.max(1, bucket/span*plotW()) : Math.max(1, plotW()/Math.max(1,data.count/meta.freqs.length));
-    // sample-and-hold: each channel's cell extends to its next sample so data
-    // gaps fill with the adjacent colour instead of showing black (capped so a
-    // cell before a huge gap doesn't smear across the whole plot).
-    const lastIdx = {}, cellW = new Array(data.t.length), maxFill = plotW()*0.2;
-    for (let i=0;i<data.t.length;i++){
-      const f = data.freq[i];
-      if (lastIdx[f]!==undefined) cellW[lastIdx[f]] = timeToX(data.t[i]) - timeToX(data.t[lastIdx[f]]);
-      lastIdx[f] = i;
-    }
+    // Each sample paints exactly one bucket-wide cell. Where a sensor has no data
+    // for a bucket, no cell is drawn, so the dark plot background shows through —
+    // the black GAPS are real missing-data, intentionally visible.
     for (let i=0;i<data.t.length;i++){
       const v = vals[i]; if (v==null) continue;
       const x = timeToX(data.t[i]);
-      const w = Math.max(bw, Math.min(maxFill, cellW[i]||bw)) + 0.6;
+      const w = bw + 0.6;                              // one bucket wide (+seam overlap)
       if (x > cv.clientWidth || x+w < PAD.l) continue;
       const fHz = data.freq[i]*1e6;                    // channel centre
       const yT = freqToY(fHz - 5e6), yB = freqToY(fHz + 5e6);  // ±5 MHz channel band
       if (yB < PAD.t || yT > PAD.t+plotH()) continue;  // outside freq window
-      const c = turbo((v - scale.lo)/(scale.hi - scale.lo));
+      const c = cmap((v - scale.lo)/(scale.hi - scale.lo));
       ctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`;
       ctx.fillRect(x, yT, w, (yB-yT)+0.6);
     }
@@ -314,7 +335,7 @@ function drawAxes(){
   let yLabel = 'Frequency (MHz)';
   if (layerMode==='pfp' && pfpView){
     for (let k=0;k<=5;k++){ const fr=k/5; ctx.fillText((fr*pfpFrameMs).toFixed(0), PAD.l-6, PAD.t+fr*plotH()); }  // 0..10 ms
-    yLabel = 'Frame position (ms)';
+    yLabel = `Frame position (ms) · ${(pfpView.freq/1e6).toFixed(0)} MHz channel`;
   } else {
     const fmin=viewF.f0/1e6, fmax=viewF.f1/1e6, dec = (fmax-fmin) < 20 ? 2 : 0;  // low freq at top
     for (let k=0;k<=6;k++){ const fr=k/6; ctx.fillText((fmin+fr*(fmax-fmin)).toFixed(dec), PAD.l-6, PAD.t+fr*plotH()); }
@@ -322,9 +343,9 @@ function drawAxes(){
   ctx.save(); ctx.translate(12, PAD.t+plotH()/2); ctx.rotate(-Math.PI/2);
   ctx.textAlign='center'; ctx.fillStyle='#69718a'; ctx.fillText(yLabel,0,0); ctx.restore();
   // time ticks
-  const {ticks, step} = niceTimeTicks();
   ctx.textAlign='center'; ctx.textBaseline='top'; ctx.fillStyle='#8b93a3';
   ctx.strokeStyle='rgba(255,255,255,0.08)'; ctx.lineWidth=1;
+  const {ticks, step} = niceTimeTicks();
   for (const t of ticks){
     const x = timeToX(t); if (x<PAD.l||x>W-PAD.r) continue;
     ctx.beginPath(); ctx.moveTo(x,PAD.t); ctx.lineTo(x,H-PAD.b); ctx.stroke();
@@ -353,21 +374,17 @@ function requestData(){
     const seq = ++fetchSeq;
     setLoading(true);
     const span = view.t1 - view.t0;
-    // PSD time can't resolve below the ~4-min capture cadence; once zoomed past
-    // that, auto-narrow to the channel at the centre and drop into the PFP frame
-    // layer (real ~18µs detail) instead of just stretching the PSD image.
-    if (pfpAvail && span <= DEEP_TIME && (viewF.f1-viewF.f0) > ONE_CHANNEL){
-      const ch = nearestChannelHz();
-      viewF.f0 = Math.max(FULL_F0, ch-6e6); viewF.f1 = Math.min(FULL_F1, ch+6e6);
-      layoutFreqSlider();
-    }
+    // PFP (the ~18µs frame layer) is reached by NARROWING THE FREQUENCY SLIDER to
+    // ~one channel — never by an automatic jump. Keeping it slider-driven means the
+    // frequency window only ever moves when the user moves it (no surprise jumps,
+    // no fight when panning frequency while zoomed deep in time).
     const freqSpan = viewF.f1 - viewF.f0;
     const w = Math.round(plotW()), h = Math.round(plotH());
     try{
       if (pfpAvail && freqSpan <= ONE_CHANNEL && span <= PFP_TIME_THRESHOLD){
         // deepest layer: one channel's 10 ms frame structure
         const ch = nearestChannelHz();
-        let url = `/api/pfp_frame?sensor=${enc(sensor)}&freq=${ch}&t0=${view.t0}&t1=${view.t1}&h=${h}`;
+        let url = `/api/pfp_frame?sensor=${enc(sensor)}&freq=${ch}&t0=${view.t0}&t1=${view.t1}&h=${h}&cmap=${cmapName}`;
         if (pfpScale[ch]) url += `&vmin=${pfpScale[ch].vmin}&vmax=${pfpScale[ch].vmax}`;   // locked per channel
         const r = await fetch(url);
         const j = await r.json();
@@ -379,6 +396,7 @@ function requestData(){
         im.onload = ()=>{ if (seq!==fetchSeq) return; pfpImg=im; pfpView=j; pfpFrameMs=j.frame_ms; layerMode='pfp';
           document.getElementById('lo').textContent=sc.vmin.toFixed(0);
           document.getElementById('hi').textContent=sc.vmax.toFixed(0);
+          setLegendUnit('dBm'); updateStatButtons();
           drawCrisp(); updateReadout(); setLoading(false); };
         im.src = j.png;
       } else {
@@ -389,8 +407,12 @@ function requestData(){
 }
 async function fetchPsdOrSummary(seq, span, w, h){
   if (psdAvail && span <= PSD_THRESHOLD){
-    let url = `/api/psd_layer?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&f0=${viewF.f0}&f1=${viewF.f1}`;
-    if (psdScale) url += `&vmin=${psdScale.vmin}&vmax=${psdScale.vmax}`;   // locked colours
+    // PSD uses its OWN per-sensor contrast scale (2nd/98th pct of the real PSD
+    // data) so detail is easy to pick out when zoomed in — NOT the summary's
+    // wider channel-power range (which washed the PSD out). Locked per sensor so
+    // colours stay stable across pan/zoom.
+    let url = `/api/psd_layer?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&f0=${viewF.f0}&f1=${viewF.f1}&cmap=${cmapName}`;
+    if (psdScale) url += `&vmin=${psdScale.vmin}&vmax=${psdScale.vmax}`;   // locked contrast
     const r = await fetch(url);
     const j = await r.json();
     if (seq !== fetchSeq) return;
@@ -400,7 +422,7 @@ async function fetchPsdOrSummary(seq, span, w, h){
     im.onload = ()=>{ if (seq!==fetchSeq) return; psdImg=im; psdView=j; layerMode='psd';
       document.getElementById('lo').textContent=psdScale.vmin.toFixed(0);
       document.getElementById('hi').textContent=psdScale.vmax.toFixed(0);
-      drawCrisp(); updateReadout(); setLoading(false); };
+      setLegendUnit('dBm'); updateStatButtons(); drawCrisp(); updateReadout(); setLoading(false); };
     im.src = j.png;
   } else {
     await fetchSummary(seq);
@@ -411,7 +433,8 @@ async function fetchSummary(seq){
   const r = await fetch(`/api/heatmap?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&width=${w}`);
   const j = await r.json();
   if (seq !== fetchSeq) return;
-  data = j; layerMode = 'summary'; autoScale(); drawCrisp(); updateReadout(); setLoading(false);
+  data = j; layerMode = 'summary'; autoScale(); setLegendUnit('dBm'); updateStatButtons();
+  drawCrisp(); updateReadout(); setLoading(false);
 }
 
 function autoScale(){
@@ -488,6 +511,10 @@ function layoutFreqSlider(){
   const z=Math.max(0,Math.min(1, spanToZoom(viewF.f1-viewF.f0)));
   const knobH=16;
   knob.style.top=((1-z)*(ph-knobH))+'px';           // z=0 (full) bottom, z=1 (finest) top
+  // amber "PFP zone" band: from the top of the track down to the one-channel threshold
+  const pfpEl=document.getElementById('freqpfp');
+  if (pfpEl){ const zT=spanToZoom(ONE_CHANNEL); const yT=(1-zT)*(ph-knobH)+knobH/2;
+    pfpEl.style.top='0px'; pfpEl.style.height=Math.max(0,yT)+'px'; }
 }
 function onFreqChange(){
   if (viewF.f1-viewF.f0 < MIN_FSPAN){ const m=(viewF.f0+viewF.f1)/2; viewF.f0=m-MIN_FSPAN/2; viewF.f1=m+MIN_FSPAN/2; }
@@ -532,11 +559,30 @@ document.getElementById('sensor').addEventListener('change', async e=>{
 document.getElementById('reset').addEventListener('click', ()=>{
   view={t0:meta.tmin,t1:meta.tmax}; resetFreq(); requestData();
 });
+document.getElementById('cmap').addEventListener('change', e=>{
+  cmapName = e.target.value;
+  try { localStorage.setItem('cmap', cmapName); } catch(_){}
+  drawLegend();
+  if (layerMode==='summary'){ drawCrisp(); }          // summary is client-drawn — recolours instantly
+  else { psdImg=null; pfpImg=null; requestData(); }    // PSD/PFP PNGs must re-render server-side
+});
 
 function drawLegend(){
   const c=document.getElementById('cbar'); c.width=120;c.height=12;
   const g=c.getContext('2d');
-  for (let x=0;x<120;x++){ const col=turbo(x/119); g.fillStyle=`rgb(${col[0]},${col[1]},${col[2]})`; g.fillRect(x,0,1,12);} }
+  for (let x=0;x<120;x++){ const col=cmap(x/119); g.fillStyle=`rgb(${col[0]},${col[1]},${col[2]})`; g.fillRect(x,0,1,12);} }
+function setLegendUnit(u){ const e=document.getElementById('unit'); if (e) e.textContent=u; }
+// PSD/PFP layers are stored max-only; median/mean apply to the summary layer
+// only, so disable them (greyed) outside summary mode to keep the toggle honest.
+function updateStatButtons(){
+  const summaryMode = (layerMode==='summary');
+  document.querySelectorAll('[data-stat]').forEach(b=>{
+    if (b.dataset.stat==='max') return;
+    b.disabled = !summaryMode;
+    b.style.opacity = summaryMode ? '' : '0.4';
+    b.title = summaryMode ? '' : 'PSD / PFP layers are max-only';
+  });
+}
 
 // ===== Tier 2 drill-in: PSD spectrogram + PFP frame view ===============
 const ov = { mode:null, sensor:null, date:null, stat:null, data:null, img:null, pfpFreqs:[],
@@ -769,6 +815,7 @@ function showNoBackend(){
 }
 
 async function boot(){
+  document.getElementById('cmap').value = cmapName;
   drawLegend();
   let r;
   try { r = await fetch('/api/meta'); if (!r.ok) throw new Error('bad status '+r.status); }

@@ -32,23 +32,47 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TILE_ROOT = os.path.join(HERE, "tiles")
 
 
-# ---- Turbo colormap LUT ----------------------------------------------
+# ---- Colormap LUT ----------------------------------------------------
+# Inferno: perceptually-uniform, monotonic in brightness — LOW power = dark,
+# HIGH power = bright. The SAME anchors + interpolation are mirrored in
+# viewer.html (client summary layer) so colours match exactly across layers.
+CMAP_ANCHORS = np.array([
+    [0, 0, 4], [20, 11, 52], [57, 9, 98], [95, 19, 110], [133, 33, 107],
+    [169, 46, 94], [203, 65, 73], [230, 93, 47], [247, 131, 17],
+    [252, 173, 18], [250, 205, 42], [252, 255, 164],
+], dtype=np.float64)
+
+
+def _build_lut(anchors):
+    seg = len(anchors) - 1
+    xs = np.linspace(0, seg, 256)
+    k = np.clip(np.floor(xs).astype(int), 0, seg - 1)
+    f = (xs - k)[:, None]
+    lut = anchors[k] + (anchors[k + 1] - anchors[k]) * f
+    return np.clip(lut, 0, 255).astype(np.uint8)
+
+
 def _turbo_lut():
+    # Google "turbo" (blue-green-yellow-red). Same polynomial mirrored in viewer.html.
     x = np.linspace(0, 1, 256)
     r = 34.61 + x*(1172.33 + x*(-10793.56 + x*(33300.12 + x*(-38394.49 + x*14825.05))))
     g = 23.31 + x*(557.33 + x*(1225.33 + x*(-3574.96 + x*(3520.99 + x*-1300.91))))
     b = 27.2 + x*(3211.1 + x*(-15327.97 + x*(27814.0 + x*(-22569.18 + x*6838.66))))
     return np.clip(np.stack([r, g, b], axis=1), 0, 255).astype(np.uint8)
 
-LUT = _turbo_lut()
+
+# Selectable colormaps (the client passes ?cmap=). 'inferno' = dark→bright (default).
+LUTS = {"inferno": _build_lut(CMAP_ANCHORS), "turbo": _turbo_lut()}
+LUT = LUTS["inferno"]   # default / back-compat
 
 
-def _colorize(mat, vmin, vmax):
+def _colorize(mat, vmin, vmax, cmap="inferno"):
+    lut = LUTS.get(cmap, LUTS["inferno"])
     norm = (mat - vmin) / max(vmax - vmin, 1e-6)
     idx = np.clip(norm * 255, 0, 255)
     nan = ~np.isfinite(mat)
     idx[nan] = 0
-    rgb = LUT[idx.astype(np.uint8)]
+    rgb = lut[idx.astype(np.uint8)]
     rgb[nan] = (8, 9, 12)
     return rgb
 

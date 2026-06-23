@@ -126,6 +126,11 @@ PSD_DB = os.path.join(HERE, "psd.duckdb")
 F0 = 3530040000.0     # first PSD bin (Hz)
 DF = 80000.0          # bin spacing (Hz)
 NF = 2250             # bins  (full band 3530.04 .. 3709.96 MHz)
+# PSD is stored as power-spectral-density (dBm/Hz); the summaries are channel
+# power (dBm). Add 10*log10(channel bandwidth) to put the PSD layer on the SAME
+# dBm scale as the summaries so the colours line up across the zoom boundary.
+# 10 MHz channel -> +70 dB.  (An 80 kHz bin would be +49 dB; tune here if needed.)
+PSD_DBM_OFFSET = 70.0
 
 
 _psd_con = None
@@ -149,7 +154,7 @@ def _psd_scale(c, sensor, qmin, qmax):
     else:
         specs = np.frombuffer(b"".join(r[0] for r in rows),
                               dtype=np.uint8).reshape(len(rows), NF)
-        full = qmin + (specs.astype(np.float32) / 255.0) * (qmax - qmin)
+        full = qmin + (specs.astype(np.float32) / 255.0) * (qmax - qmin) + PSD_DBM_OFFSET
         sc = (float(np.percentile(full, 2)), float(np.percentile(full, 98)))
     _psd_scale_cache[sensor] = sc
     return sc
@@ -191,7 +196,7 @@ def psd_meta():
 def psd_layer():
     sensor = request.args.get("sensor")
     t0 = float(request.args.get("t0")); t1 = float(request.args.get("t1"))
-    W = int(request.args.get("w", 1200)); H = int(request.args.get("h", 600))
+    W = max(1, int(request.args.get("w", 1200))); H = max(1, int(request.args.get("h", 600)))
     # optional frequency window (Hz); default = full band
     f0 = float(request.args.get("f0", 0)); f1 = float(request.args.get("f1", 0))
     fi0 = int(round((f0 - F0) / DF)) if f0 > 0 else 0
@@ -238,7 +243,7 @@ def psd_layer():
         band = np.pad(band, ((0, 0), (0, pad)))       # pad high-freq end (max-binning ignores 0)
     nF = band.shape[1] // fb
     binned = band.reshape(ncap, nF, fb).max(axis=2)   # max over each freq pixel
-    img = qmin + (binned.T / 255.0) * (qmax - qmin)   # (nF, ncap) dBm/Hz, row 0 = low freq (top)
+    img = qmin + (binned.T / 255.0) * (qmax - qmin) + PSD_DBM_OFFSET   # (nF, ncap) dBm, row 0 = low freq (top)
     # Colour scale: a locked vmin/vmax from the client keeps colours stable across
     # zoom; otherwise derive it from the FULL spectrum (not the visible band) so
     # zooming frequency never remaps colours.
@@ -250,7 +255,7 @@ def psd_layer():
         # window, so colours stay consistent across zoom/pan and match the summary.
         with _psd_lock:
             vmin, vmax = _psd_scale(c, sensor, qmin, qmax)
-    rgb = tier2._colorize(img, vmin, vmax)
+    rgb = tier2._colorize(img, vmin, vmax, request.args.get("cmap", "inferno"))
     png = tier2._encode(rgb)
     return jsonify({
         "png": tier2._b64(png),
@@ -306,7 +311,7 @@ def pfp_frame():
     sensor = request.args.get("sensor")
     freq = float(request.args.get("freq"))
     t0 = float(request.args.get("t0")); t1 = float(request.args.get("t1"))
-    H = int(request.args.get("h", 600))
+    H = max(1, int(request.args.get("h", 600)))
     c = pfp_conn()
     if c is None:
         return jsonify({"error": "pfp not ready"}), 503
@@ -336,7 +341,7 @@ def pfp_frame():
         vmin, vmax = float(qv0), float(qv1)
     else:
         vmin = float(np.percentile(img, 2)); vmax = float(np.percentile(img, 98))
-    rgb = tier2._colorize(img, vmin, vmax)
+    rgb = tier2._colorize(img, vmin, vmax, request.args.get("cmap", "inferno"))
     png = tier2._encode(rgb)
     return jsonify({
         "png": tier2._b64(png),
