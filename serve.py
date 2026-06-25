@@ -110,11 +110,15 @@ def heatmap():
         ORDER BY t
     """, [sensor, t0, t1]).fetchall()
 
-    # Compact columnar payload: parallel arrays keep JSON small.
+    # Compact columnar payload: parallel arrays keep JSON small. Round the dBm
+    # values to 0.1 and times to whole seconds so the JSON is ~half the size
+    # (0.1 dBm is far finer than the colour resolution) — much faster to ship/parse.
     freq, t, mx, md, mn = [], [], [], [], []
     for r in rows:
-        freq.append(r[0]); t.append(r[1])
-        mx.append(r[2]); md.append(r[3]); mn.append(r[4])
+        freq.append(r[0]); t.append(int(r[1]))
+        mx.append(None if r[2] is None else round(r[2], 1))
+        md.append(None if r[3] is None else round(r[3], 1))
+        mn.append(None if r[4] is None else round(r[4], 1))
     return jsonify({
         "level": tbl, "bucket": bucket, "count": len(rows),
         "freq": freq, "t": t, "max": mx, "median": md, "mean": mn,
@@ -287,6 +291,10 @@ def pfp_conn():
     return _pfp_con
 
 
+_pfp_freqs_cache = {}   # sensor -> channel freqs (static; the DISTINCT scan over the
+                        # 14 GB table costs ~270 ms, so cache it after the first call)
+
+
 @app.route("/api/pfp_meta")
 def pfp_meta():
     sensor = request.args.get("sensor")
@@ -296,10 +304,13 @@ def pfp_meta():
     with _pfp_lock:
         m = c.execute("SELECT npos, frame_ms, t_min, t_max, stat FROM pfp_meta WHERE sensor=?",
                       [sensor]).fetchone()
-        freqs = [r[0] for r in c.execute(
-            "SELECT DISTINCT freq FROM pfp WHERE sensor=? ORDER BY 1", [sensor]).fetchall()]
-    if not m:
-        return jsonify({"has": False})
+        if not m:
+            return jsonify({"has": False})
+        freqs = _pfp_freqs_cache.get(sensor)
+        if freqs is None:
+            freqs = [r[0] for r in c.execute(
+                "SELECT DISTINCT freq FROM pfp WHERE sensor=? ORDER BY 1", [sensor]).fetchall()]
+            _pfp_freqs_cache[sensor] = freqs
     return jsonify({"has": True, "npos": m[0], "frame_ms": m[1],
                     "t_min": m[2], "t_max": m[3], "stat": m[4], "freqs": freqs})
 

@@ -31,17 +31,29 @@
   .hint { color:#69718a; }
   #legend { display:flex; align-items:center; gap:6px; }
   #legend canvas { position: static; width: 120px; height: 12px; border-radius: 3px; }
-  #freqslider { position: absolute; left: 0; width: 18px; z-index: 12; cursor: pointer; }
-  #freqtrack { position: absolute; left: 7px; top: 0; width: 4px; height: 100%;
-               background: #2c3344; border-radius: 2px; }
+  /* --- Zoom sliders: light rounded track + round blue knob (accessible) --- */
+  #freqslider { position: absolute; left: 2px; width: 22px; z-index: 12; cursor: pointer; }
+  #freqtrack { position: absolute; left: 8px; top: 0; width: 6px; height: 100%;
+               background: #e6e9ef; border-radius: 3px; }
   /* highlighted top segment of the track = the "PFP zone" (narrow to ~1 channel) */
-  #freqpfp { position: absolute; left: 6px; width: 6px; background: #e8a23d;
-             opacity: .55; border-radius: 3px; pointer-events: none; }
-  #freqknob { position: absolute; left: 0; width: 18px; height: 16px; background: #2d5fd0;
-              border: 1px solid #5a86ec; border-radius: 4px; cursor: grab;
-              box-shadow: 0 1px 4px rgba(0,0,0,.6); }
-  #freqknob:hover { background: #3a6fe0; }
+  #freqpfp { position: absolute; left: 8px; width: 6px; background: #f0a500;
+             opacity: .85; border-radius: 3px; pointer-events: none; }
+  #freqknob { position: absolute; left: 3px; width: 16px; height: 16px; background: #2b7fff;
+              border: 2px solid #eaf1ff; border-radius: 50%; cursor: grab;
+              box-shadow: 0 1px 5px rgba(0,0,0,.55); }
+  #freqknob:hover { background: #3d8bff; }
   #freqknob.grab { cursor: grabbing; }
+  #freqlabel { position: absolute; left: 0; bottom: 2px; width: 56px; text-align: center;
+               font-size: 10px; line-height: 1.1; color: #8b93a3; z-index: 12; pointer-events: none; }
+  #timebar { position: relative; height: 20px; margin: 6px 14px 0 64px; cursor: pointer; }
+  #timetrack { position: absolute; left: 0; right: 0; top: 7px; height: 6px;
+               background: #e6e9ef; border-radius: 3px; }
+  #timeknob { position: absolute; top: 2px; width: 16px; height: 16px; background: #2b7fff;
+              border: 2px solid #eaf1ff; border-radius: 50%; cursor: grab;
+              box-shadow: 0 1px 5px rgba(0,0,0,.55); }
+  #timeknob:hover { background: #3d8bff; }
+  #timeknob.grab { cursor: grabbing; }
+  #sliderhint { text-align: center; color: #8b93a3; font-size: 12px; padding: 3px 0 2px; }
   #loadbar { position: absolute; left: 64px; right: 14px; top: 10px; height: 2px; z-index: 14;
              overflow: hidden; opacity: 0; transition: opacity .15s; pointer-events: none; }
   #loadbar.on { opacity: 1; }
@@ -78,13 +90,15 @@
       <button data-stat="mean">mean</button>
     </div>
     <div class="group"><button id="reset">⤢ Full span</button></div>
+    <div class="group"><button id="exportBtn" title="Export the current view + statistics as a PNG image for reports/sharing">⤓ Export PNG</button></div>
     <div class="group"><label>Colors</label><select id="cmap"><option value="inferno">Inferno</option><option value="turbo">Turbo</option></select></div>
     <div class="group" id="legend"><span id="lo"></span><canvas id="cbar"></canvas><span id="hi"></span><span id="unit" style="color:#69718a">dBm</span></div>
-    <div class="group" style="color:#69718a">scroll = zoom · drag = pan · zoom in for full PSD detail</div>
+    <div class="group" style="color:#69718a">scroll = time zoom · <b style="color:#9db2e8">Ctrl+scroll = freq zoom</b> · drag = pan</div>
   </header>
   <div id="stage">
     <canvas id="cv"></canvas>
     <div id="freqslider" title="Frequency zoom — knob at BOTTOM = full band; drag UP to zoom into frequency. The amber zone near the top = one channel, where the PFP (~18µs frame) layer appears. Drag the heatmap up/down to pan frequency."><div id="freqtrack"></div><div id="freqpfp" title="PFP zone — narrow to one channel here for ~18µs frame detail"></div><div id="freqknob"></div></div>
+    <div id="freqlabel">freq zoom</div>
     <div id="loadbar"></div>
     <div id="drillMenu" hidden></div>
     <div id="overlay" hidden>
@@ -98,6 +112,8 @@
       <div id="ovFoot"><span id="ovReadout">—</span></div>
     </div>
   </div>
+  <div id="timebar" title="Time zoom — knob at LEFT = full span; drag RIGHT to zoom into time. Drag the heatmap left/right to pan time."><div id="timetrack"></div><div id="timeknob"></div></div>
+  <div id="sliderhint">time zoom · drag image to pan</div>
   <footer>
     <div>Window: <b id="winRange">—</b></div>
     <div>Span: <b id="winSpan">—</b></div>
@@ -225,6 +241,7 @@ function resize(){
   if (!syncCanvasSize()) return;
   drawAll(true);
   if (typeof layoutFreqSlider==='function') layoutFreqSlider();
+  if (typeof layoutTimeSlider==='function') layoutTimeSlider();
 }
 
 function drawCrisp(){
@@ -367,74 +384,83 @@ function schedulePreview(){     // coalesce rapid zoom/pan into one draw per fra
   if (previewRAF) return;
   previewRAF = requestAnimationFrame(()=>{ previewRAF=null; drawPreview(); });
 }
+// In-memory tile cache: revisiting an exact window (zoom out then back, cmap
+// toggle, etc.) renders instantly — no network, no re-decode. Keyed by the full
+// URL (encodes sensor/window/size/colours/cmap), LRU-evicted.
+const tileCache = new Map();
+const TILE_CACHE_MAX = 48;
+function cacheGet(url){ const v=tileCache.get(url); if (v){ tileCache.delete(url); tileCache.set(url,v); } return v; }
+function cacheSet(url,v){ tileCache.set(url,v); if (tileCache.size>TILE_CACHE_MAX) tileCache.delete(tileCache.keys().next().value); }
+
+function pfpUrl(ch,h){ let u=`/api/pfp_frame?sensor=${enc(sensor)}&freq=${ch}&t0=${view.t0}&t1=${view.t1}&h=${h}&cmap=${cmapName}`;
+  if (pfpScale[ch]) u+=`&vmin=${pfpScale[ch].vmin}&vmax=${pfpScale[ch].vmax}`; return u; }
+function psdUrl(w,h){ let u=`/api/psd_layer?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&f0=${viewF.f0}&f1=${viewF.f1}&cmap=${cmapName}`;
+  if (psdScale) u+=`&vmin=${psdScale.vmin}&vmax=${psdScale.vmax}`; return u; }
+function sumUrl(w){ return `/api/heatmap?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&width=${w}`; }
+
+function applySummary(j){ data=j; layerMode='summary'; autoScale(); setLegendUnit('dBm'); updateStatButtons(); drawCrisp(); updateReadout(); }
+function applyPsd(j, im){ psdImg=im; psdView=j; layerMode='psd'; if(!psdScale) psdScale={vmin:j.vmin,vmax:j.vmax};
+  document.getElementById('lo').textContent=psdScale.vmin.toFixed(0); document.getElementById('hi').textContent=psdScale.vmax.toFixed(0);
+  setLegendUnit('dBm'); updateStatButtons(); drawCrisp(); updateReadout(); }
+function applyPfp(j, im, ch){ pfpImg=im; pfpView=j; pfpFrameMs=j.frame_ms; layerMode='pfp'; if(!pfpScale[ch]) pfpScale[ch]={vmin:j.vmin,vmax:j.vmax};
+  const sc=pfpScale[ch]; document.getElementById('lo').textContent=sc.vmin.toFixed(0); document.getElementById('hi').textContent=sc.vmax.toFixed(0);
+  setLegendUnit('dBm'); updateStatButtons(); drawCrisp(); updateReadout(); }
+
+// What would the current view fetch? (used for instant cache hits)
+function buildReq(){
+  const span=view.t1-view.t0, freqSpan=viewF.f1-viewF.f0, w=Math.round(plotW()), h=Math.round(plotH());
+  if (pfpAvail && freqSpan<=ONE_CHANNEL && span<=PFP_TIME_THRESHOLD){ const ch=nearestChannelHz(); return {kind:'pfp', url:pfpUrl(ch,h), ch}; }
+  if (psdAvail && span<=PSD_THRESHOLD) return {kind:'psd', url:psdUrl(w,h)};
+  return {kind:'summary', url:sumUrl(w)};
+}
+
 function requestData(){
-  schedulePreview();           // instant, smooth stretch
+  schedulePreview();                        // instant, smooth stretch
+  const req=buildReq(), hit=cacheGet(req.url);
+  if (hit){ clearTimeout(fetchTimer); ++fetchSeq;   // instant: cancel debounce + in-flight fetch
+    if (req.kind==='summary') applySummary(hit.data);
+    else if (req.kind==='psd') applyPsd(hit.j, hit.img);
+    else applyPfp(hit.j, hit.img, req.ch);
+    setLoading(false); return;
+  }
   clearTimeout(fetchTimer);
-  fetchTimer = setTimeout(async ()=>{
-    const seq = ++fetchSeq;
-    setLoading(true);
-    const span = view.t1 - view.t0;
-    // PFP (the ~18µs frame layer) is reached by NARROWING THE FREQUENCY SLIDER to
-    // ~one channel — never by an automatic jump. Keeping it slider-driven means the
-    // frequency window only ever moves when the user moves it (no surprise jumps,
-    // no fight when panning frequency while zoomed deep in time).
-    const freqSpan = viewF.f1 - viewF.f0;
-    const w = Math.round(plotW()), h = Math.round(plotH());
-    try{
-      if (pfpAvail && freqSpan <= ONE_CHANNEL && span <= PFP_TIME_THRESHOLD){
-        // deepest layer: one channel's 10 ms frame structure
-        const ch = nearestChannelHz();
-        let url = `/api/pfp_frame?sensor=${enc(sensor)}&freq=${ch}&t0=${view.t0}&t1=${view.t1}&h=${h}&cmap=${cmapName}`;
-        if (pfpScale[ch]) url += `&vmin=${pfpScale[ch].vmin}&vmax=${pfpScale[ch].vmax}`;   // locked per channel
-        const r = await fetch(url);
-        const j = await r.json();
-        if (seq !== fetchSeq) return;
-        if (j.error){ await fetchPsdOrSummary(seq, span, w, h); return; }
-        if (!pfpScale[ch]) pfpScale[ch] = {vmin:j.vmin, vmax:j.vmax};
-        const sc = pfpScale[ch];
-        const im = new Image();
-        im.onload = ()=>{ if (seq!==fetchSeq) return; pfpImg=im; pfpView=j; pfpFrameMs=j.frame_ms; layerMode='pfp';
-          document.getElementById('lo').textContent=sc.vmin.toFixed(0);
-          document.getElementById('hi').textContent=sc.vmax.toFixed(0);
-          setLegendUnit('dBm'); updateStatButtons();
-          drawCrisp(); updateReadout(); setLoading(false); };
-        im.src = j.png;
-      } else {
-        await fetchPsdOrSummary(seq, span, w, h);
-      }
-    }catch(e){ console.error(e); setLoading(false); }
-  }, 70);
+  fetchTimer=setTimeout(doFetch, 45);       // shorter debounce → crisp appears sooner
+}
+async function doFetch(){
+  const seq=++fetchSeq; setLoading(true);
+  const span=view.t1-view.t0, freqSpan=viewF.f1-viewF.f0, w=Math.round(plotW()), h=Math.round(plotH());
+  try{
+    if (pfpAvail && freqSpan<=ONE_CHANNEL && span<=PFP_TIME_THRESHOLD){
+      const ch=nearestChannelHz(), url=pfpUrl(ch,h);
+      const j=await (await fetch(url)).json();
+      if (seq!==fetchSeq) return;
+      if (j.error){ await fetchPsdOrSummary(seq,span,w,h); return; }
+      const im=new Image();
+      im.onload=()=>{ if(seq!==fetchSeq) return; applyPfp(j,im,ch); cacheSet(pfpUrl(ch,h),{img:im,j}); setLoading(false); };
+      im.src=j.png;
+    } else {
+      await fetchPsdOrSummary(seq,span,w,h);
+    }
+  }catch(e){ console.error(e); setLoading(false); }
 }
 async function fetchPsdOrSummary(seq, span, w, h){
-  if (psdAvail && span <= PSD_THRESHOLD){
-    // PSD uses its OWN per-sensor contrast scale (2nd/98th pct of the real PSD
-    // data) so detail is easy to pick out when zoomed in — NOT the summary's
-    // wider channel-power range (which washed the PSD out). Locked per sensor so
-    // colours stay stable across pan/zoom.
-    let url = `/api/psd_layer?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&f0=${viewF.f0}&f1=${viewF.f1}&cmap=${cmapName}`;
-    if (psdScale) url += `&vmin=${psdScale.vmin}&vmax=${psdScale.vmax}`;   // locked contrast
-    const r = await fetch(url);
-    const j = await r.json();
-    if (seq !== fetchSeq) return;
+  if (psdAvail && span<=PSD_THRESHOLD){
+    const url=psdUrl(w,h);
+    const j=await (await fetch(url)).json();
+    if (seq!==fetchSeq) return;
     if (j.error){ await fetchSummary(seq); return; }
-    if (!psdScale) psdScale = {vmin:j.vmin, vmax:j.vmax};                  // lock on first render
-    const im = new Image();
-    im.onload = ()=>{ if (seq!==fetchSeq) return; psdImg=im; psdView=j; layerMode='psd';
-      document.getElementById('lo').textContent=psdScale.vmin.toFixed(0);
-      document.getElementById('hi').textContent=psdScale.vmax.toFixed(0);
-      setLegendUnit('dBm'); updateStatButtons(); drawCrisp(); updateReadout(); setLoading(false); };
-    im.src = j.png;
+    const im=new Image();
+    im.onload=()=>{ if(seq!==fetchSeq) return; applyPsd(j,im); cacheSet(psdUrl(w,h),{img:im,j}); setLoading(false); };
+    im.src=j.png;
   } else {
     await fetchSummary(seq);
   }
 }
 async function fetchSummary(seq){
-  const w = Math.round(plotW());
-  const r = await fetch(`/api/heatmap?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&width=${w}`);
-  const j = await r.json();
-  if (seq !== fetchSeq) return;
-  data = j; layerMode = 'summary'; autoScale(); setLegendUnit('dBm'); updateStatButtons();
-  drawCrisp(); updateReadout(); setLoading(false);
+  const w=Math.round(plotW());
+  const j=await (await fetch(sumUrl(w))).json();
+  if (seq!==fetchSeq) return;
+  applySummary(j); cacheSet(sumUrl(w),{data:j}); setLoading(false);
 }
 
 function autoScale(){
@@ -474,10 +500,18 @@ function clampTimeView(){
 }
 stage.addEventListener('wheel', e=>{
   e.preventDefault();
+  if (e.ctrlKey){                                   // Ctrl + scroll = FREQUENCY zoom (centred on cursor)
+    const fc = (layerMode!=='pfp') ? yToFreq(e.offsetY) : (viewF.f0+viewF.f1)/2;
+    const ff = Math.pow(1.0015, e.deltaY);
+    viewF.f0 = fc-(fc-viewF.f0)*ff; viewF.f1 = fc+(viewF.f1-fc)*ff;
+    onFreqChange();                                 // clamps + lays out freq slider + requestData
+    return;
+  }
   const tc = xToTime(e.offsetX);
   const f = Math.pow(1.0015, e.deltaY);      // >1 zoom out
   view.t0 = tc - (tc-view.t0)*f; view.t1 = tc + (view.t1-tc)*f;
   clampTimeView();
+  layoutTimeSlider();
   requestData();
 }, {passive:false});
 
@@ -543,6 +577,36 @@ function setFreqZoom(z){
   sl.addEventListener('wheel', e=>{ e.preventDefault(); setFreqZoom(spanToZoom(viewF.f1-viewF.f0) - e.deltaY*0.0006); }, {passive:false});
 })();
 
+// ---- Time zoom slider (bottom): drag LEFT = full span, RIGHT = zoom in -----
+// Mirrors the frequency slider. The mouse-wheel zoom on the heatmap still works;
+// this is an additional, accessible control. The knob tracks the current span.
+const MIN_TSPAN = 60;   // finest span the slider reaches (s); the wheel can go finer
+function fullTSpan(){ return Math.max(1, meta.tmax - meta.tmin); }
+function tspanToZoom(span){ const F=fullTSpan(); return Math.log(F/Math.max(span,MIN_TSPAN)) / Math.log(F/MIN_TSPAN); }
+function tzoomToSpan(z){ const F=fullTSpan(); return F * Math.pow(MIN_TSPAN/F, Math.max(0,Math.min(1,z))); }
+function layoutTimeSlider(){
+  const tb=document.getElementById('timebar'), knob=document.getElementById('timeknob');
+  if (!tb || !meta) return;
+  const w=tb.clientWidth; if (w<=0) return;
+  const z=Math.max(0,Math.min(1, tspanToZoom(view.t1-view.t0)));
+  knob.style.left=(z*(w-16))+'px';                 // z=0 (full) left, z=1 (finest) right
+}
+function setTimeZoom(z){
+  z=Math.max(0,Math.min(1,z));
+  const span=tzoomToSpan(z), c=(view.t0+view.t1)/2;
+  view.t0=c-span/2; view.t1=c+span/2; clampTimeView(); layoutTimeSlider(); requestData();
+}
+(function(){
+  const tb=document.getElementById('timebar'), knob=document.getElementById('timeknob');
+  let tdrag=false;
+  function zFromX(clientX){ const r=tb.getBoundingClientRect();
+    return Math.max(0,Math.min(1,(clientX-r.left-8)/Math.max(1,r.width-16))); }
+  tb.addEventListener('pointerdown', e=>{ e.preventDefault(); tdrag=true; knob.classList.add('grab'); tb.setPointerCapture(e.pointerId); setTimeZoom(zFromX(e.clientX)); });
+  tb.addEventListener('pointermove', e=>{ if(tdrag) setTimeZoom(zFromX(e.clientX)); });
+  tb.addEventListener('pointerup', ()=>{ tdrag=false; knob.classList.remove('grab'); });
+  tb.addEventListener('wheel', e=>{ e.preventDefault(); setTimeZoom(tspanToZoom(view.t1-view.t0) - e.deltaY*0.0006); }, {passive:false});
+})();
+
 // ---- Controls ---------------------------------------------------------
 document.querySelectorAll('[data-stat]').forEach(b=>b.addEventListener('click', ()=>{
   document.querySelectorAll('[data-stat]').forEach(x=>x.classList.remove('active'));
@@ -552,13 +616,85 @@ document.querySelectorAll('[data-stat]').forEach(b=>b.addEventListener('click', 
 document.getElementById('sensor').addEventListener('change', async e=>{
   sensor=e.target.value; const s=meta.sensors.find(x=>x.sensor===sensor);
   meta.tmin=s.t_min; meta.tmax=s.t_max; view={t0:s.t_min,t1:s.t_max}; cacheView=null;
-  psdImg=null; psdView=null; pfpImg=null; pfpView=null; layerMode='summary'; resetFreq();
+  psdImg=null; psdView=null; pfpImg=null; pfpView=null; layerMode='summary'; resetFreq(); layoutTimeSlider();
   psdScale=null; pfpScale={}; summaryLock={};        // recompute locked colours for the new sensor
-  await checkPsd(); await checkPfp(); requestData();
+  requestData();                                     // paint new sensor's summary now
+  checkPsd(); checkPfp();                             // availability flags load in parallel
 });
 document.getElementById('reset').addEventListener('click', ()=>{
-  view={t0:meta.tmin,t1:meta.tmax}; resetFreq(); requestData();
+  view={t0:meta.tmin,t1:meta.tmax}; resetFreq(); layoutTimeSlider(); requestData();
 });
+
+// ---- Export: current view + key stats -> a single shareable PNG ---------
+function exportPNG(){
+  if (!meta || !cv.width) return null;
+  const M=26, W=1320, src=cv;
+  const hmW=W-2*M, hmH=Math.round(hmW * src.height/src.width);
+  const lo=document.getElementById('lo').textContent, hi=document.getElementById('hi').textContent,
+        unit=document.getElementById('unit').textContent;
+  const layerName = layerMode==='pfp' ? 'PFP frame (~18 µs, folded 10 ms frame)'
+                  : layerMode==='psd' ? 'PSD (2250 bins @ 80 kHz)'
+                  : 'Summary (channel power, ~90 s sweeps)';
+  const rows=[];
+  rows.push(['Sensor', sensor]);
+  rows.push(['Layer', layerName + (layerMode==='summary' ? '   ·   statistic: '+stat : '')]);
+  rows.push(['Time window (UTC)', fmtTs(view.t0)+'   →   '+fmtTs(view.t1)]);
+  rows.push(['Time span', fmtSpan(view.t1-view.t0)]);
+  if (layerMode==='pfp' && pfpView){
+    rows.push(['Channel', (pfpView.freq/1e6).toFixed(0)+' MHz']);
+    rows.push(['Frame structure', pfpView.npos+' pts over '+pfpFrameMs+' ms  (~'+(pfpFrameMs*1000/pfpView.npos).toFixed(1)+' µs/pt)']);
+    rows.push(['Captures in view', String(pfpView.ncap)]);
+  } else {
+    rows.push(['Frequency window', (viewF.f0/1e6).toFixed(3)+' MHz   →   '+(viewF.f1/1e6).toFixed(3)+' MHz']);
+    if (layerMode==='psd' && psdView) rows.push(['Captures in view', psdView.ncap+'  (× 2250 freq bins)']);
+    else if (data) rows.push(['Detail level', data.level+'   ('+data.count.toLocaleString()+' cells)']);
+  }
+  rows.push(['Colour scale', lo+'  …  '+hi+'  '+unit]);
+  rows.push(['Colormap', cmapName.charAt(0).toUpperCase()+cmapName.slice(1)]);
+  rows.push(['Sensor data range', fmtTs(meta.tmin)+'   →   '+fmtTs(meta.tmax)]);
+  rows.push(['Exported (UTC)', new Date().toISOString().replace('T',' ').slice(0,19)]);
+
+  const rowH=26, titleH=58, legH=46, sepGap=16;
+  const H = M + titleH + 14 + hmH + 16 + legH + sepGap + rows.length*rowH + M;
+  const c=document.createElement('canvas'); c.width=W; c.height=H;
+  const g=c.getContext('2d');
+  g.fillStyle='#0d0f14'; g.fillRect(0,0,W,H);
+  let y=M;
+  g.textBaseline='top'; g.textAlign='left';
+  g.fillStyle='#e8edf6'; g.font='bold 24px ui-sans-serif, system-ui, Segoe UI, sans-serif';
+  g.fillText('RF Spectrum Viewer — '+sensor, M, y);
+  g.fillStyle='#8b93a3'; g.font='14px ui-sans-serif';
+  g.fillText(layerName, M, y+32);
+  y += titleH+14;
+  g.imageSmoothingEnabled=true; g.imageSmoothingQuality='high';
+  g.drawImage(src, M, y, hmW, hmH);
+  g.strokeStyle='#2a3142'; g.lineWidth=1; g.strokeRect(M+0.5, y+0.5, hmW, hmH);
+  y += hmH+16;
+  const cb=document.getElementById('cbar'), lgW=240;
+  g.drawImage(cb, M, y, lgW, 14); g.strokeRect(M+0.5, y+0.5, lgW, 14);
+  g.fillStyle='#9aa3b4'; g.font='12px ui-monospace, monospace'; g.textBaseline='top';
+  g.textAlign='left'; g.fillText('low  '+lo+' '+unit, M, y+18);
+  g.textAlign='right'; g.fillText(hi+' '+unit+'  high', M+lgW, y+18);
+  g.textAlign='left';
+  y += legH+sepGap;
+  g.strokeStyle='#232836'; g.beginPath(); g.moveTo(M,y-8); g.lineTo(W-M,y-8); g.stroke();
+  g.textBaseline='middle';
+  for (const [k,v] of rows){
+    g.fillStyle='#8b93a3'; g.font='13px ui-sans-serif'; g.textAlign='left';
+    g.fillText(k, M, y+rowH/2);
+    g.fillStyle='#dfe3ea'; g.font='13px ui-monospace, ui-sans-serif, monospace';
+    g.fillText(v, M+230, y+rowH/2);
+    y += rowH;
+  }
+  // attribution, bottom-right, aligned with the last ("Exported") row
+  g.fillStyle='#69718a'; g.font='13px ui-sans-serif'; g.textAlign='right';
+  g.fillText('@Jimmy Lu 2026', W-M, y-rowH/2);
+  g.textAlign='left';
+  const fn = 'spectrum_'+sensor.replace(/[^A-Za-z0-9-]/g,'')+'_'+new Date().toISOString().replace(/[:T]/g,'-').slice(0,19)+'.png';
+  c.toBlob(b=>{ if(!b) return; const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=fn; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),5000); }, 'image/png');
+  return c;
+}
+document.getElementById('exportBtn').addEventListener('click', exportPNG);
 document.getElementById('cmap').addEventListener('change', e=>{
   cmapName = e.target.value;
   try { localStorage.setItem('cmap', cmapName); } catch(_){}
@@ -827,19 +963,21 @@ async function boot(){
   sensor = meta.sensors[0].sensor;
   meta.tmin = meta.sensors[0].t_min; meta.tmax = meta.sensors[0].t_max;
   view = { t0: meta.tmin, t1: meta.tmax };
-  await checkPsd(); await checkPfp();
   new ResizeObserver(resize).observe(stage);
-  resize(); requestData();
+  resize(); requestData();              // paint the (full-span) summary immediately
+  checkPsd(); checkPfp();               // availability flags load in parallel — don't block first paint
 }
 async function checkPsd(){
   psdAvail = false;
   try { const j = await (await fetch('/api/psd_meta?sensor='+enc(sensor))).json(); psdAvail = !!j.has; }
   catch(e){}
+  if (psdAvail && (view.t1-view.t0)<=PSD_THRESHOLD) requestData();   // upgrade if already zoomed in
 }
 async function checkPfp(){
   pfpAvail = false;
   try { const j = await (await fetch('/api/pfp_meta?sensor='+enc(sensor))).json(); pfpAvail = !!j.has; if (j.frame_ms) pfpFrameMs=j.frame_ms; }
   catch(e){}
+  if (pfpAvail && (viewF.f1-viewF.f0)<=ONE_CHANNEL && (view.t1-view.t0)<=PFP_TIME_THRESHOLD) requestData();
 }
 boot();
 </script>
