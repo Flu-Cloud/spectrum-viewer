@@ -83,6 +83,7 @@
 <body>
 <div id="app">
   <header>
+    <div class="group"><label>Source</label><select id="source"><option value="cbrs">CBRS SEA monitoring</option></select></div>
     <div class="group"><label>Sensor</label><select id="sensor"></select></div>
     <div class="group"><label>Show</label>
       <button data-stat="max" class="active">max</button>
@@ -143,7 +144,7 @@ let fetchTimer = null, fetchSeq = 0;
 
 // Second layer: the PSD detail heatmap, rendered from data server-side and
 // drawn on this same canvas when zoomed in past the summaries' usefulness.
-let layerMode = 'summary';             // 'summary' | 'psd'
+let layerMode = 'summary';             // 'summary' | 'psd' | 'pfp' | 'iq'
 let psdImg = null, psdView = null;     // last PSD layer image + its window
 let psdAvail = false;                  // does the current sensor have PSD data?
 // Locked colour scales so colours stay fixed across zoom (reset on sensor change).
@@ -156,7 +157,20 @@ const enc = encodeURIComponent;
 // Frequency view window (Hz), independent of the time zoom. Low freq at top.
 const FULL_F0 = 3530040000, FULL_F1 = 3530040000 + 2249 * 80000;   // 3530.04..3709.96 MHz
 let viewF = { f0: FULL_F0, f1: FULL_F1 };
-const MIN_FSPAN = 1e6;                  // don't zoom frequency below 1 MHz
+const MIN_FSPAN = 1e6;                  // don't zoom frequency below 1 MHz (CBRS)
+
+// ---- Source mode: 'cbrs' (multi-sensor monitoring) or 'iq' (one capture) ----
+// In IQ mode the SAME canvas/zoom machinery runs on a per-capture coordinate
+// system: X = time within the capture (0..duration s), Y = fc ± fs/2. The band
+// limits below replace the CBRS FULL_F0/FULL_F1 globals while in IQ mode.
+let mode = 'cbrs';
+let iqCap = null;                       // /api/iq_meta of the selected capture
+let iqImg = null, iqView = null;        // last iq_layer tile + its window
+let iqScale = null;                     // locked {vmin,vmax} per capture
+let BAND_F0 = FULL_F0, BAND_F1 = FULL_F1;      // current mode's full band
+function minFSpan(){ return (mode==='iq' && iqCap) ? iqCap.fs/256 : MIN_FSPAN; }
+function minTSpan(){ return (mode==='iq' && iqCap) ? iqCap.duration/2e5 : 60; }
+let savedCbrs = null;                   // CBRS view state to restore on switch-back
 
 // PFP (deepest layer): when narrowed to ~one channel AND zoomed time deep, show
 // that channel's 10 ms frame structure. X stays time; Y = frame position.
@@ -200,11 +214,19 @@ let cmapName = 'inferno';
 try { const s=localStorage.getItem('cmap'); if (s && CMAP_LUTS[s]) cmapName=s; } catch(e){}
 function cmap(x){ return CMAP_LUTS[cmapName][Math.max(0,Math.min(255,Math.floor((x||0)*255)))]; }
 
+function fmtRel(sec){                    // time WITHIN an IQ capture (µs/ms/s)
+  if (sec < 0.0009) return (sec*1e6).toFixed(1)+' µs';
+  if (sec < 0.9) return (sec*1e3).toFixed(3)+' ms';
+  return sec.toFixed(4)+' s';
+}
 function fmtTs(sec){
+  if (mode==='iq') return fmtRel(sec);
   const d = new Date(sec*1000);
   return d.toISOString().replace('T',' ').replace('.000Z',' UTC').replace('Z',' UTC');
 }
 function fmtSpan(s){
+  if (s < 0.0009) return (s*1e6).toFixed(1)+' µs';
+  if (s < 0.9) return (s*1e3).toFixed(2)+' ms';
   if (s < 90) return s.toFixed(1)+' s';
   if (s < 5400) return (s/60).toFixed(1)+' min';
   if (s < 172800) return (s/3600).toFixed(1)+' h';
@@ -255,7 +277,14 @@ function drawCrisp(){
   // clip to the plot area so partial cells/images don't bleed into the margins
   ctx.save();
   ctx.beginPath(); ctx.rect(PAD.l, PAD.t, plotW(), plotH()); ctx.clip();
-  if (layerMode==='pfp' && pfpImg && pfpView){
+  if (layerMode==='iq' && iqImg && iqView){
+    // IQ capture spectrogram: image mapped to its time window AND freq band,
+    // exactly like the PSD layer (crisp nearest-neighbour, no smoothing).
+    const x0 = timeToX(iqView.t0), x1 = timeToX(iqView.t1);
+    const yT = freqToY(iqView.fmin), yB = freqToY(iqView.fmax);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(iqImg, x0, yT, Math.max(1, x1-x0), Math.max(1, yB-yT));
+  } else if (layerMode==='pfp' && pfpImg && pfpView){
     // PFP frame layer: X = capture time (positioned by timeToX like the other layers
     // so zooming gives live feedback), Y = frame position (0..10 ms, full height).
     const x0 = timeToX(pfpView.t0), x1 = timeToX(pfpView.t1);
@@ -324,9 +353,12 @@ function drawPreview(){
 }
 
 function niceTimeTicks(){
-  const span = view.t1 - view.t0, steps = [
-    1,2,5,10,15,30,60,120,300,600,1800,3600,7200,21600,43200,86400,
-    172800,604800,2592000,7776000,15552000,31536000];
+  const span = view.t1 - view.t0;
+  const steps = (mode==='iq')
+    ? [1e-7,2e-7,5e-7,1e-6,2e-6,5e-6,1e-5,2e-5,5e-5,1e-4,2e-4,5e-4,
+       0.001,0.002,0.005,0.01,0.02,0.05,0.1,0.2,0.5,1,2,5]
+    : [1,2,5,10,15,30,60,120,300,600,1800,3600,7200,21600,43200,86400,
+       172800,604800,2592000,7776000,15552000,31536000];
   const target = plotW()/110;
   let step = steps[steps.length-1];
   for (const s of steps){ if (span/s <= target){ step = s; break; } }
@@ -336,6 +368,11 @@ function niceTimeTicks(){
   return { ticks, step };
 }
 function tickLabel(t, step){
+  if (mode==='iq'){
+    if (step < 0.0009) return (t*1e6).toFixed(step<5e-6?1:0)+'µs';
+    if (step < 0.9) return (t*1e3).toFixed(step<0.005?1:0)+'ms';
+    return t.toFixed(step<5?1:0)+'s';
+  }
   const d = new Date(t*1000);
   if (step >= 2592000) return d.toISOString().slice(0,7);
   if (step >= 86400) return d.toISOString().slice(0,10);
@@ -392,12 +429,17 @@ const TILE_CACHE_MAX = 48;
 function cacheGet(url){ const v=tileCache.get(url); if (v){ tileCache.delete(url); tileCache.set(url,v); } return v; }
 function cacheSet(url,v){ tileCache.set(url,v); if (tileCache.size>TILE_CACHE_MAX) tileCache.delete(tileCache.keys().next().value); }
 
+function iqUrl(w,h){ let u=`/api/iq_layer?id=${enc(iqCap.id)}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&f0=${viewF.f0}&f1=${viewF.f1}&cmap=${cmapName}`;
+  if (iqScale) u+=`&vmin=${iqScale.vmin}&vmax=${iqScale.vmax}`; return u; }
 function pfpUrl(ch,h){ let u=`/api/pfp_frame?sensor=${enc(sensor)}&freq=${ch}&t0=${view.t0}&t1=${view.t1}&h=${h}&cmap=${cmapName}`;
   if (pfpScale[ch]) u+=`&vmin=${pfpScale[ch].vmin}&vmax=${pfpScale[ch].vmax}`; return u; }
 function psdUrl(w,h){ let u=`/api/psd_layer?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&f0=${viewF.f0}&f1=${viewF.f1}&cmap=${cmapName}`;
   if (psdScale) u+=`&vmin=${psdScale.vmin}&vmax=${psdScale.vmax}`; return u; }
 function sumUrl(w){ return `/api/heatmap?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&width=${w}`; }
 
+function applyIq(j, im){ iqImg=im; iqView=j; layerMode='iq'; if(!iqScale) iqScale={vmin:j.vmin,vmax:j.vmax};
+  document.getElementById('lo').textContent=iqScale.vmin.toFixed(0); document.getElementById('hi').textContent=iqScale.vmax.toFixed(0);
+  setLegendUnit('dBm'); updateStatButtons(); drawCrisp(); updateReadout(); }
 function applySummary(j){ data=j; layerMode='summary'; autoScale(); setLegendUnit('dBm'); updateStatButtons(); drawCrisp(); updateReadout(); }
 function applyPsd(j, im){ psdImg=im; psdView=j; layerMode='psd'; if(!psdScale) psdScale={vmin:j.vmin,vmax:j.vmax};
   document.getElementById('lo').textContent=psdScale.vmin.toFixed(0); document.getElementById('hi').textContent=psdScale.vmax.toFixed(0);
@@ -409,6 +451,7 @@ function applyPfp(j, im, ch){ pfpImg=im; pfpView=j; pfpFrameMs=j.frame_ms; layer
 // What would the current view fetch? (used for instant cache hits)
 function buildReq(){
   const span=view.t1-view.t0, freqSpan=viewF.f1-viewF.f0, w=Math.round(plotW()), h=Math.round(plotH());
+  if (mode==='iq' && iqCap) return {kind:'iq', url:iqUrl(w,h)};
   if (pfpAvail && freqSpan<=ONE_CHANNEL && span<=PFP_TIME_THRESHOLD){ const ch=nearestChannelHz(); return {kind:'pfp', url:pfpUrl(ch,h), ch}; }
   if (psdAvail && span<=PSD_THRESHOLD) return {kind:'psd', url:psdUrl(w,h)};
   return {kind:'summary', url:sumUrl(w)};
@@ -420,6 +463,7 @@ function requestData(){
   if (hit){ clearTimeout(fetchTimer); ++fetchSeq;   // instant: cancel debounce + in-flight fetch
     if (req.kind==='summary') applySummary(hit.data);
     else if (req.kind==='psd') applyPsd(hit.j, hit.img);
+    else if (req.kind==='iq') applyIq(hit.j, hit.img);
     else applyPfp(hit.j, hit.img, req.ch);
     setLoading(false); return;
   }
@@ -430,7 +474,15 @@ async function doFetch(){
   const seq=++fetchSeq; setLoading(true);
   const span=view.t1-view.t0, freqSpan=viewF.f1-viewF.f0, w=Math.round(plotW()), h=Math.round(plotH());
   try{
-    if (pfpAvail && freqSpan<=ONE_CHANNEL && span<=PFP_TIME_THRESHOLD){
+    if (mode==='iq' && iqCap){
+      const url=iqUrl(w,h);
+      const j=await (await fetch(url)).json();
+      if (seq!==fetchSeq) return;
+      if (j.error){ setLoading(false); return; }
+      const im=new Image();
+      im.onload=()=>{ if(seq!==fetchSeq) return; applyIq(j,im); cacheSet(url,{img:im,j}); setLoading(false); };
+      im.src=j.png;
+    } else if (pfpAvail && freqSpan<=ONE_CHANNEL && span<=PFP_TIME_THRESHOLD){
       const ch=nearestChannelHz(), url=pfpUrl(ch,h);
       const j=await (await fetch(url)).json();
       if (seq!==fetchSeq) return;
@@ -482,9 +534,27 @@ function updateReadout(){
   document.getElementById('winRange').textContent = fmtTs(view.t0)+'  →  '+fmtTs(view.t1);
   document.getElementById('winSpan').textContent = fmtSpan(view.t1-view.t0);
   document.getElementById('level').textContent =
-    (layerMode==='pfp' && pfpView) ? `PFP frame · ${(pfpView.freq/1e6).toFixed(0)} MHz · ${pfpView.ncap} captures × ${pfpView.npos} pts (≈${(pfpFrameMs*1000/pfpView.npos).toFixed(1)} µs)`
+    (layerMode==='iq' && iqView) ? `IQ STFT · pyramid level ${iqView.level} · ${iqView.cols} cols × ${iqView.nf} bins (${(iqCap.fs/iqCap.nfft/1e3).toFixed(1)} kHz)`
+    : (layerMode==='pfp' && pfpView) ? `PFP frame · ${(pfpView.freq/1e6).toFixed(0)} MHz · ${pfpView.ncap} captures × ${pfpView.npos} pts (≈${(pfpFrameMs*1000/pfpView.npos).toFixed(1)} µs)`
     : (layerMode==='psd' && psdView) ? (psdView.gap ? `PSD detail · ⚠ data gap — holding last capture` : `PSD detail · ${psdView.ncap} captures × 2250 bins @ 80 kHz`)
     : (data ? `${data.level} (${data.count.toLocaleString()} cells)` : '—');
+}
+
+// Invert the colormap at a canvas pixel -> approximate power (IQ readout).
+// The tile was painted through the SAME LUT with a locked vmin/vmax, so the
+// nearest LUT entry recovers the quantized dBm level.
+function powerAtPixel(x, y){
+  if (!iqScale) return null;
+  try{
+    const p = ctx.getImageData(Math.round(x*DPR), Math.round(y*DPR), 1, 1).data;
+    const lut = CMAP_LUTS[cmapName];
+    let best = 0, bd = 1e9;
+    for (let i=0;i<256;i++){ const c=lut[i];
+      const d=(c[0]-p[0])**2+(c[1]-p[1])**2+(c[2]-p[2])**2;
+      if (d<bd){ bd=d; best=i; } }
+    if (bd > 2500) return null;                       // not a colormap pixel (axes/bg)
+    return iqScale.vmin + best/255*(iqScale.vmax-iqScale.vmin);
+  }catch(e){ return null; }
 }
 
 // ---- Interaction ------------------------------------------------------
@@ -492,7 +562,7 @@ function updateReadout(){
 // data (no black margins when zoomed/panned out).
 function clampTimeView(){
   const range = meta.tmax - meta.tmin;
-  let span = Math.max(1, Math.min(view.t1 - view.t0, range));
+  let span = Math.max(mode==='iq'?1e-7:1, Math.min(view.t1 - view.t0, range));
   let t0 = view.t0;
   if (t0 + span > meta.tmax) t0 = meta.tmax - span;
   if (t0 < meta.tmin) t0 = meta.tmin;
@@ -518,16 +588,24 @@ stage.addEventListener('wheel', e=>{
 let drag=null;
 stage.addEventListener('pointerdown', e=>{ drag={x:e.offsetX, y:e.offsetY, t0:view.t0, t1:view.t1, f0:viewF.f0, f1:viewF.f1}; cv.classList.add('drag'); cv.setPointerCapture(e.pointerId); });
 stage.addEventListener('pointermove', e=>{
-  document.getElementById('cursor').textContent = fmtTs(xToTime(e.offsetX));
+  if (mode==='iq'){
+    // IQ readout: time within capture, true RF frequency, power (dBm)
+    const pw = powerAtPixel(e.offsetX, e.offsetY);
+    document.getElementById('cursor').textContent =
+      fmtRel(Math.max(0,xToTime(e.offsetX)))+' · '+(yToFreq(e.offsetY)/1e6).toFixed(3)+' MHz'
+      +(pw!=null ? ' · '+pw.toFixed(1)+' dBm' : '');
+  } else {
+    document.getElementById('cursor').textContent = fmtTs(xToTime(e.offsetX));
+  }
   if (!drag) return;
   const dt = (e.offsetX-drag.x)/plotW()*(drag.t1-drag.t0);
   view.t0=drag.t0-dt; view.t1=drag.t1-dt; clampTimeView();
   if (layerMode!=='pfp'){            // vertical drag pans frequency (Y means frame-pos in PFP)
     const df = (e.offsetY-drag.y)/plotH()*(drag.f1-drag.f0);
     let n0=drag.f0-df, n1=drag.f1-df;
-    if (n0<FULL_F0){ n1+=FULL_F0-n0; n0=FULL_F0; }
-    if (n1>FULL_F1){ n0-=n1-FULL_F1; n1=FULL_F1; }
-    viewF.f0=Math.max(FULL_F0,n0); viewF.f1=Math.min(FULL_F1,n1);
+    if (n0<BAND_F0){ n1+=BAND_F0-n0; n0=BAND_F0; }
+    if (n1>BAND_F1){ n0-=n1-BAND_F1; n1=BAND_F1; }
+    viewF.f0=Math.max(BAND_F0,n0); viewF.f1=Math.min(BAND_F1,n1);
     layoutFreqSlider();
   }
   requestData();
@@ -535,9 +613,9 @@ stage.addEventListener('pointermove', e=>{
 stage.addEventListener('pointerup', e=>{ drag=null; cv.classList.remove('drag'); });
 
 // ---- Frequency zoom slider (left): drag up = zoom in, bottom = full band ---
-const FULL_SPAN = FULL_F1 - FULL_F0;
-function spanToZoom(span){ return Math.log(FULL_SPAN/Math.max(span,MIN_FSPAN)) / Math.log(FULL_SPAN/MIN_FSPAN); }
-function zoomToSpan(z){ return FULL_SPAN * Math.pow(MIN_FSPAN/FULL_SPAN, Math.max(0,Math.min(1,z))); }
+function bandSpan(){ return BAND_F1 - BAND_F0; }        // full span of the current mode's band
+function spanToZoom(span){ const F=bandSpan(), m=minFSpan(); return Math.log(F/Math.max(span,m)) / Math.log(F/m); }
+function zoomToSpan(z){ const F=bandSpan(), m=minFSpan(); return F * Math.pow(m/F, Math.max(0,Math.min(1,z))); }
 function layoutFreqSlider(){
   const sl=document.getElementById('freqslider'), knob=document.getElementById('freqknob');
   const ph=plotH(); if (ph<=0) return;
@@ -545,19 +623,23 @@ function layoutFreqSlider(){
   const z=Math.max(0,Math.min(1, spanToZoom(viewF.f1-viewF.f0)));
   const knobH=16;
   knob.style.top=((1-z)*(ph-knobH))+'px';           // z=0 (full) bottom, z=1 (finest) top
-  // amber "PFP zone" band: from the top of the track down to the one-channel threshold
+  // amber "PFP zone" band: from the top of the track down to the one-channel
+  // threshold (CBRS only — IQ captures have no PFP layer)
   const pfpEl=document.getElementById('freqpfp');
-  if (pfpEl){ const zT=spanToZoom(ONE_CHANNEL); const yT=(1-zT)*(ph-knobH)+knobH/2;
-    pfpEl.style.top='0px'; pfpEl.style.height=Math.max(0,yT)+'px'; }
+  if (pfpEl){
+    if (mode==='iq'){ pfpEl.style.height='0px'; }
+    else { const zT=spanToZoom(ONE_CHANNEL); const yT=(1-zT)*(ph-knobH)+knobH/2;
+      pfpEl.style.top='0px'; pfpEl.style.height=Math.max(0,yT)+'px'; } }
 }
 function onFreqChange(){
-  if (viewF.f1-viewF.f0 < MIN_FSPAN){ const m=(viewF.f0+viewF.f1)/2; viewF.f0=m-MIN_FSPAN/2; viewF.f1=m+MIN_FSPAN/2; }
-  if (viewF.f0 < FULL_F0){ viewF.f1+=FULL_F0-viewF.f0; viewF.f0=FULL_F0; }
-  if (viewF.f1 > FULL_F1){ viewF.f0-=viewF.f1-FULL_F1; viewF.f1=FULL_F1; }
-  viewF.f0=Math.max(FULL_F0,viewF.f0); viewF.f1=Math.min(FULL_F1,viewF.f1);
+  const mf=minFSpan();
+  if (viewF.f1-viewF.f0 < mf){ const m=(viewF.f0+viewF.f1)/2; viewF.f0=m-mf/2; viewF.f1=m+mf/2; }
+  if (viewF.f0 < BAND_F0){ viewF.f1+=BAND_F0-viewF.f0; viewF.f0=BAND_F0; }
+  if (viewF.f1 > BAND_F1){ viewF.f0-=viewF.f1-BAND_F1; viewF.f1=BAND_F1; }
+  viewF.f0=Math.max(BAND_F0,viewF.f0); viewF.f1=Math.min(BAND_F1,viewF.f1);
   layoutFreqSlider(); requestData();
 }
-function resetFreq(){ viewF.f0=FULL_F0; viewF.f1=FULL_F1; layoutFreqSlider(); }
+function resetFreq(){ viewF.f0=BAND_F0; viewF.f1=BAND_F1; layoutFreqSlider(); }
 function setFreqZoom(z){
   z=Math.max(0,Math.min(1,z));
   const span=zoomToSpan(z), c=(viewF.f0+viewF.f1)/2;
@@ -580,10 +662,11 @@ function setFreqZoom(z){
 // ---- Time zoom slider (bottom): drag LEFT = full span, RIGHT = zoom in -----
 // Mirrors the frequency slider. The mouse-wheel zoom on the heatmap still works;
 // this is an additional, accessible control. The knob tracks the current span.
-const MIN_TSPAN = 60;   // finest span the slider reaches (s); the wheel can go finer
-function fullTSpan(){ return Math.max(1, meta.tmax - meta.tmin); }
-function tspanToZoom(span){ const F=fullTSpan(); return Math.log(F/Math.max(span,MIN_TSPAN)) / Math.log(F/MIN_TSPAN); }
-function tzoomToSpan(z){ const F=fullTSpan(); return F * Math.pow(MIN_TSPAN/F, Math.max(0,Math.min(1,z))); }
+// finest span the slider reaches; the wheel can go finer. IQ captures are
+// seconds long, so their slider floor scales with duration (see minTSpan()).
+function fullTSpan(){ return Math.max(mode==='iq'?1e-6:1, meta.tmax - meta.tmin); }
+function tspanToZoom(span){ const F=fullTSpan(), m=minTSpan(); return Math.log(F/Math.max(span,m)) / Math.log(F/m); }
+function tzoomToSpan(z){ const F=fullTSpan(), m=minTSpan(); return F * Math.pow(m/F, Math.max(0,Math.min(1,z))); }
 function layoutTimeSlider(){
   const tb=document.getElementById('timebar'), knob=document.getElementById('timeknob');
   if (!tb || !meta) return;
@@ -613,7 +696,41 @@ document.querySelectorAll('[data-stat]').forEach(b=>b.addEventListener('click', 
   b.classList.add('active'); stat=b.dataset.stat;
   if (data){ autoScale(); drawCrisp(); }
 }));
+// ---- Source/mode switcher: CBRS monitoring <-> independent IQ captures ----
+function clearLayers(){ psdImg=null; psdView=null; pfpImg=null; pfpView=null; iqImg=null; iqView=null; cacheView=null; tileCache.clear(); }
+async function enterIqMode(id){
+  const j = await (await fetch('/api/iq_meta?id='+enc(id))).json();
+  if (!j.has){ console.error('unknown IQ capture', id); return; }
+  if (mode==='cbrs') savedCbrs = { tmin:meta.tmin, tmax:meta.tmax, view:{...view}, viewF:{...viewF} };
+  mode='iq'; iqCap=j; iqScale={vmin:j.vmin, vmax:j.vmax};
+  clearLayers(); layerMode='iq';
+  psdAvail=false; pfpAvail=false;                     // CBRS drill layers are off in IQ mode
+  BAND_F0=j.fc-j.fs/2; BAND_F1=j.fc+j.fs/2;
+  meta.tmin=0; meta.tmax=j.duration;
+  view={t0:0, t1:j.duration}; viewF={f0:BAND_F0, f1:BAND_F1};
+  document.getElementById('sensor').disabled=true;
+  document.getElementById('lo').textContent=iqScale.vmin.toFixed(0);
+  document.getElementById('hi').textContent=iqScale.vmax.toFixed(0);
+  resetFreq(); layoutTimeSlider(); requestData();
+}
+function enterCbrsMode(){
+  mode='cbrs'; iqCap=null; iqScale=null;
+  clearLayers(); layerMode='summary';
+  BAND_F0=FULL_F0; BAND_F1=FULL_F1;
+  const s = savedCbrs;
+  if (s){ meta.tmin=s.tmin; meta.tmax=s.tmax; view={...s.view}; viewF={...s.viewF}; }
+  else { const se=meta.sensors.find(x=>x.sensor===sensor); meta.tmin=se.t_min; meta.tmax=se.t_max;
+         view={t0:meta.tmin,t1:meta.tmax}; viewF={f0:FULL_F0,f1:FULL_F1}; }
+  document.getElementById('sensor').disabled=false;
+  layoutFreqSlider(); layoutTimeSlider(); requestData();
+  checkPsd(); checkPfp();
+}
+document.getElementById('source').addEventListener('change', e=>{
+  const v=e.target.value;
+  if (v==='cbrs') enterCbrsMode(); else enterIqMode(v.slice(3));
+});
 document.getElementById('sensor').addEventListener('change', async e=>{
+  if (mode!=='cbrs') return;
   sensor=e.target.value; const s=meta.sensors.find(x=>x.sensor===sensor);
   meta.tmin=s.t_min; meta.tmax=s.t_max; view={t0:s.t_min,t1:s.t_max}; cacheView=null;
   psdImg=null; psdView=null; pfpImg=null; pfpView=null; layerMode='summary'; resetFreq(); layoutTimeSlider();
@@ -632,11 +749,15 @@ function exportPNG(){
   const hmW=W-2*M, hmH=Math.round(hmW * src.height/src.width);
   const lo=document.getElementById('lo').textContent, hi=document.getElementById('hi').textContent,
         unit=document.getElementById('unit').textContent;
-  const layerName = layerMode==='pfp' ? 'PFP frame (~18 µs, folded 10 ms frame)'
+  const layerName = layerMode==='iq' ? 'IQ capture STFT spectrogram'
+                  : layerMode==='pfp' ? 'PFP frame (~18 µs, folded 10 ms frame)'
                   : layerMode==='psd' ? 'PSD (2250 bins @ 80 kHz)'
                   : 'Summary (channel power, ~90 s sweeps)';
   const rows=[];
-  rows.push(['Sensor', sensor]);
+  const srcName = (mode==='iq' && iqCap) ? iqCap.name : sensor;
+  rows.push([mode==='iq' ? 'Capture' : 'Sensor', srcName]);
+  if (mode==='iq' && iqCap) rows.push(['Capture params',
+    (iqCap.fc/1e6).toFixed(3)+' MHz centre · '+(iqCap.fs/1e6).toFixed(2)+' Msps · '+iqCap.duration.toFixed(2)+' s · '+iqCap.dataset]);
   rows.push(['Layer', layerName + (layerMode==='summary' ? '   ·   statistic: '+stat : '')]);
   rows.push(['Time window (UTC)', fmtTs(view.t0)+'   →   '+fmtTs(view.t1)]);
   rows.push(['Time span', fmtSpan(view.t1-view.t0)]);
@@ -662,7 +783,7 @@ function exportPNG(){
   let y=M;
   g.textBaseline='top'; g.textAlign='left';
   g.fillStyle='#e8edf6'; g.font='bold 24px ui-sans-serif, system-ui, Segoe UI, sans-serif';
-  g.fillText('RF Spectrum Viewer — '+sensor, M, y);
+  g.fillText('RF Spectrum Viewer — '+srcName, M, y);
   g.fillStyle='#8b93a3'; g.font='14px ui-sans-serif';
   g.fillText(layerName, M, y+32);
   y += titleH+14;
@@ -690,7 +811,7 @@ function exportPNG(){
   g.fillStyle='#69718a'; g.font='13px ui-sans-serif'; g.textAlign='right';
   g.fillText('@Jimmy Lu 2026', W-M, y-rowH/2);
   g.textAlign='left';
-  const fn = 'spectrum_'+sensor.replace(/[^A-Za-z0-9-]/g,'')+'_'+new Date().toISOString().replace(/[:T]/g,'-').slice(0,19)+'.png';
+  const fn = 'spectrum_'+srcName.replace(/[^A-Za-z0-9-]/g,'')+'_'+new Date().toISOString().replace(/[:T]/g,'-').slice(0,19)+'.png';
   c.toBlob(b=>{ if(!b) return; const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=fn; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),5000); }, 'image/png');
   return c;
 }
@@ -700,7 +821,7 @@ document.getElementById('cmap').addEventListener('change', e=>{
   try { localStorage.setItem('cmap', cmapName); } catch(_){}
   drawLegend();
   if (layerMode==='summary'){ drawCrisp(); }          // summary is client-drawn — recolours instantly
-  else { psdImg=null; pfpImg=null; requestData(); }    // PSD/PFP PNGs must re-render server-side
+  else { psdImg=null; pfpImg=null; iqImg=null; requestData(); }  // PSD/PFP/IQ tiles must re-render server-side
 });
 
 function drawLegend(){
@@ -966,20 +1087,35 @@ async function boot(){
   new ResizeObserver(resize).observe(stage);
   resize(); requestData();              // paint the (full-span) summary immediately
   checkPsd(); checkPfp();               // availability flags load in parallel — don't block first paint
+  loadIqIndex();                        // IQ capture library (optional; header dropdown)
+}
+async function loadIqIndex(){
+  try{
+    const j = await (await fetch('/api/iq_index')).json();
+    const sel = document.getElementById('source');
+    (j.captures||[]).forEach(c=>{
+      const o=document.createElement('option');
+      o.value='iq:'+c.id;
+      o.textContent=`IQ capture: ${c.name} (${c.dataset} · ${(c.fc/1e6).toFixed(0)} MHz · ${(c.fs/1e6).toFixed(2)} Msps · ${c.duration.toFixed(1)} s)`;
+      sel.appendChild(o);
+    });
+  }catch(e){}
 }
 async function checkPsd(){
   psdAvail = false;
-  try { const j = await (await fetch('/api/psd_meta?sensor='+enc(sensor))).json(); psdAvail = !!j.has; }
+  try { const j = await (await fetch('/api/psd_meta?sensor='+enc(sensor))).json(); if (mode==='cbrs') psdAvail = !!j.has; }
   catch(e){}
-  if (psdAvail && (view.t1-view.t0)<=PSD_THRESHOLD) requestData();   // upgrade if already zoomed in
+  if (mode==='cbrs' && psdAvail && (view.t1-view.t0)<=PSD_THRESHOLD) requestData();   // upgrade if already zoomed in
 }
 async function checkPfp(){
   pfpAvail = false;
-  try { const j = await (await fetch('/api/pfp_meta?sensor='+enc(sensor))).json(); pfpAvail = !!j.has; if (j.frame_ms) pfpFrameMs=j.frame_ms; }
+  try { const j = await (await fetch('/api/pfp_meta?sensor='+enc(sensor))).json(); if (mode==='cbrs'){ pfpAvail = !!j.has; if (j.frame_ms) pfpFrameMs=j.frame_ms; } }
   catch(e){}
-  if (pfpAvail && (viewF.f1-viewF.f0)<=ONE_CHANNEL && (view.t1-view.t0)<=PFP_TIME_THRESHOLD) requestData();
+  if (mode==='cbrs' && pfpAvail && (viewF.f1-viewF.f0)<=ONE_CHANNEL && (view.t1-view.t0)<=PFP_TIME_THRESHOLD) requestData();
 }
 boot();
+// IQ capture mode: header "Source" dropdown switches between CBRS monitoring
+// and independent IQ captures (own time/frequency axes per capture).
 </script>
 </body>
 </html>

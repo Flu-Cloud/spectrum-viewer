@@ -7,6 +7,11 @@
 tiles/
 seadata/
 
+# Raw IQ capture downloads (NIST datasets; rebuild iq.duckdb via iq_ingest.py)
+iqdata/
+*.bak
+.fuse_hidden*
+
 # ---- Logs ----
 *.log
 

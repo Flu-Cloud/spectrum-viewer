@@ -362,6 +362,121 @@ def pfp_frame():
     })
 
 
+# ---- IQ capture mode (independent SigMF/TDMS captures; own axes) ------
+# Renders come from the iq.duckdb STFT pyramid built by iq_ingest.py.
+# Thread-safe: every request opens its own read-only connection (renders can
+# run in parallel; iq_ingest may also be appending to the DB).
+IQ_DB = os.environ.get("IQ_DB", os.path.join(HERE, "iq.duckdb"))
+
+
+def iq_conn():
+    if not os.path.exists(IQ_DB):
+        return None
+    try:
+        return duckdb.connect(IQ_DB, read_only=True)
+    except Exception:
+        return None
+
+
+@app.route("/api/iq_index")
+def iq_index():
+    c = iq_conn()
+    if c is None:
+        return jsonify({"captures": []})
+    rows = c.execute("SELECT id, name, dataset, fc, fs, duration FROM iq_meta "
+                     "ORDER BY dataset, name").fetchall()
+    c.close()
+    return jsonify({"captures": [
+        {"id": r[0], "name": r[1], "dataset": r[2], "fc": r[3], "fs": r[4],
+         "duration": r[5]} for r in rows]})
+
+
+@app.route("/api/iq_meta")
+def iq_meta():
+    c = iq_conn()
+    row = c and c.execute(
+        "SELECT id, dataset, name, fc, fs, duration, n_samples, nfft, nfreq, "
+        "hop, nlevels, vmin, vmax FROM iq_meta WHERE id=?",
+        [request.args.get("id")]).fetchone()
+    if c:
+        c.close()
+    if not row:
+        return jsonify({"has": False})
+    k = ["id", "dataset", "name", "fc", "fs", "duration", "n_samples", "nfft",
+         "nfreq", "hop", "nlevels", "vmin", "vmax"]
+    return jsonify({"has": True, **dict(zip(k, row))})
+
+
+@app.route("/api/iq_layer")
+def iq_layer():
+    """WebP tile of one capture's spectrogram for a [t0,t1]x[f0,f1] window.
+    Picks the finest pyramid level with <= ~2*w columns (mirrors pick_level)."""
+    cid = request.args.get("id")
+    c = iq_conn()
+    if c is None:
+        return jsonify({"error": "iq layer not ready"}), 503
+    m = c.execute("SELECT fc, fs, duration, nfft, hop, nlevels, qmin, qmax, "
+                  "vmin, vmax FROM iq_meta WHERE id=?", [cid]).fetchone()
+    if not m:
+        c.close()
+        return jsonify({"error": "unknown capture"}), 404
+    fc, fs, dur, nfft, hop, nlevels, qmin, qmax, dvmin, dvmax = m
+    t0 = max(0.0, float(request.args.get("t0", 0)))
+    t1 = min(dur, float(request.args.get("t1", dur)))
+    W = max(1, int(request.args.get("w", 1200)))
+    H = max(1, int(request.args.get("h", 600)))
+    fmin_full, fmax_full = fc - fs / 2, fc + fs / 2
+    f0 = max(fmin_full, float(request.args.get("f0", fmin_full)))
+    f1 = min(fmax_full, float(request.args.get("f1", fmax_full)))
+    if t1 <= t0 or f1 <= f0:
+        c.close()
+        return jsonify({"error": "empty window"}), 400
+    # finest level whose column count over this span <= 2*w (like pick_level)
+    span_cols0 = (t1 - t0) * fs / hop
+    level = 0
+    while level < nlevels - 1 and span_cols0 / (1 << level) > 2 * W:
+        level += 1
+    colw = hop * (1 << level) / fs                    # seconds per column
+    c0 = int(t0 / colw)
+    c1 = max(c0 + 1, int(math.ceil(t1 / colw)))
+    rows = c.execute(
+        "SELECT col0, ncols, chunk FROM iq_stft WHERE id=? AND level=? "
+        "AND col0 < ? AND col0 + ncols > ? ORDER BY col0",
+        [cid, level, c1, c0]).fetchall()
+    c.close()
+    if not rows:
+        return jsonify({"error": "no data in window"}), 404
+    mat = np.concatenate([np.frombuffer(r[2], dtype=np.uint8).reshape(r[1], nfft)
+                          for r in rows])                       # (cols, nfft)
+    base = rows[0][0]
+    c0 = max(c0, base); c1 = min(c1, base + mat.shape[0])
+    mat = mat[c0 - base:c1 - base]
+    # frequency slice: row 0 of the fftshifted STFT = fc - fs/2 (low freq)
+    df = fs / nfft
+    fi0 = max(0, int((f0 - fmin_full) / df))
+    fi1 = min(nfft, max(fi0 + 1, int(math.ceil((f1 - fmin_full) / df))))
+    band = mat[:, fi0:fi1].astype(np.float32).T       # (nbins, ncols) row0 = low f
+    nbins = band.shape[0]
+    fb = max(1, math.ceil(nbins / H))                 # bin freq down to <= H rows
+    pad = (-nbins) % fb
+    if pad:
+        band = np.pad(band, ((0, pad), (0, 0)))
+    img = band.reshape(band.shape[0] // fb, fb, -1).max(axis=1)
+    img = qmin + (img / 255.0) * (qmax - qmin)        # uint8 -> dBm
+    qv0, qv1 = request.args.get("vmin"), request.args.get("vmax")
+    vmin = float(qv0) if qv0 is not None else dvmin   # locked scale: no drift on zoom
+    vmax = float(qv1) if qv1 is not None else dvmax
+    rgb = tier2._colorize(img, vmin, vmax, request.args.get("cmap", "inferno"))
+    return jsonify({
+        "png": tier2._b64(tier2._encode(rgb)),
+        "t0": c0 * colw, "t1": c1 * colw,
+        "fmin": fmin_full + fi0 * df, "fmax": fmin_full + fi1 * df,
+        "cols": int(img.shape[1]), "nf": int(img.shape[0]), "level": level,
+        "vmin": round(vmin, 1), "vmax": round(vmax, 1),
+    })
+
+
 if __name__ == "__main__":
+    # launched via .claude/launch.json ("spectrum") -> port 8090
     port = int(os.environ.get("SEA_PORT", "8000"))
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
