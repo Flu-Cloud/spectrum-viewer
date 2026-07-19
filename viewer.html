@@ -3,123 +3,163 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Spectrum Overview — 2 year viewer</title>
+<title>RF Spectrum Viewer</title>
 <style>
-  :root { color-scheme: dark; }
+  /* Design tokens — one source of truth for the whole UI. */
+  :root {
+    color-scheme: dark;
+    --bg: #0b0d12;            /* page chrome */
+    --plot-bg: #05070b;       /* canvas plot area */
+    --surface: #12161f;       /* header / footer */
+    --surface-2: #1a2030;     /* controls */
+    --surface-3: #232b3e;     /* controls hover */
+    --border: #262e40;
+    --text: #dde2ea;
+    --text-mut: #97a0b2;
+    --text-dim: #7a8499;
+    --accent: #3d7bfd;
+    --accent-hi: #5f93ff;
+    --accent-strong: #2f66e0; /* active-state fill: white text passes 4.5:1 on this */
+    --border-hi: #33405c;     /* hover borders */
+    --knob-ring: #dbe7ff;
+    --amber: #f0a500;         /* PFP zone marker */
+    --track: #242c3d;         /* slider tracks (quiet, on-theme) */
+    --r: 8px; --r-sm: 6px;
+    --dur: .15s;
+  }
   * { box-sizing: border-box; }
-  /* make the `hidden` attribute authoritative even when an element also has a
-     display rule (e.g. #overlay{display:flex}, .group{display:flex}). Without
-     this the overlay stays visible and covers the heatmap. */
-  [hidden] { display: none !important; }
-  html, body { margin: 0; height: 100%; background: #0d0f14; color: #d7dae0;
-               font: 13px/1.4 ui-sans-serif, system-ui, Segoe UI, sans-serif; }
+  [hidden] { display: none !important; }   /* `hidden` beats any display rule */
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+               font: 13px/1.45 ui-sans-serif, system-ui, "Segoe UI", sans-serif; }
   #app { display: flex; flex-direction: column; height: 100%; }
-  header { display: flex; gap: 16px; align-items: center; padding: 8px 14px;
-           background: #151922; border-bottom: 1px solid #232836; flex-wrap: wrap; }
-  header label { color: #8b93a3; margin-right: 4px; }
-  select, button { background: #1d2330; color: #d7dae0; border: 1px solid #2c3344;
-                   border-radius: 6px; padding: 5px 9px; font: inherit; cursor: pointer; }
-  button.active { background: #2d5fd0; border-color: #3d72e8; color: #fff; }
-  .group { display: flex; gap: 6px; align-items: center; }
+
+  /* ---- Header toolbar ---- */
+  header { display: flex; gap: 16px; align-items: center; padding: 8px 16px;
+           background: var(--surface); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  header label { color: var(--text-dim); margin-right: 2px; font-size: 11px;
+                 font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+  .group { display: flex; gap: 8px; align-items: center; }
+  select, button {
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: var(--r-sm); padding: 6px 10px; font: inherit; cursor: pointer;
+    transition: background var(--dur), border-color var(--dur);
+  }
+  select:hover, button:hover { background: var(--surface-3); border-color: var(--border-hi); }
+  select:focus-visible, button:focus-visible, .zoombar:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:active { transform: translateY(0.5px); }
+  button svg { width: 13px; height: 13px; vertical-align: -2px; margin-right: 5px;
+               stroke: currentColor; fill: none; stroke-width: 2;
+               stroke-linecap: round; stroke-linejoin: round; }
+  /* segmented control (summary statistic) */
+  .seg { display: inline-flex; background: var(--surface-2); border: 1px solid var(--border);
+         border-radius: var(--r-sm); padding: 2px; gap: 2px; }
+  .seg button { border: 0; background: transparent; border-radius: 4px; padding: 4px 10px;
+                color: var(--text-mut); }
+  .seg button:hover:not(:disabled) { background: var(--surface-3); color: var(--text); }
+  .seg button.active { background: var(--accent-strong); color: #fff; }
+  .seg button:disabled { cursor: default; opacity: .4; }
+  /* outside summary mode the layers are max-only: show `max` as what's really
+     rendered, while remembering the user's choice for when summary returns */
+  .seg.max-only button.active { background: transparent; color: var(--text-mut); }
+  .seg.max-only button[data-stat="max"] { background: var(--accent-strong); color: #fff; opacity: 1; }
+  #legend { display: flex; align-items: center; gap: 7px; color: var(--text-mut);
+            font-variant-numeric: tabular-nums; }
+  #legend canvas { position: static; width: 120px; height: 12px; border-radius: 3px;
+                   outline: 1px solid var(--border); cursor: default; }
+  .hint { color: var(--text-dim); }
+  kbd { background: var(--surface-2); border: 1px solid var(--border); border-bottom-width: 2px;
+        border-radius: 4px; padding: 0 5px; font: 11px ui-monospace, monospace; color: var(--text-mut); }
+
+  /* ---- Plot stage ---- */
   #stage { position: relative; flex: 1; overflow: hidden; }
-  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block;
-           cursor: grab; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; }
   canvas.drag { cursor: grabbing; }
-  footer { padding: 6px 14px; background: #151922; border-top: 1px solid #232836;
-           color: #9aa3b4; display: flex; gap: 22px; flex-wrap: wrap; }
-  footer b { color: #d7dae0; font-weight: 600; }
-  .hint { color:#69718a; }
-  #legend { display:flex; align-items:center; gap:6px; }
-  #legend canvas { position: static; width: 120px; height: 12px; border-radius: 3px; }
-  /* --- Zoom sliders: light rounded track + round blue knob (accessible) --- */
-  #freqslider { position: absolute; left: 2px; width: 22px; z-index: 12; cursor: pointer; }
-  #freqtrack { position: absolute; left: 8px; top: 0; width: 6px; height: 100%;
-               background: #e6e9ef; border-radius: 3px; }
-  /* highlighted top segment of the track = the "PFP zone" (narrow to ~1 channel) */
-  #freqpfp { position: absolute; left: 8px; width: 6px; background: #f0a500;
-             opacity: .85; border-radius: 3px; pointer-events: none; }
-  #freqknob { position: absolute; left: 3px; width: 16px; height: 16px; background: #2b7fff;
-              border: 2px solid #eaf1ff; border-radius: 50%; cursor: grab;
-              box-shadow: 0 1px 5px rgba(0,0,0,.55); }
-  #freqknob:hover { background: #3d8bff; }
-  #freqknob.grab { cursor: grabbing; }
+
+  /* ---- Zoom sliders: quiet track, accent knob ---- */
+  .zoombar { touch-action: none; }
+  #freqslider { position: absolute; left: 2px; width: 24px; z-index: 12; cursor: pointer; }
+  #freqtrack { position: absolute; left: 9px; top: 0; width: 6px; height: 100%;
+               background: var(--track); border-radius: 3px; }
+  #freqpfp { position: absolute; left: 9px; width: 6px; background: var(--amber);
+             opacity: .7; border-radius: 3px; pointer-events: none; }
+  #timebar { position: relative; height: 24px; margin: 5px 14px 2px 64px; cursor: pointer; }
+  #timetrack { position: absolute; left: 0; right: 0; top: 9px; height: 6px;
+               background: var(--track); border-radius: 3px; }
+  .knob { position: absolute; width: 16px; height: 16px; border-radius: 50%;
+          background: var(--accent); border: 2px solid var(--knob-ring); cursor: grab;
+          box-shadow: 0 1px 6px rgba(0,0,0,.6);
+          transition: transform var(--dur), background var(--dur); }
+  .knob:hover { background: var(--accent-hi); transform: scale(1.12); }
+  .knob.grab { cursor: grabbing; transform: scale(1.12); }
+  #freqknob { left: 4px; }
+  #timeknob { top: 4px; }
   #freqlabel { position: absolute; left: 0; bottom: 2px; width: 56px; text-align: center;
-               font-size: 10px; line-height: 1.1; color: #8b93a3; z-index: 12; pointer-events: none; }
-  #timebar { position: relative; height: 20px; margin: 6px 14px 0 64px; cursor: pointer; }
-  #timetrack { position: absolute; left: 0; right: 0; top: 7px; height: 6px;
-               background: #e6e9ef; border-radius: 3px; }
-  #timeknob { position: absolute; top: 2px; width: 16px; height: 16px; background: #2b7fff;
-              border: 2px solid #eaf1ff; border-radius: 50%; cursor: grab;
-              box-shadow: 0 1px 5px rgba(0,0,0,.55); }
-  #timeknob:hover { background: #3d8bff; }
-  #timeknob.grab { cursor: grabbing; }
-  #sliderhint { text-align: center; color: #8b93a3; font-size: 12px; padding: 3px 0 2px; }
+               font-size: 10px; line-height: 1.2; color: var(--text-dim); z-index: 12;
+               pointer-events: none; }
+  #sliderhint { text-align: center; color: var(--text-dim); font-size: 11.5px; padding: 2px 0 4px; }
+
+  /* ---- Loading indicator ---- */
   #loadbar { position: absolute; left: 64px; right: 14px; top: 10px; height: 2px; z-index: 14;
-             overflow: hidden; opacity: 0; transition: opacity .15s; pointer-events: none; }
+             overflow: hidden; opacity: 0; transition: opacity var(--dur); pointer-events: none; }
   #loadbar.on { opacity: 1; }
-  #loadbar::before { content:''; position:absolute; left:0; top:0; height:100%; width:35%;
-             background: linear-gradient(90deg, transparent, #4a7ae8, transparent);
+  #loadbar::before { content: ''; position: absolute; left: 0; top: 0; height: 100%; width: 35%;
+             background: linear-gradient(90deg, transparent, var(--accent-hi), transparent);
              animation: lb 1s linear infinite; }
-  @keyframes lb { 0%{ left:-35%; } 100%{ left:100%; } }
-  #drillMenu { position: absolute; z-index: 20; top: 6px; left: 6px; background: #1d2330;
-               border: 1px solid #2c3344; border-radius: 8px; padding: 8px; min-width: 220px;
-               box-shadow: 0 8px 24px rgba(0,0,0,.5); max-height: 70%; overflow:auto; }
-  #drillMenu h4 { margin: 6px 4px 4px; color: #8b93a3; font-size: 11px; font-weight: 600;
-                  text-transform: uppercase; letter-spacing: .04em; }
-  #drillMenu .row { padding: 5px 8px; border-radius: 5px; cursor: pointer; color:#d7dae0; }
-  #drillMenu .row:hover { background: #2d5fd0; }
-  #drillMenu .empty { padding: 5px 8px; color: #69718a; font-style: italic; }
-  #overlay { position: absolute; inset: 0; z-index: 15; background: #0d0f14;
-             display: flex; flex-direction: column; }
-  #ovBar { display: flex; align-items: center; gap: 10px; padding: 7px 12px;
-           background: #151922; border-bottom: 1px solid #232836; }
-  #crumb { color: #d7dae0; font-weight: 600; }
-  #crumb .sep { color: #69718a; font-weight: 400; margin: 0 6px; }
-  #ovCanvasWrap { flex: 1; position: relative; min-height: 0; }
-  #ovcv { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; }
-  #ovFoot { padding: 6px 12px; background: #151922; border-top: 1px solid #232836; color:#9aa3b4; }
+  @keyframes lb { 0% { left: -35%; } 100% { left: 100%; } }
+
+  /* ---- Footer status bar ---- */
+  footer { padding: 7px 16px; background: var(--surface); border-top: 1px solid var(--border);
+           color: var(--text-dim); display: flex; gap: 24px; flex-wrap: wrap;
+           font-variant-numeric: tabular-nums; }
+  footer span.k { font-size: 11px; font-weight: 600; text-transform: uppercase;
+                  letter-spacing: .05em; margin-right: 6px; }
+  footer b { color: var(--text); font-weight: 500; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before { transition: none !important; animation: none !important; }
+    /* with the sweep animation off, show loading as a solid full-width bar */
+    #loadbar::before { width: 100%; background: var(--accent-hi); }
+  }
 </style>
 </head>
 <body>
 <div id="app">
   <header>
-    <div class="group"><label>Source</label><select id="source"><option value="cbrs">CBRS SEA monitoring</option></select></div>
-    <div class="group"><label>Sensor</label><select id="sensor"></select></div>
+    <div class="group"><label>Source</label><select id="source" aria-label="Data source"><option value="cbrs">CBRS SEA monitoring</option></select></div>
+    <div class="group"><label>Sensor</label><select id="sensor" aria-label="Sensor"></select></div>
     <div class="group"><label>Show</label>
-      <button data-stat="max" class="active">max</button>
-      <button data-stat="median">median</button>
-      <button data-stat="mean">mean</button>
+      <span class="seg" role="group" aria-label="Summary statistic">
+        <button data-stat="max" class="active" aria-pressed="true">max</button>
+        <button data-stat="median" aria-pressed="false">median</button>
+        <button data-stat="mean" aria-pressed="false">mean</button>
+      </span>
     </div>
-    <div class="group"><button id="reset">⤢ Full span</button></div>
-    <div class="group"><button id="exportBtn" title="Export the current view + statistics as a PNG image for reports/sharing">⤓ Export PNG</button></div>
-    <div class="group"><label>Colors</label><select id="cmap"><option value="inferno">Inferno</option><option value="turbo">Turbo</option></select></div>
-    <div class="group" id="legend"><span id="lo"></span><canvas id="cbar"></canvas><span id="hi"></span><span id="unit" style="color:#69718a">dBm</span></div>
-    <div class="group" style="color:#69718a">scroll = time zoom · <b style="color:#9db2e8">Ctrl+scroll = freq zoom</b> · drag = pan</div>
+    <div class="group"><button id="reset" title="Zoom back out to the full time span and full band">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>Full span</button></div>
+    <div class="group"><button id="exportBtn" title="Export the current view + statistics as a PNG image for reports/sharing">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>Export PNG</button></div>
+    <div class="group"><label>Colors</label><select id="cmap" aria-label="Colormap"><option value="inferno">Inferno</option><option value="turbo">Turbo</option></select></div>
+    <div class="group" id="legend"><span id="lo"></span><canvas id="cbar"></canvas><span id="hi"></span><span id="unit" class="hint">dBm</span></div>
+    <div class="group hint">scroll = time zoom · <kbd>Ctrl</kbd>+scroll = freq zoom · drag = pan</div>
   </header>
   <div id="stage">
     <canvas id="cv"></canvas>
-    <div id="freqslider" title="Frequency zoom — knob at BOTTOM = full band; drag UP to zoom into frequency. The amber zone near the top = one channel, where the PFP (~18µs frame) layer appears. Drag the heatmap up/down to pan frequency."><div id="freqtrack"></div><div id="freqpfp" title="PFP zone — narrow to one channel here for ~18µs frame detail"></div><div id="freqknob"></div></div>
+    <div id="freqslider" class="zoombar" tabindex="0" role="slider" aria-label="Frequency zoom"
+         aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-orientation="vertical"
+         title="Frequency zoom — knob at BOTTOM = full band; drag UP to zoom into frequency. The amber zone near the top = one channel, where the PFP (~18µs frame) layer appears. Drag the heatmap up/down to pan frequency."><div id="freqtrack"></div><div id="freqpfp" title="PFP zone — narrow to one channel here for ~18µs frame detail"></div><div id="freqknob" class="knob"></div></div>
     <div id="freqlabel">freq zoom</div>
     <div id="loadbar"></div>
-    <div id="drillMenu" hidden></div>
-    <div id="overlay" hidden>
-      <div id="ovBar">
-        <span id="crumb"></span>
-        <span style="flex:1"></span>
-        <span class="group" id="ovChanWrap" hidden><label>Channel</label><select id="ovChan"></select></span>
-        <button id="ovClose">✕ Close</button>
-      </div>
-      <div id="ovCanvasWrap"><canvas id="ovcv"></canvas></div>
-      <div id="ovFoot"><span id="ovReadout">—</span></div>
-    </div>
   </div>
-  <div id="timebar" title="Time zoom — knob at LEFT = full span; drag RIGHT to zoom into time. Drag the heatmap left/right to pan time."><div id="timetrack"></div><div id="timeknob"></div></div>
+  <div id="timebar" class="zoombar" tabindex="0" role="slider" aria-label="Time zoom"
+       aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
+       title="Time zoom — knob at LEFT = full span; drag RIGHT to zoom into time. Drag the heatmap left/right to pan time."><div id="timetrack"></div><div id="timeknob" class="knob"></div></div>
   <div id="sliderhint">time zoom · drag image to pan</div>
   <footer>
-    <div>Window: <b id="winRange">—</b></div>
-    <div>Span: <b id="winSpan">—</b></div>
-    <div>Detail level: <b id="level">—</b></div>
-    <div>Cursor: <b id="cursor">—</b></div>
+    <div><span class="k">Window</span><b id="winRange">—</b></div>
+    <div><span class="k">Span</span><b id="winSpan">—</b></div>
+    <div><span class="k">Detail</span><b id="level">—</b></div>
+    <div><span class="k">Cursor</span><b id="cursor">—</b></div>
   </footer>
 </div>
 <script>
@@ -184,7 +224,7 @@ function nearestChannelHz(){            // channel centre nearest the freq-windo
 }
 
 // ---- Colormaps (selectable via the Colors dropdown) --------------------
-// Same maths mirrored server-side in tier2.py so this client-drawn summary and
+// Same maths mirrored server-side in serve.py so this client-drawn summary and
 // the server-rendered PSD/PFP PNGs match. 'inferno' = dark→bright (low power
 // dark); 'turbo' = the classic blue-green-yellow-red.
 const INFERNO_ANCHORS = [
@@ -271,7 +311,7 @@ function drawCrisp(){
   if (!syncCanvasSize()) return;   // size the canvas to the stage before drawing
   ctx.setTransform(DPR,0,0,DPR,0,0);
   ctx.clearRect(0,0,cv.clientWidth,cv.clientHeight);
-  ctx.fillStyle = '#05070b';
+  ctx.fillStyle = COL.plotBg;
   ctx.fillRect(PAD.l,PAD.t,plotW(),plotH());
 
   // clip to the plot area so partial cells/images don't bleed into the margins
@@ -331,7 +371,7 @@ function drawPreview(){
   if (!cacheView || cache.width === 0 || cache.height === 0) { drawCrisp(); return; }
   ctx.setTransform(DPR,0,0,DPR,0,0);
   ctx.clearRect(0,0,cv.clientWidth,cv.clientHeight);
-  ctx.fillStyle = '#05070b'; ctx.fillRect(PAD.l,PAD.t,plotW(),plotH());
+  ctx.fillStyle = COL.plotBg; ctx.fillRect(PAD.l,PAD.t,plotW(),plotH());
   // map cached window onto current axes (time = x; y = freq, or full height in PFP)
   const sx0 = timeToX(cacheView.t0), sx1 = timeToX(cacheView.t1);
   const sy0 = (layerMode==='pfp') ? PAD.t : freqToY(cacheView.f0);
@@ -380,12 +420,14 @@ function tickLabel(t, step){
   return d.toISOString().slice(11,19);
 }
 
+// Canvas-drawn chrome colours (kept in sync with the CSS tokens above).
+const COL = { chrome:'#0b0d12', plotBg:'#05070b', label:'#97a0b2', dim:'#7a8499', grid:'rgba(255,255,255,0.07)' };
 function drawAxes(){
   const W = cv.clientWidth, H = cv.clientHeight;
-  ctx.fillStyle = '#0d0f14';
+  ctx.fillStyle = COL.chrome;
   ctx.fillRect(0,0,PAD.l,H); ctx.fillRect(0,H-PAD.b,W,PAD.b);
   // frequency labels
-  ctx.fillStyle = '#8b93a3'; ctx.font = '11px ui-sans-serif'; ctx.textAlign='right'; ctx.textBaseline='middle';
+  ctx.fillStyle = COL.label; ctx.font = '11px ui-sans-serif'; ctx.textAlign='right'; ctx.textBaseline='middle';
   let yLabel = 'Frequency (MHz)';
   if (layerMode==='pfp' && pfpView){
     for (let k=0;k<=5;k++){ const fr=k/5; ctx.fillText((fr*pfpFrameMs).toFixed(0), PAD.l-6, PAD.t+fr*plotH()); }  // 0..10 ms
@@ -395,10 +437,10 @@ function drawAxes(){
     for (let k=0;k<=6;k++){ const fr=k/6; ctx.fillText((fmin+fr*(fmax-fmin)).toFixed(dec), PAD.l-6, PAD.t+fr*plotH()); }
   }
   ctx.save(); ctx.translate(12, PAD.t+plotH()/2); ctx.rotate(-Math.PI/2);
-  ctx.textAlign='center'; ctx.fillStyle='#69718a'; ctx.fillText(yLabel,0,0); ctx.restore();
+  ctx.textAlign='center'; ctx.fillStyle=COL.dim; ctx.fillText(yLabel,0,0); ctx.restore();
   // time ticks
-  ctx.textAlign='center'; ctx.textBaseline='top'; ctx.fillStyle='#8b93a3';
-  ctx.strokeStyle='rgba(255,255,255,0.08)'; ctx.lineWidth=1;
+  ctx.textAlign='center'; ctx.textBaseline='top'; ctx.fillStyle=COL.label;
+  ctx.strokeStyle=COL.grid; ctx.lineWidth=1;
   const {ticks, step} = niceTimeTicks();
   for (const t of ticks){
     const x = timeToX(t); if (x<PAD.l||x>W-PAD.r) continue;
@@ -470,26 +512,30 @@ function requestData(){
   clearTimeout(fetchTimer);
   fetchTimer=setTimeout(doFetch, 45);       // shorter debounce → crisp appears sooner
 }
+// Tiles arrive as raw WebP bytes with the axis metadata in an X-Meta header —
+// no base64/JSON wrapping (~25% fewer bytes) and the browser decodes natively.
+async function fetchTile(url){
+  const r = await fetch(url);
+  if (!r.ok) throw new Error((await r.json().catch(()=>({}))).error || ('HTTP '+r.status));
+  const j = JSON.parse(r.headers.get('X-Meta'));
+  const img = await createImageBitmap(await r.blob());
+  return { j, img };
+}
 async function doFetch(){
   const seq=++fetchSeq; setLoading(true);
   const span=view.t1-view.t0, freqSpan=viewF.f1-viewF.f0, w=Math.round(plotW()), h=Math.round(plotH());
   try{
     if (mode==='iq' && iqCap){
-      const url=iqUrl(w,h);
-      const j=await (await fetch(url)).json();
+      const url=iqUrl(w,h), {j,img}=await fetchTile(url);
       if (seq!==fetchSeq) return;
-      if (j.error){ setLoading(false); return; }
-      const im=new Image();
-      im.onload=()=>{ if(seq!==fetchSeq) return; applyIq(j,im); cacheSet(url,{img:im,j}); setLoading(false); };
-      im.src=j.png;
+      applyIq(j,img); cacheSet(url,{img,j}); setLoading(false);
     } else if (pfpAvail && freqSpan<=ONE_CHANNEL && span<=PFP_TIME_THRESHOLD){
       const ch=nearestChannelHz(), url=pfpUrl(ch,h);
-      const j=await (await fetch(url)).json();
-      if (seq!==fetchSeq) return;
-      if (j.error){ await fetchPsdOrSummary(seq,span,w,h); return; }
-      const im=new Image();
-      im.onload=()=>{ if(seq!==fetchSeq) return; applyPfp(j,im,ch); cacheSet(pfpUrl(ch,h),{img:im,j}); setLoading(false); };
-      im.src=j.png;
+      try{
+        const {j,img}=await fetchTile(url);
+        if (seq!==fetchSeq) return;
+        applyPfp(j,img,ch); cacheSet(url,{img,j}); setLoading(false);
+      }catch(e){ await fetchPsdOrSummary(seq,span,w,h); }   // no PFP here -> PSD
     } else {
       await fetchPsdOrSummary(seq,span,w,h);
     }
@@ -498,15 +544,14 @@ async function doFetch(){
 async function fetchPsdOrSummary(seq, span, w, h){
   if (psdAvail && span<=PSD_THRESHOLD){
     const url=psdUrl(w,h);
-    const j=await (await fetch(url)).json();
-    if (seq!==fetchSeq) return;
-    if (j.error){ await fetchSummary(seq); return; }
-    const im=new Image();
-    im.onload=()=>{ if(seq!==fetchSeq) return; applyPsd(j,im); cacheSet(psdUrl(w,h),{img:im,j}); setLoading(false); };
-    im.src=j.png;
-  } else {
-    await fetchSummary(seq);
+    try{
+      const {j,img}=await fetchTile(url);
+      if (seq!==fetchSeq) return;
+      applyPsd(j,img); cacheSet(url,{img,j}); setLoading(false);
+      return;
+    }catch(e){}                                             // fall through to summary
   }
+  await fetchSummary(seq);
 }
 async function fetchSummary(seq){
   const w=Math.round(plotW());
@@ -623,6 +668,8 @@ function layoutFreqSlider(){
   const z=Math.max(0,Math.min(1, spanToZoom(viewF.f1-viewF.f0)));
   const knobH=16;
   knob.style.top=((1-z)*(ph-knobH))+'px';           // z=0 (full) bottom, z=1 (finest) top
+  sl.setAttribute('aria-valuenow', Math.round(z*100));
+  sl.setAttribute('aria-valuetext', ((viewF.f1-viewF.f0)/1e6).toFixed(2)+' MHz span');
   // amber "PFP zone" band: from the top of the track down to the one-channel
   // threshold (CBRS only — IQ captures have no PFP layer)
   const pfpEl=document.getElementById('freqpfp');
@@ -657,6 +704,17 @@ function setFreqZoom(z){
   sl.addEventListener('pointermove', e=>{ if(sdrag) setFreqZoom(zFromY(e.clientY)); });
   sl.addEventListener('pointerup', ()=>{ sdrag=false; knob.classList.remove('grab'); });
   sl.addEventListener('wheel', e=>{ e.preventDefault(); setFreqZoom(spanToZoom(viewF.f1-viewF.f0) - e.deltaY*0.0006); }, {passive:false});
+  sl.addEventListener('keydown', e=>{                     // keyboard-operable slider
+    const z=spanToZoom(viewF.f1-viewF.f0);
+    if (e.shiftKey && (e.key==='ArrowUp' || e.key==='ArrowDown')){   // pan 10% of span
+      const d=(viewF.f1-viewF.f0)*0.1*(e.key==='ArrowUp'?-1:1);
+      viewF.f0+=d; viewF.f1+=d; onFreqChange(); e.preventDefault(); return;
+    }
+    if (e.key==='ArrowUp'){ setFreqZoom(z+0.03); e.preventDefault(); }
+    else if (e.key==='ArrowDown'){ setFreqZoom(z-0.03); e.preventDefault(); }
+    else if (e.key==='Home'){ setFreqZoom(0); e.preventDefault(); }   // full band
+    else if (e.key==='End'){ setFreqZoom(1); e.preventDefault(); }    // finest
+  });
 })();
 
 // ---- Time zoom slider (bottom): drag LEFT = full span, RIGHT = zoom in -----
@@ -673,6 +731,8 @@ function layoutTimeSlider(){
   const w=tb.clientWidth; if (w<=0) return;
   const z=Math.max(0,Math.min(1, tspanToZoom(view.t1-view.t0)));
   knob.style.left=(z*(w-16))+'px';                 // z=0 (full) left, z=1 (finest) right
+  tb.setAttribute('aria-valuenow', Math.round(z*100));
+  tb.setAttribute('aria-valuetext', fmtSpan(view.t1-view.t0)+' span');
 }
 function setTimeZoom(z){
   z=Math.max(0,Math.min(1,z));
@@ -688,12 +748,23 @@ function setTimeZoom(z){
   tb.addEventListener('pointermove', e=>{ if(tdrag) setTimeZoom(zFromX(e.clientX)); });
   tb.addEventListener('pointerup', ()=>{ tdrag=false; knob.classList.remove('grab'); });
   tb.addEventListener('wheel', e=>{ e.preventDefault(); setTimeZoom(tspanToZoom(view.t1-view.t0) - e.deltaY*0.0006); }, {passive:false});
+  tb.addEventListener('keydown', e=>{                     // keyboard-operable slider
+    const z=tspanToZoom(view.t1-view.t0);
+    if (e.shiftKey && (e.key==='ArrowLeft' || e.key==='ArrowRight')){ // pan 10% of span
+      const d=(view.t1-view.t0)*0.1*(e.key==='ArrowLeft'?-1:1);
+      view.t0+=d; view.t1+=d; clampTimeView(); layoutTimeSlider(); requestData(); e.preventDefault(); return;
+    }
+    if (e.key==='ArrowRight'){ setTimeZoom(z+0.03); e.preventDefault(); }
+    else if (e.key==='ArrowLeft'){ setTimeZoom(z-0.03); e.preventDefault(); }
+    else if (e.key==='Home'){ setTimeZoom(0); e.preventDefault(); }   // full span
+    else if (e.key==='End'){ setTimeZoom(1); e.preventDefault(); }    // finest
+  });
 })();
 
 // ---- Controls ---------------------------------------------------------
 document.querySelectorAll('[data-stat]').forEach(b=>b.addEventListener('click', ()=>{
-  document.querySelectorAll('[data-stat]').forEach(x=>x.classList.remove('active'));
-  b.classList.add('active'); stat=b.dataset.stat;
+  document.querySelectorAll('[data-stat]').forEach(x=>{ x.classList.remove('active'); x.setAttribute('aria-pressed','false'); });
+  b.classList.add('active'); b.setAttribute('aria-pressed','true'); stat=b.dataset.stat;
   if (data){ autoScale(); drawCrisp(); }
 }));
 // ---- Source/mode switcher: CBRS monitoring <-> independent IQ captures ----
@@ -779,36 +850,36 @@ function exportPNG(){
   const H = M + titleH + 14 + hmH + 16 + legH + sepGap + rows.length*rowH + M;
   const c=document.createElement('canvas'); c.width=W; c.height=H;
   const g=c.getContext('2d');
-  g.fillStyle='#0d0f14'; g.fillRect(0,0,W,H);
+  g.fillStyle='#0b0d12'; g.fillRect(0,0,W,H);
   let y=M;
   g.textBaseline='top'; g.textAlign='left';
-  g.fillStyle='#e8edf6'; g.font='bold 24px ui-sans-serif, system-ui, Segoe UI, sans-serif';
+  g.fillStyle='#dde2ea'; g.font='bold 24px ui-sans-serif, system-ui, Segoe UI, sans-serif';
   g.fillText('RF Spectrum Viewer — '+srcName, M, y);
-  g.fillStyle='#8b93a3'; g.font='14px ui-sans-serif';
+  g.fillStyle='#97a0b2'; g.font='14px ui-sans-serif';
   g.fillText(layerName, M, y+32);
   y += titleH+14;
   g.imageSmoothingEnabled=true; g.imageSmoothingQuality='high';
   g.drawImage(src, M, y, hmW, hmH);
-  g.strokeStyle='#2a3142'; g.lineWidth=1; g.strokeRect(M+0.5, y+0.5, hmW, hmH);
+  g.strokeStyle='#262e40'; g.lineWidth=1; g.strokeRect(M+0.5, y+0.5, hmW, hmH);
   y += hmH+16;
   const cb=document.getElementById('cbar'), lgW=240;
   g.drawImage(cb, M, y, lgW, 14); g.strokeRect(M+0.5, y+0.5, lgW, 14);
-  g.fillStyle='#9aa3b4'; g.font='12px ui-monospace, monospace'; g.textBaseline='top';
+  g.fillStyle='#97a0b2'; g.font='12px ui-monospace, monospace'; g.textBaseline='top';
   g.textAlign='left'; g.fillText('low  '+lo+' '+unit, M, y+18);
   g.textAlign='right'; g.fillText(hi+' '+unit+'  high', M+lgW, y+18);
   g.textAlign='left';
   y += legH+sepGap;
-  g.strokeStyle='#232836'; g.beginPath(); g.moveTo(M,y-8); g.lineTo(W-M,y-8); g.stroke();
+  g.strokeStyle='#262e40'; g.beginPath(); g.moveTo(M,y-8); g.lineTo(W-M,y-8); g.stroke();
   g.textBaseline='middle';
   for (const [k,v] of rows){
-    g.fillStyle='#8b93a3'; g.font='13px ui-sans-serif'; g.textAlign='left';
+    g.fillStyle='#97a0b2'; g.font='13px ui-sans-serif'; g.textAlign='left';
     g.fillText(k, M, y+rowH/2);
-    g.fillStyle='#dfe3ea'; g.font='13px ui-monospace, ui-sans-serif, monospace';
+    g.fillStyle='#dde2ea'; g.font='13px ui-monospace, ui-sans-serif, monospace';
     g.fillText(v, M+230, y+rowH/2);
     y += rowH;
   }
   // attribution, bottom-right, aligned with the last ("Exported") row
-  g.fillStyle='#69718a'; g.font='13px ui-sans-serif'; g.textAlign='right';
+  g.fillStyle='#7a8499'; g.font='13px ui-sans-serif'; g.textAlign='right';
   g.fillText('@Jimmy Lu 2026', W-M, y-rowH/2);
   g.textAlign='left';
   const fn = 'spectrum_'+srcName.replace(/[^A-Za-z0-9-]/g,'')+'_'+new Date().toISOString().replace(/[:T]/g,'-').slice(0,19)+'.png';
@@ -833,242 +904,23 @@ function setLegendUnit(u){ const e=document.getElementById('unit'); if (e) e.tex
 // only, so disable them (greyed) outside summary mode to keep the toggle honest.
 function updateStatButtons(){
   const summaryMode = (layerMode==='summary');
+  document.querySelector('.seg').classList.toggle('max-only', !summaryMode);
   document.querySelectorAll('[data-stat]').forEach(b=>{
     if (b.dataset.stat==='max') return;
     b.disabled = !summaryMode;
-    b.style.opacity = summaryMode ? '' : '0.4';
     b.title = summaryMode ? '' : 'PSD / PFP layers are max-only';
   });
 }
 
-// ===== Tier 2 drill-in: PSD spectrogram + PFP frame view ===============
-const ov = { mode:null, sensor:null, date:null, stat:null, data:null, img:null, pfpFreqs:[],
-             zoom:{x0:0,x1:1,y0:0,y1:1} };   // normalized sub-rect of the day image
-const ovcv = document.getElementById('ovcv'), octx = ovcv.getContext('2d');
-const OVP = { l:62, r:16, t:10, b:28 };
 
-function midDate(){
-  const d = new Date(((view.t0+view.t1)/2)*1000);
-  return d.toISOString().slice(0,10);
-}
-
-// Continuous zoom: when the overview is zoomed into ~a day, automatically
-// sharpen to the PSD spectrogram for that day (no button). Zoom back out
-// (scroll up inside the detail view) to return to the overview.
-const AUTO_DETAIL_SPAN = 30 * 3600;   // seconds (~1.25 days)
-function maybeAutoDetail(){
-  const span = view.t1 - view.t0;
-  if (span <= AUTO_DETAIL_SPAN && document.getElementById('overlay').hidden){
-    openPSD(midDate(), 'max');
-  }
-}
-function ovZoomOutToOverview(){
-  closeOverlay();
-  const c = (view.t0 + view.t1) / 2, span = (view.t1 - view.t0);
-  view.t0 = c - span * 3; view.t1 = c + span * 3;   // widen so auto-detail doesn't re-fire
-  requestData();
-}
-// clamp a [a,b] window to [0,1] keeping its width, with a minimum size
-function clampWin(a, b){
-  if (b - a > 1){ a = 0; b = 1; }
-  if (a < 0){ b -= a; a = 0; }
-  if (b > 1){ a -= (b - 1); b = 1; }
-  const minw = 0.008;
-  if (b - a < minw){ const m = (a + b) / 2; a = m - minw/2; b = m + minw/2; }
-  return [Math.max(0, a), Math.min(1, b)];
-}
-// Zoom/pan INSIDE the PSD day image. Scroll out past the full day -> overview.
-ovcv.addEventListener('wheel', e=>{
-  if (ov.mode !== 'psd' || !ov.img) return;
-  e.preventDefault();
-  const z = ov.zoom, P = ovPlot();
-  // already fully zoomed out and scrolling out more -> back to the overview
-  if (e.deltaY > 0 && (z.x1 - z.x0) >= 0.98 && (z.y1 - z.y0) >= 0.98){
-    ovZoomOutToOverview(); return;
-  }
-  const fx = Math.min(1, Math.max(0, (e.offsetX - OVP.l) / P.w));
-  const fy = Math.min(1, Math.max(0, (e.offsetY - OVP.t) / P.h));
-  const cx = z.x0 + fx*(z.x1 - z.x0), cy = z.y0 + fy*(z.y1 - z.y0);
-  const f = Math.pow(1.0015, e.deltaY);           // >1 zoom out
-  [z.x0, z.x1] = clampWin(cx - (cx - z.x0)*f, cx + (z.x1 - cx)*f);
-  [z.y0, z.y1] = clampWin(cy - (cy - z.y0)*f, cy + (z.y1 - cy)*f);
-  // snap to full when nearly out, so the next scroll-out exits cleanly
-  if (z.x1 - z.x0 >= 0.98){ z.x0 = 0; z.x1 = 1; }
-  if (z.y1 - z.y0 >= 0.98){ z.y0 = 0; z.y1 = 1; }
-  drawOverlay();
-}, {passive:false});
-
-let ovDrag = null;
-ovcv.addEventListener('pointerdown', e=>{
-  if (ov.mode !== 'psd') return;
-  ovDrag = { x:e.offsetX, y:e.offsetY, z:{...ov.zoom} };
-  ovcv.setPointerCapture(e.pointerId); ovcv.style.cursor='grabbing';
-});
-ovcv.addEventListener('pointermove', e=>{
-  if (!ovDrag) return;
-  const P = ovPlot(), z = ovDrag.z;
-  const dxf = (e.offsetX - ovDrag.x)/P.w * (z.x1 - z.x0);
-  const dyf = (e.offsetY - ovDrag.y)/P.h * (z.y1 - z.y0);
-  [ov.zoom.x0, ov.zoom.x1] = clampWin(z.x0 - dxf, z.x1 - dxf);
-  [ov.zoom.y0, ov.zoom.y1] = clampWin(z.y0 - dyf, z.y1 - dyf);
-  drawOverlay();
-});
-ovcv.addEventListener('pointerup', ()=>{ ovDrag = null; ovcv.style.cursor='crosshair'; });
-
-const _drillBtn = document.getElementById('drillBtn');
-if (_drillBtn) _drillBtn.addEventListener('click', async (e)=>{
-  e.stopPropagation();
-  const menu = document.getElementById('drillMenu');
-  if (!menu.hidden){ menu.hidden = true; return; }
-  menu.innerHTML = 'Loading…';
-  menu.hidden = false;
-  const idx = await (await fetch('/api/drill/index?sensor='+encodeURIComponent(sensor))).json();
-  const near = midDate();
-  const sortByNear = ds => ds.slice().sort((a,b)=>Math.abs(Date.parse(a)-Date.parse(near))-Math.abs(Date.parse(b)-Date.parse(near)));
-  let html = `<h4>PSD spectrogram · ${sensor}</h4>`;
-  const pd = sortByNear(idx.psd.dates);
-  html += pd.length ? pd.slice(0,12).map(d=>`<div class="row" data-k="psd" data-d="${d}">${d}  <span style="color:#9aa3b4">(${idx.psd.stats.join('/')})</span></div>`).join('') : '<div class="empty">none for this sensor</div>';
-  html += `<h4>PFP frame (≈18µs) · ${sensor}</h4>`;
-  const fd = sortByNear(idx.pfp.dates);
-  html += fd.length ? fd.slice(0,12).map(d=>`<div class="row" data-k="pfp" data-d="${d}">${d}  <span style="color:#9aa3b4">(${idx.pfp.stats.join('/')})</span></div>`).join('') : '<div class="empty">none for this sensor</div>';
-  menu.innerHTML = html;
-  menu.querySelectorAll('.row').forEach(r=>r.addEventListener('click',()=>{
-    menu.hidden = true;
-    if (r.dataset.k==='psd') openPSD(r.dataset.d);
-    else openPFP(r.dataset.d, null);
-  }));
-});
-document.addEventListener('click', ()=>{ document.getElementById('drillMenu').hidden = true; });
-document.getElementById('drillMenu').addEventListener('click', e=>e.stopPropagation());
-document.getElementById('ovClose').addEventListener('click', closeOverlay);
-
-function showOverlay(){ document.getElementById('overlay').hidden = false; document.querySelector('footer').style.display='none'; }
-function closeOverlay(){ document.getElementById('overlay').hidden = true; document.querySelector('footer').style.display=''; ov.mode=null; ov.img=null; }
-
-function fitOverlay(){
-  const r = ovcv.getBoundingClientRect();
-  ovcv.width = r.width*DPR; ovcv.height = r.height*DPR;
-  octx.setTransform(DPR,0,0,DPR,0,0);
-}
-
-async function openPSD(date, stat){
-  ov.mode='psd'; ov.sensor=sensor; ov.date=date;
-  ov.zoom={x0:0,x1:1,y0:0,y1:1};
-  setCrumb(`${sensor}<span class="sep">›</span>PSD spectrogram<span class="sep">›</span>${date}`);
-  document.getElementById('ovChanWrap').hidden = true;
-  showOverlay();
-  const j = await (await fetch(`/api/psd?sensor=${encodeURIComponent(sensor)}&date=${date}&stat=${stat||'max'}`)).json();
-  if (j.error){ document.getElementById('ovReadout').textContent = j.error; return; }
-  ov.data=j; ov.stat=j.stat;
-  ov.pfpFreqs = [];   // PFP drill-in disabled for now (PSD-only phase)
-  loadOvImage(j.png);
-}
-
-async function openPFP(date, freq, stat){
-  ov.mode='pfp'; ov.sensor=sensor; ov.date=date;
-  showOverlay();
-  document.getElementById('ovReadout').textContent = 'Loading…';
-  // first call without freq -> channel list
-  const base = `/api/pfp?sensor=${encodeURIComponent(sensor)}&date=${date}`+(stat?`&stat=${stat}`:'');
-  const list = await (await fetch(base)).json();
-  if (list.error){ setCrumb(`${sensor}<span class="sep">›</span>PFP`); document.getElementById('ovReadout').textContent=list.error; return; }
-  ov.pfpFreqs = list.freqs; ov.stat = list.stat;
-  const f = freq || list.freqs[Math.floor(list.freqs.length/2)];
-  // channel dropdown
-  const wrap = document.getElementById('ovChanWrap'); wrap.hidden = false;
-  const sel = document.getElementById('ovChan'); sel.innerHTML='';
-  list.freqs.forEach(fr=>{ const o=document.createElement('option'); o.value=fr; o.textContent=(fr/1e6).toFixed(0)+' MHz'; if(fr===f)o.selected=true; sel.appendChild(o); });
-  sel.onchange = ()=> loadPFPFreq(parseFloat(sel.value));
-  loadPFPFreq(f);
-}
-
-async function loadPFPFreq(f){
-  setCrumb(`${ov.sensor}<span class="sep">›</span>PFP frame<span class="sep">›</span>${ov.date}<span class="sep">›</span>${(f/1e6).toFixed(0)} MHz`);
-  const j = await (await fetch(`/api/pfp?sensor=${encodeURIComponent(ov.sensor)}&date=${ov.date}&stat=${ov.stat}&freq=${f}`)).json();
-  if (j.error){ document.getElementById('ovReadout').textContent=j.error; return; }
-  ov.data=j; loadOvImage(j.png);
-}
-
-function loadOvImage(src){
-  const im = new Image();
-  im.onload = ()=>{ ov.img = im; fitOverlay(); drawOverlay(); };
-  im.src = src;
-}
-function setCrumb(html){ document.getElementById('crumb').innerHTML = html; }
-
-function ovPlot(){ return { w: ovcv.clientWidth-OVP.l-OVP.r, h: ovcv.clientHeight-OVP.t-OVP.b }; }
-
-function drawOverlay(){
-  if (!ov.img || !ov.data) return;
-  fitOverlay();
-  const P = ovPlot();
-  octx.clearRect(0,0,ovcv.clientWidth,ovcv.clientHeight);
-  octx.fillStyle='#05070b'; octx.fillRect(OVP.l,OVP.t,P.w,P.h);
-  if (ov.mode==='psd'){
-    const z=ov.zoom, iw=ov.img.naturalWidth, ih=ov.img.naturalHeight;
-    octx.imageSmoothingEnabled = (z.x1-z.x0 < 0.999 || z.y1-z.y0 < 0.999); // smooth when magnifying
-    octx.drawImage(ov.img, z.x0*iw, z.y0*ih, (z.x1-z.x0)*iw, (z.y1-z.y0)*ih, OVP.l, OVP.t, P.w, P.h);
-  } else {
-    octx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
-    octx.drawImage(ov.img, OVP.l, OVP.t, P.w, P.h);
-  }
-  octx.font='11px ui-sans-serif'; octx.fillStyle='#0d0f14';
-  octx.fillRect(0,0,OVP.l,ovcv.clientHeight); octx.fillRect(0,ovcv.clientHeight-OVP.b,ovcv.clientWidth,OVP.b);
-  const d = ov.data;
-  if (ov.mode==='psd'){
-    // axes follow the zoom window. Y = frequency (top=fmax), X = time.
-    const z=ov.zoom;
-    const t0z=d.t0+z.x0*(d.t1-d.t0), t1z=d.t0+z.x1*(d.t1-d.t0);
-    const fTop=d.fmax-z.y0*(d.fmax-d.fmin), fBot=d.fmax-z.y1*(d.fmax-d.fmin);
-    ovYticks([[fTop,(fTop/1e6).toFixed(1)],[(fTop+fBot)/2,(((fTop+fBot)/2)/1e6).toFixed(1)],[fBot,(fBot/1e6).toFixed(1)]], fTop,fBot,'MHz');
-    ovXtimeTicks(t0z,t1z);
-    const zoomed = (z.x1-z.x0<0.999 || z.y1-z.y0<0.999);
-    document.getElementById('ovReadout').textContent =
-      `${d.nt} captures × ${d.nf} freq bins (80 kHz) · ${(d.vmin)}…${(d.vmax)} dBm/Hz · scroll = zoom · drag = pan` + (zoomed?' · scroll out fully → overview':'');
-  } else {
-    // X = 0..10 ms, Y = time
-    ovXframeTicks(d.frame_ms);
-    ovTimeAxisY(d.t0,d.t1);
-    document.getElementById('ovReadout').textContent =
-      `${d.nt} captures × ${d.npos} points across ${d.frame_ms} ms (≈${(d.frame_ms*1000/d.npos).toFixed(1)} µs/pt) · ${(d.vmin)}…${(d.vmax)} dBm`;
-  }
-}
-
-function ovYticks(ticks, top, bot, unit){
-  const P=ovPlot();
-  octx.fillStyle='#8b93a3'; octx.textAlign='right'; octx.textBaseline='middle';
-  for (const [val,lab] of ticks){ const yf=(top-val)/(top-bot); const y=OVP.t+yf*P.h; octx.fillText(lab, OVP.l-6, y); }
-  octx.save(); octx.translate(12,OVP.t+P.h/2); octx.rotate(-Math.PI/2); octx.textAlign='center'; octx.fillStyle='#69718a'; octx.fillText('Frequency ('+unit+')',0,0); octx.restore();
-}
-function ovTimeAxisY(t0,t1){
-  const P=ovPlot(); octx.fillStyle='#8b93a3'; octx.textAlign='right'; octx.textBaseline='middle';
-  for (let k=0;k<=4;k++){ const tf=k/4; const t=t1-(t1-t0)*tf; const y=OVP.t+tf*P.h*0+ (k/4)*P.h; const tt=t1-(t1-t0)*(k/4);
-    octx.fillText(new Date(tt*1000).toISOString().slice(11,16), OVP.l-6, OVP.t+(k/4)*P.h); }
-  octx.save(); octx.translate(12,OVP.t+P.h/2); octx.rotate(-Math.PI/2); octx.textAlign='center'; octx.fillStyle='#69718a'; octx.fillText('Capture time (UTC)',0,0); octx.restore();
-}
-function ovXtimeTicks(t0,t1){
-  const P=ovPlot(); octx.fillStyle='#8b93a3'; octx.textAlign='center'; octx.textBaseline='top';
-  for (let k=0;k<=6;k++){ const x=OVP.l+(k/6)*P.w; const t=t0+(t1-t0)*(k/6);
-    octx.fillText(new Date(t*1000).toISOString().slice(11,16), x, ovcv.clientHeight-OVP.b+5); }
-}
-function ovXframeTicks(ms){
-  const P=ovPlot(); octx.fillStyle='#8b93a3'; octx.textAlign='center'; octx.textBaseline='top'; octx.strokeStyle='rgba(255,255,255,0.10)';
-  for (let k=0;k<=10;k++){ const x=OVP.l+(k/10)*P.w; octx.beginPath(); octx.moveTo(x,OVP.t); octx.lineTo(x,OVP.t+P.h); octx.stroke();
-    octx.fillText((ms*k/10).toFixed(0), x, ovcv.clientHeight-OVP.b+5); }
-  octx.fillStyle='#69718a'; octx.fillText('Periodic frame time (ms)', OVP.l+P.w/2, ovcv.clientHeight-OVP.b+16);
-}
-
-// click on PSD band -> open PFP for nearest 10 MHz channel (if available)
-// (PFP click-through disabled during the PSD-only phase; zoom/pan own the canvas.)
-window.addEventListener('resize', ()=>{ if(!document.getElementById('overlay').hidden) drawOverlay(); });
 
 // ---- Boot -------------------------------------------------------------
 function showNoBackend(){
   document.body.innerHTML =
     '<div style="display:flex;align-items:center;justify-content:center;height:100%;padding:30px;text-align:center">'
-    + '<div><h2 style="color:#e8b">⚠ No data server</h2>'
-    + '<p style="color:#d7dae0">This page must be opened through the running server, not as a file.</p>'
-    + '<p style="font-size:18px;color:#7db">Open <b>http://localhost:8090</b> in your browser.</p></div></div>';
+    + '<div><h2 style="color:#f0a500">⚠ No data server</h2>'
+    + '<p style="color:#dde2ea">This page must be opened through the running server, not as a file.</p>'
+    + '<p style="font-size:18px;color:#5f93ff">Open <b>http://localhost:8090</b> in your browser.</p></div></div>';
 }
 
 async function boot(){

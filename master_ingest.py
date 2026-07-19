@@ -9,6 +9,11 @@ then atomically swap them live and restart the server. Fully autonomous.
 - When every sensor is done, it stops the server on :8090, moves the build DBs
   over the live ones, and restarts the server -> all sensors live.
 
+NOTE (schema change): the ingest scripts write the ROW-PER-CAPTURE schema, but
+the live server now reads the compacted chunk schema (psd_chunk / pfp_chunk).
+If you re-run this, follow it with compact_db.py + vacuum_dbs.py and swap the
+*_c.duckdb files live instead of letting this script's swap stand alone.
+
     cd C:\\Users\\pipyt\\spectrum-viewer
     py master_ingest.py
 """

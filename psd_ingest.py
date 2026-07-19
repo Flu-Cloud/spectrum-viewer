@@ -7,6 +7,10 @@ row per capture (~180k) instead of 398M long-form rows, so ingest skips the
 expensive UNPIVOT, the DB is ~4x smaller, and rendering is just a fetch + numpy
 bin. Re-render at any frequency zoom stays crisp (the numbers are preserved).
 
+NOTE: this writes the ROW-PER-CAPTURE schema (table `psd`). The live server
+reads the compacted chunk schema (`psd_chunk`, built by compact_db.py). After
+ingesting new data: run compact_db.py, then swap psd_c.duckdb -> psd.duckdb.
+
     cd C:\\Users\\pipyt\\spectrum-viewer
     py psd_ingest.py CBBT-Directional            # one sensor
     py psd_ingest.py CBBT-Directional --limit 5  # quick test

@@ -17,23 +17,28 @@ Colors are locked per sensor so they stay stable across zoom. Frequency zoom is 
 vertical slider on the left (drag up = zoom in); drag the heatmap vertically to pan
 frequency.
 
+There is also an independent **IQ capture mode** (header "Source" dropdown): STFT
+spectrograms of NIST I/Q datasets (SigMF / TDMS), each with its own time/frequency
+axes, backed by a multi-level pyramid in `iq.duckdb` (see `IQ_DATASETS.md`).
+
 ## Architecture
 
-- **`serve.py`** — Flask backend. Serves `viewer.html` and the heatmap APIs
-  (`/api/heatmap`, `/api/psd_layer`, `/api/pfp_frame`, plus `*_meta` availability
-  endpoints). Auto-picks the coarsest pyramid level that still has detail for the
-  requested window. Reads the DuckDB files read-only.
-- **`tier2.py`** — Flask blueprint + the server-side PNG/WebP renderer (numpy + Pillow,
-  turbo colormap). Decodes the compact int8 spectra/frames and colorizes them.
-- **`viewer.html`** — single-file canvas app (no build step). All zoom/pan, the three
-  layer swaps, the frequency slider, and color locking live here.
+- **`serve.py`** — the whole backend (Flask). Serves `viewer.html` and all APIs
+  (`/api/heatmap`, `/api/psd_layer`, `/api/pfp_frame`, `/api/iq_*`, plus `*_meta`
+  availability endpoints), auto-picking the coarsest stored level that still has
+  detail for the requested window, and rendering WebP tiles (numpy + Pillow;
+  metadata rides in the `X-Meta` response header). Reads the DuckDB files read-only.
+- **`viewer.html`** — single-file canvas app (no build step). All zoom/pan, the
+  layer swaps, the zoom sliders, and color locking live here.
+- **`sigmf_io.py`** — unified reader for IQ capture formats (SigMF/TDMS/npy).
 
 ### Data storage
 
-The DuckDB files store **compact quantized int8 BLOBs** — one spectrum (PSD) or one
-folded frame (PFP) per capture — which keeps them ~4× smaller than long-form and makes
-rendering ~2× faster. They are built from the source CSVs by the ingest scripts and are
-**not** checked into git (they are 5–14 GB).
+Quantized **int8** spectra/frames, grouped into **zlib-compressed chunks** of
+consecutive captures (`psd_chunk`: 256 spectra, `pfp_chunk`: 1024 frames — consecutive
+same-channel frames compress ~3×). Summary tables store dBm as `SMALLINT` (dBm×10).
+Built from the source CSVs by the ingest scripts + `compact_db.py`; **not** checked
+into git (multi-GB).
 
 ## Ingest scripts
 
@@ -43,11 +48,11 @@ DuckDB files. All are per-sensor and resumable.
 | Script | Builds | Notes |
 |--------|--------|-------|
 | `build_db.py` | `spectrum.duckdb` | summaries + pyramid levels (lvl_m10/h1/h6/d1) |
-| `psd_ingest.py` | `psd.duckdb` | PSD `max`, int8 BLOB per capture |
-| `pfp_ingest.py` | `pfp.duckdb` | PFP `max_peak`, int8 BLOB per channel/capture |
+| `psd_ingest.py` | `psd.duckdb` | PSD `max`, int8 BLOB per capture (old row schema) |
+| `pfp_ingest.py` | `pfp.duckdb` | PFP `max_peak`, int8 BLOB per channel/capture (old row schema) |
 | `master_ingest.py` | both build DBs | ingests all 10 sensors, then swaps build → live |
-| `repack_psd.py` | — | converts old long-form PSD → compact BLOB |
-| `prerender.py` | `tiles/` | (superseded) pre-rendered WebP tile approach |
+| `compact_db.py` | `*_c.duckdb` | **run after any ingest**: repacks into the chunked/zlib schema the server reads, then swap `*_c` → live |
+| `iq_ingest.py` | `iq.duckdb` | STFT pyramid for IQ captures (SigMF/TDMS/npy) |
 | `run_master.ps1` | — | runs `master_ingest.py` detached with a crash-retry loop |
 
 ## Running
@@ -60,7 +65,7 @@ pip install -r requirements.txt
 # point at your copy of the source data (only needed for ingest / on-demand drill)
 export SEA_DATA_ROOT="/path/to/SEA-DATA"   # PowerShell: $env:SEA_DATA_ROOT="..."
 
-# choose a port (default 8000)
+# choose a port (default 8090)
 export SEA_PORT=8090                        # PowerShell: $env:SEA_PORT="8090"
 
 python serve.py

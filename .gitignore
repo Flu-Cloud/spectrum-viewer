@@ -1,7 +1,8 @@
-# ---- Data (huge: 5-14 GB DuckDB files are NOT tracked) ----
+# ---- Data (huge: multi-GB DuckDB files are NOT tracked) ----
 *.duckdb
 *.duckdb.wal
 *.duckdb.tmp/
+*.duckdb.old
 
 # Pre-rendered tiles and any staged sample data
 tiles/

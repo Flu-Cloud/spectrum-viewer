@@ -6,6 +6,10 @@ channel, one trace per ~4-min capture. We store one int8-quantized BLOB per
 (channel, capture): (sensor, freq, t, frame). Re-render any channel/time window
 crisply, like the PSD layer.
 
+NOTE: this writes the ROW-PER-CAPTURE schema (table `pfp`). The live server
+reads the compacted chunk schema (`pfp_chunk`, built by compact_db.py). After
+ingesting new data: run compact_db.py, then swap pfp_c.duckdb -> pfp.duckdb.
+
     cd C:\\Users\\pipyt\\spectrum-viewer
     py pfp_ingest.py CBBT-Directional               # default stat max_peak
     py pfp_ingest.py CBBT-Directional --limit 30    # quick prototype

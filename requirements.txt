@@ -2,3 +2,5 @@ duckdb>=1.0
 flask>=3.0
 numpy>=1.26
 Pillow>=10.0
+waitress>=3.0
+npTDMS>=1.9        # NI TDMS IQ captures (mds2-3177)
