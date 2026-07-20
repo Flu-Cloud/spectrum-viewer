@@ -17,6 +17,18 @@ Colors are locked per sensor so they stay stable across zoom. Frequency zoom is 
 vertical slider on the left (drag up = zoom in); drag the heatmap vertically to pan
 frequency.
 
+$$ Controls
+
+- Scroll: Zoom time (x axis)
+- Ctrl + Scroll: Zoom frequency (y-axis)
+
+$$ Options
+
+- Changing sensor (sensor): Pulls from 10+ sensor databases for different sensors
+- Max, Median, Mean: Filters out noise
+- Full Span: Full ~500 day view
+- Export PNG: Exports a PNG of the current view, including data statistics and time
+  
 ## Architecture
 
 - **`serve.py`** — Flask backend. Serves `viewer.html` and the heatmap APIs
