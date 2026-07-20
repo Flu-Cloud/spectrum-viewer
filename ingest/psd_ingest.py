@@ -24,9 +24,10 @@ import duckdb
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 DATA_ROOT = os.environ.get("SEA_DATA_ROOT", r"C:\Users\pipyt\Box\SEA-DATA")
-SUMM_DB = os.path.join(HERE, "spectrum.duckdb")
-PSD_DB = os.environ.get("PSD_DB", os.path.join(HERE, "psd.duckdb"))
+SUMM_DB = os.path.join(ROOT, "spectrum.duckdb")
+PSD_DB = os.environ.get("PSD_DB", os.path.join(ROOT, "psd.duckdb"))
 
 F0 = 3530040000.0    # first PSD bin (Hz)
 DF = 80000.0         # bin spacing (Hz)

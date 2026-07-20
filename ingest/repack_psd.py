@@ -12,8 +12,9 @@ import duckdb
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(HERE, "psd.duckdb")
-DST = os.path.join(HERE, "psd_compact.duckdb")
+ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
+SRC = os.path.join(ROOT, "psd.duckdb")
+DST = os.path.join(ROOT, "psd_compact.duckdb")
 F0, DF, NF = 3530040000.0, 80000.0, 2250
 QMIN, QMAX = -180.0, -90.0
 try:

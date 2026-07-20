@@ -24,9 +24,10 @@ import duckdb
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 DATA_ROOT = os.environ.get("SEA_DATA_ROOT", r"C:\Users\pipyt\Box\SEA-DATA")
-SUMM_DB = os.path.join(HERE, "spectrum.duckdb")
-PFP_DB = os.environ.get("PFP_DB", os.path.join(HERE, "pfp.duckdb"))
+SUMM_DB = os.path.join(ROOT, "spectrum.duckdb")
+PFP_DB = os.environ.get("PFP_DB", os.path.join(ROOT, "pfp.duckdb"))
 
 NPOS = 560
 FRAME_MS = 10.0

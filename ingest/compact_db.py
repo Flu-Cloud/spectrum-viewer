@@ -20,6 +20,7 @@ import duckdb
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 Z = 6                # zlib level (PFP 3.1x, PSD 1.7x at z6 - measured on live data)
 PSD_CHUNK = 256      # spectra per chunk  (256*2250 = 576 KB raw)
 PFP_CHUNK = 1024     # frames per chunk   (1024*560 = 573 KB raw)
@@ -44,8 +45,8 @@ def _skip(dst, key):
 
 
 def compact_spectrum():
-    src_p = os.path.join(HERE, "spectrum.duckdb")
-    dst = duckdb.connect(os.path.join(HERE, "spectrum_c.duckdb"))
+    src_p = os.path.join(ROOT, "spectrum.duckdb")
+    dst = duckdb.connect(os.path.join(ROOT, "spectrum_c.duckdb"))
     dst.execute("CREATE TABLE IF NOT EXISTS done (k VARCHAR)")
     dst.execute(f"ATTACH '{src_p}' AS s (READ_ONLY)")
     if not _skip(dst, "meta"):
@@ -79,9 +80,9 @@ def _copy_meta(dst, src_path, table):
 
 
 def compact_psd():
-    src_p = os.path.join(HERE, "psd.duckdb")
+    src_p = os.path.join(ROOT, "psd.duckdb")
     src = duckdb.connect(src_p, read_only=True)
-    dst = duckdb.connect(os.path.join(HERE, "psd_c.duckdb"))
+    dst = duckdb.connect(os.path.join(ROOT, "psd_c.duckdb"))
     _prep(dst, """CREATE TABLE IF NOT EXISTS psd_chunk (
         sensor VARCHAR, t0 DOUBLE, t1 DOUBLE, n INT, times BLOB, specs BLOB)""")
     if not _skip(dst, "meta"):
@@ -118,9 +119,9 @@ def compact_psd():
 
 
 def compact_pfp():
-    src_p = os.path.join(HERE, "pfp.duckdb")
+    src_p = os.path.join(ROOT, "pfp.duckdb")
     src = duckdb.connect(src_p, read_only=True)
-    dst = duckdb.connect(os.path.join(HERE, "pfp_c.duckdb"))
+    dst = duckdb.connect(os.path.join(ROOT, "pfp_c.duckdb"))
     _prep(dst, """CREATE TABLE IF NOT EXISTS pfp_chunk (
         sensor VARCHAR, freq DOUBLE, t0 DOUBLE, t1 DOUBLE, n INT, times BLOB, frames BLOB)""")
     if not _skip(dst, "meta"):

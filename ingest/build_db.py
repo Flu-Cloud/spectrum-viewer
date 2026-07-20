@@ -19,8 +19,9 @@ import time
 import duckdb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 CSV_DIR = os.path.join(HERE, "csv")
-DB_PATH = os.path.join(HERE, "spectrum.duckdb")
+DB_PATH = os.path.join(ROOT, "spectrum.duckdb")
 
 # Pyramid: bucket size in seconds -> table name. "raw" (native ~90s cadence) is
 # kept as-is; these are the coarser pre-aggregated levels for zoomed-out views.

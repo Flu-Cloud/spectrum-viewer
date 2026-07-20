@@ -26,13 +26,14 @@ import time
 
 import duckdb
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SUMM = os.path.join(HERE, "spectrum.duckdb")
+HERE = os.path.dirname(os.path.abspath(__file__))       # ingest/ (holds the scripts)
+ROOT = os.path.dirname(HERE)                             # repo root (holds serve.py + DBs)
+SUMM = os.path.join(ROOT, "spectrum.duckdb")
 BOX = os.environ.get("SEA_DATA_ROOT", r"C:\Users\pipyt\Box\SEA-DATA")
-LIVE_PSD = os.path.join(HERE, "psd.duckdb")
-LIVE_PFP = os.path.join(HERE, "pfp.duckdb")
-PSD_BUILD = os.path.join(HERE, "psd_build.duckdb")
-PFP_BUILD = os.path.join(HERE, "pfp_build.duckdb")
+LIVE_PSD = os.path.join(ROOT, "psd.duckdb")
+LIVE_PFP = os.path.join(ROOT, "pfp.duckdb")
+PSD_BUILD = os.path.join(ROOT, "psd_build.duckdb")
+PFP_BUILD = os.path.join(ROOT, "pfp_build.duckdb")
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -47,7 +48,7 @@ def log(m):
 def run(script, sensor, dbenv, dbpath):
     env = {**os.environ, dbenv: dbpath, "SEA_DATA_ROOT": BOX}
     log(f"========== {script} {sensor} ==========")
-    subprocess.run([sys.executable, script, sensor], env=env, cwd=HERE)
+    subprocess.run([sys.executable, os.path.join(HERE, script), sensor], env=env, cwd=ROOT)
 
 
 def kill_server():
@@ -88,9 +89,9 @@ def main():
                 log(f"swap FAILED for {build}: {e}")
     env = {**os.environ, "SEA_PORT": "8090"}
     subprocess.Popen(
-        [sys.executable, "serve.py"], env=env, cwd=HERE,
-        stdout=open(os.path.join(HERE, "serve_out.log"), "a"),
-        stderr=open(os.path.join(HERE, "serve_err.log"), "a"),
+        [sys.executable, os.path.join(ROOT, "serve.py")], env=env, cwd=ROOT,
+        stdout=open(os.path.join(ROOT, "serve_out.log"), "a"),
+        stderr=open(os.path.join(ROOT, "serve_err.log"), "a"),
         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
     log("server restarted with all sensors live. DONE.")
 

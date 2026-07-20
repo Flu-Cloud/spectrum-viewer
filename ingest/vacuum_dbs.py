@@ -10,10 +10,11 @@ import time
 import duckdb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 
 for name in ("spectrum_c", "psd_c", "pfp_c"):
-    src = os.path.join(HERE, f"{name}.duckdb")
-    tmp = os.path.join(HERE, f"{name}_v.duckdb")
+    src = os.path.join(ROOT, f"{name}.duckdb")
+    tmp = os.path.join(ROOT, f"{name}_v.duckdb")
     if not os.path.exists(src):
         continue
     if os.path.exists(tmp):
