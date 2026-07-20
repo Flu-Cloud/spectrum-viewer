@@ -110,6 +110,61 @@ python ingest/iq_ingest.py /path/to/sigmf_or_tdms_folder --dataset my_dataset
 Per-dataset format notes for the four NIST I/Q sets are in
 [docs/IQ_DATASETS.md](docs/IQ_DATASETS.md).
 
+# Bring your own dataset
+
+The ingest scripts all read from local disk; `ingest/fetch.py` is the step
+before them. Point it at a NIST dataset and it puts the files on disk in the
+layout the ingest scripts expect. Two steps, any dataset — including ones NIST
+publishes after this was written:
+
+1. **Fetch** — `python ingest/fetch.py <NIST PDR record URL or direct file URL>`
+   downloads the files (streamed, resumable: Ctrl+C and re-run to continue;
+   `.sha256` sidecars are verified when the record has them).
+2. **Ingest** — run the matching existing ingest script, same as above.
+
+A dataset's DOI landing page is a JS app, but every NIST Public Data
+Repository record has a JSON manifest at `data.nist.gov/rmm/records/<id>`
+listing each file's path, size and download URL. `fetch.py` takes the record
+id, the landing/DOI URL, or a direct file URL; `--list` previews a record and
+`--filter` narrows it (full flags: `python ingest/fetch.py --help`).
+
+**IQ example** — a small slice of the FDD-LTE record
+[mds2-3177](https://data.nist.gov/od/id/mds2-3177), rendered end to end:
+
+```bash
+python ingest/fetch.py mds2-3177 --list                    # see what's inside (~34 GB total)
+python ingest/fetch.py mds2-3177 --filter 1.4MHz/config_0 --dest iqdata/mds2-3177   # one 37 MB capture
+python ingest/iq_ingest.py iqdata/mds2-3177 --dataset mds2-3177
+python serve.py                                            # Source dropdown -> the new capture
+```
+
+**CBRS SEA example** — the [SEA data portal](https://pages.nist.gov/SEA-DATA/)
+designates PDR record [mds2-4214](https://data.nist.gov/od/id/mds2-4214)
+(not yet published as of July 2026; its Box mirror is invite-only, which
+`fetch.py` deliberately doesn't touch). The day the record goes live:
+
+```bash
+export SEA_DATA_ROOT="/path/to/SEA-DATA"
+python ingest/fetch.py mds2-4214 --filter CBBT-Directional --dest "$SEA_DATA_ROOT"
+python ingest/psd_ingest.py CBBT-Directional         # then pfp_ingest.py, compact_db.py
+```
+
+Summaries CSVs for `build_db.py` go flat into `ingest/csv/`: add
+`--dest ingest/csv --flat`.
+
+Handing this to a Claude / Cowork session? Paste:
+
+```text
+In the spectrum-viewer repo: given this NIST PDR URL <URL>, run
+`python ingest/fetch.py <URL> --list` to see the record, fetch a SMALL slice
+(--filter) into the layout the matching ingest script expects, then run that
+script unmodified: build_db.py for Summaries CSVs fetched flat into
+ingest/csv; psd_ingest.py / pfp_ingest.py with SEA_DATA_ROOT set to the
+fetch --dest; iq_ingest.py <folder> --dataset <name> for SigMF/TDMS/npy.
+After any CBRS ingest run compact_db.py then vacuum_dbs.py. Finish by
+confirming the new source renders in serve.py.
+```
+
 # Repository layout
 
 ```
