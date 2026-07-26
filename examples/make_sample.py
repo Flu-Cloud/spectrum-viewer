@@ -1,11 +1,10 @@
-"""
-make_sample.py  -  build a tiny synthetic IQ capture so the viewer runs with
+"""make_sample.py: build a tiny synthetic IQ capture so the viewer runs with
 zero downloads.
 
 The real datasets (NIST NASCTN CBRS SEA, NIST I/Q libraries) are multi-GB and
 not in this repo. This script fabricates one small SigMF capture with obvious,
-recognisable spectrogram structure -- a steady carrier, a frequency-hopping
-tone, and periodic wideband bursts -- then runs the normal ingest pipeline
+recognisable spectrogram structure: a steady carrier, a frequency-hopping tone,
+and periodic wideband bursts. Then it runs the normal ingest pipeline
 (sigmf_io + iq_ingest) to produce `iq.duckdb` beside serve.py.
 
     python examples/make_sample.py
@@ -48,7 +47,7 @@ def synth():
         s = slice(i * seg, (i + 1) * seg)
         x[s] += 0.6 * np.exp(2j * np.pi * f * t[s])
 
-    # 3) periodic wideband bursts (10 ms on / 40 ms off) -- LTE/Wi-Fi-like TDD
+    # 3) periodic wideband bursts (10 ms on / 40 ms off): LTE/Wi-Fi-like TDD
     burst = (np.mod(t, 0.05) < 0.010)
     wb = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) * 0.5
     # keep the burst inside +/-900 kHz so its edges are visible against the band
@@ -66,7 +65,7 @@ def write_sigmf(x):
             "core:datatype": "cf32_le",
             "core:sample_rate": FS,
             "core:version": "1.0.0",
-            "core:description": "Synthetic demo signal (numpy) -- not real RF.",
+            "core:description": "Synthetic demo signal (numpy), not real RF.",
         },
         "captures": [{"core:sample_start": 0, "core:frequency": FC}],
         "annotations": [],
@@ -87,7 +86,7 @@ def main():
     r = subprocess.run([sys.executable, os.path.join(INGEST, "iq_ingest.py"),
                         SAMPLE_DIR, "--dataset", "demo"], env=env, cwd=ROOT)
     if r.returncode != 0:
-        sys.exit("iq_ingest failed -- see output above")
+        sys.exit("iq_ingest failed. See output above.")
     print("\nDone. Now run:  python serve.py")
     print("Then open http://127.0.0.1:8090 and pick Source -> \"IQ capture: demo_signal\".")
 
