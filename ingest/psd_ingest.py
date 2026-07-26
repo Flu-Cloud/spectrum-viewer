@@ -1,5 +1,5 @@
 """
-psd_ingest.py  -  ingest PSD numbers into a compact, fast store.
+psd_ingest.py: ingest PSD numbers into a compact, fast store.
 
 Each capture's 2250-bin spectrum is quantized to int8 (0.35 dB steps over
 [-180,-90] dBm/Hz) and stored as one BLOB row: (sensor, t, spec). That's ~1

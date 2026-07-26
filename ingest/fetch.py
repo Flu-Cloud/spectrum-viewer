@@ -1,5 +1,5 @@
 """
-fetch.py  -  download NIST Public Data Repository (PDR) datasets for this viewer.
+fetch.py: download NIST Public Data Repository (PDR) datasets for this viewer.
 
 Turns "I have a URL to a NIST dataset" into files on disk, laid out so the
 existing ingest scripts run unmodified afterwards. This script only downloads;
@@ -21,7 +21,7 @@ folder structure under --dest (default: ./<record-id>). --flat drops the
 folder structure and writes basenames straight into --dest (for e.g.
 ingest/csv/, which build_db.py globs non-recursively). Downloads stream to
 disk with progress, skip files that are already complete, and resume partial
-files via HTTP Range - so Ctrl+C and re-run any time. When the record carries
+files via HTTP Range, so Ctrl+C and re-run any time. When the record carries
 .sha256 sidecar components, downloaded files are verified against them.
 
 Examples (see README "Bring your own dataset"):
@@ -31,7 +31,7 @@ Examples (see README "Bring your own dataset"):
 
 Only public, unauthenticated NIST hosts are allowed (plus NIST's own OAR
 download cache on S3, which data.nist.gov redirects to). If a source needs an
-invite or login - e.g. the SEA Box share - this script refuses rather than
+invite or login, e.g. the SEA Box share, this script refuses rather than
 work around it.
 """
 
@@ -177,7 +177,7 @@ def record_files(rec):
         else:
             files.append({"filepath": fp, "url": url, "size": size})
     if dropped:
-        print(f"  ({dropped} component(s) dropped - not on an allowed NIST host)")
+        print(f"  ({dropped} component(s) dropped, not on an allowed NIST host)")
     return files, checksums
 
 
@@ -224,12 +224,12 @@ def verify_checksum(path, sidecar_url):
         text = r.read(4096).decode("ascii", "replace")
     m = re.search(r"\b[0-9a-fA-F]{64}\b", text)
     if not m:
-        print("      checksum sidecar unreadable - skipping verification")
+        print("      checksum sidecar unreadable; skipping verification")
         return True
     if sha256_file(path).lower() == m.group(0).lower():
         return True
     os.remove(path)   # so a re-run re-downloads instead of skip-as-complete
-    print(f"      CHECKSUM MISMATCH - deleted {path}; re-run to re-download")
+    print(f"      CHECKSUM MISMATCH: deleted {path}; re-run to re-download")
     return False
 
 
@@ -241,10 +241,10 @@ def download(url, path, expected, label):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     have = os.path.getsize(path) if os.path.exists(path) else 0
     if expected is not None and have == expected:
-        print(f"{label} already complete ({fmt_size(expected)}) - skipped")
+        print(f"{label} already complete ({fmt_size(expected)}), skipped")
         return "skipped"
     if expected is not None and have > expected:
-        print(f"{label} local file larger than expected - restarting")
+        print(f"{label} local file larger than expected; restarting")
         have = 0
 
     headers = {"Range": f"bytes={have}-"} if have else {}
@@ -252,7 +252,7 @@ def download(url, path, expected, label):
         resp = open_url(url, headers=headers)
     except urllib.error.HTTPError as e:
         if e.code == 416 and have:      # nothing left to serve
-            print(f"{label} already complete ({fmt_size(have)}) - skipped")
+            print(f"{label} already complete ({fmt_size(have)}), skipped")
             return "skipped"
         print(f"{label} FAILED: HTTP {e.code}")
         return "failed"
@@ -288,8 +288,8 @@ def download(url, path, expected, label):
     print(f"\r{label} {fmt_size(done):>9} downloaded "
           f"({fmt_size(rate)}/s)" + " " * 24)
     if expected is not None and done != expected:
-        print(f"{label} INCOMPLETE ({fmt_size(done)} of {fmt_size(expected)}) "
-              "- re-run to resume")
+        print(f"{label} INCOMPLETE ({fmt_size(done)} of {fmt_size(expected)}), "
+              "re-run to resume")
         return "failed"
     return "done"
 
@@ -371,13 +371,13 @@ def main():
                     status = "failed"
             counts[status] += 1
     except KeyboardInterrupt:
-        print("\n\ninterrupted - partial files kept; "
+        print("\n\ninterrupted. Partial files kept; "
               "re-run the same command to resume")
         sys.exit(130)
 
     print(f"\ndone: {counts['done']} downloaded, {counts['skipped']} already "
           f"complete, {counts['failed']} failed"
-          + ("" if not counts["failed"] else " - re-run to retry/resume"))
+          + ("" if not counts["failed"] else ". Re-run to retry/resume"))
     print("next: run the matching ingest script "
           "(build_db.py / psd_ingest.py / pfp_ingest.py / iq_ingest.py)")
     sys.exit(1 if counts["failed"] else 0)
