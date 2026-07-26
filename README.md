@@ -1,24 +1,24 @@
 # Spectrum Viewer
 
-A "Google-Maps for RF spectrum" — a single pan/zoom canvas where **X is always
-time** and colour is power. Zoom from a two-year overview all the way down to the
-microsecond structure of a single burst, with the viewer swapping resolution
-layers automatically as you go.
+A "Google Maps for RF spectrum": one pan/zoom canvas where **X is always
+time** and colour is power. Zoom from a two-year overview down to the
+microsecond structure of a single burst. The viewer swaps resolution layers
+automatically as you go.
 
 ![CBRS spectrum overview](docs/cbrs_overview.jpg)
 
-It renders two independent data sources on the same machinery:
+It draws two independent data sources on the same machinery:
 
-- **CBRS SEA monitoring** — the [NIST NASCTN CBRS SEA](https://www.nist.gov/programs-projects/spectrum-monitoring-cbrs-band)
+- **CBRS SEA monitoring**: the [NIST NASCTN CBRS SEA](https://www.nist.gov/programs-projects/spectrum-monitoring-cbrs-band)
   dataset (10 sensors, 3.5 GHz band, ~2 years), as one continuous time axis.
-- **IQ captures** — STFT spectrograms of individual [NIST I/Q recordings](https://www.nist.gov/ctl/spectrum-technology-and-research-division/applied-systems-metrology-group/iq-data-sets)
+- **IQ captures**: STFT spectrograms of individual [NIST I/Q recordings](https://www.nist.gov/ctl/spectrum-technology-and-research-division/applied-systems-metrology-group/iq-data-sets)
   (SigMF / TDMS), each with its own time and frequency axes.
 
 # Quick start
 
 Requires Python 3.10+ and the dependencies in `requirements.txt`. The real
-datasets are multi-GB and not in this repo, so the fastest way to see the viewer
-work is the built-in synthetic demo — **no downloads required**:
+datasets are multi-GB and aren't in this repo, so the quickest way to see the
+viewer work is the built-in synthetic demo. **No downloads required**:
 
 ```bash
 pip install -r requirements.txt
@@ -33,11 +33,11 @@ Then open the **Source** dropdown in the header and pick
 
 # Use case
 
-Spectrum measurements are awkward to explore: a monitoring campaign spans years
+Spectrum measurements are awkward to explore. A monitoring campaign spans years
 of ~90-second sweeps, while a single I/Q capture is milliseconds of data at tens
 of megasamples per second. Spectrum Viewer puts both on the same interface. One
-canvas, continuous zoom, and colours that stay **locked** per sensor/capture so a
-given power level always maps to the same colour no matter how far you zoom in.
+canvas, continuous zoom, and colours that stay **locked** per sensor/capture, so
+a given power level always maps to the same colour no matter how far you zoom in.
 
 ## CBRS monitoring mode
 
@@ -56,9 +56,9 @@ heatmap vertically to pan frequency.
 ## IQ capture mode
 
 The header **Source** dropdown switches to an independent library of I/Q
-captures. Each is rendered as a multi-resolution STFT spectrogram pyramid
-(`iq.duckdb`) on its **own** axes — elapsed time within the capture on X,
-`fc ± fs/2` on Y — with the same continuous zoom and locked colours. The example
+captures. Each one renders as a multi-resolution STFT spectrogram pyramid
+(`iq.duckdb`) on its **own** axes: elapsed time within the capture on X,
+`fc ± fs/2` on Y, with the same continuous zoom and locked colours. The example
 below is a NIST high-SNR FDD-LTE uplink capture showing the burst / resource-block
 structure.
 
@@ -66,15 +66,15 @@ structure.
 
 # Architecture
 
-- **`serve.py`** — the whole backend (Flask). Serves `viewer.html` and all APIs
-  (`/api/heatmap`, `/api/psd_layer`, `/api/pfp_frame`, `/api/iq_*`, plus `*_meta`
-  availability endpoints), auto-picking the coarsest stored level that still has
-  detail for the requested window and rendering WebP tiles (numpy + Pillow;
-  axis metadata rides in the `X-Meta` response header). Reads the DuckDB files
-  read-only, with a per-request connection so renders are thread-safe.
-- **`viewer.html`** — single-file canvas app (no build step). All zoom/pan, the
-  layer swaps, the zoom sliders, and colour locking live here.
-- **`ingest/`** — the data-build tooling (see below). `sigmf_io.py` there is a
+- **`serve.py`**: the whole backend (Flask). It serves `viewer.html` and all the
+  APIs (`/api/heatmap`, `/api/psd_layer`, `/api/pfp_frame`, `/api/iq_*`, plus the
+  `*_meta` availability endpoints). For each request it picks the coarsest stored
+  level that still has detail for the window and renders WebP tiles (numpy +
+  Pillow; axis metadata rides in the `X-Meta` response header). It reads the
+  DuckDB files read-only, with a per-request connection so renders are thread-safe.
+- **`viewer.html`**: single-file canvas app, no build step. Zoom/pan, the layer
+  swaps, the zoom sliders, and colour locking all live here.
+- **`ingest/`**: the data-build tooling (see below). `sigmf_io.py` there is a
   unified reader for IQ capture formats (SigMF / TDMS / npy).
 
 ## Data storage
@@ -114,13 +114,13 @@ Per-dataset format notes for the four NIST I/Q sets are in
 
 The ingest scripts all read from local disk; `ingest/fetch.py` is the step
 before them. Point it at a NIST dataset and it puts the files on disk in the
-layout the ingest scripts expect. Two steps, any dataset — including ones NIST
+layout the ingest scripts expect. Two steps, any dataset, including ones NIST
 publishes after this was written:
 
-1. **Fetch** — `python ingest/fetch.py <NIST PDR record URL or direct file URL>`
-   downloads the files (streamed, resumable: Ctrl+C and re-run to continue;
+1. **Fetch**: `python ingest/fetch.py <NIST PDR record URL or direct file URL>`
+   downloads the files (streamed and resumable: Ctrl+C and re-run to continue;
    `.sha256` sidecars are verified when the record has them).
-2. **Ingest** — run the matching existing ingest script, same as above.
+2. **Ingest**: run the matching ingest script, same as above.
 
 A dataset's DOI landing page is a JS app, but every NIST Public Data
 Repository record has a JSON manifest at `data.nist.gov/rmm/records/<id>`
@@ -128,7 +128,7 @@ listing each file's path, size and download URL. `fetch.py` takes the record
 id, the landing/DOI URL, or a direct file URL; `--list` previews a record and
 `--filter` narrows it (full flags: `python ingest/fetch.py --help`).
 
-**IQ example** — a small slice of the FDD-LTE record
+**IQ example**: a small slice of the FDD-LTE record
 [mds2-3177](https://data.nist.gov/od/id/mds2-3177), rendered end to end:
 
 ```bash
@@ -138,7 +138,7 @@ python ingest/iq_ingest.py iqdata/mds2-3177 --dataset mds2-3177
 python serve.py                                            # Source dropdown -> the new capture
 ```
 
-**CBRS SEA example** — the [SEA data portal](https://pages.nist.gov/SEA-DATA/)
+**CBRS SEA example**: the [SEA data portal](https://pages.nist.gov/SEA-DATA/)
 designates PDR record [mds2-4214](https://data.nist.gov/od/id/mds2-4214)
 (not yet published as of July 2026; its Box mirror is invite-only, which
 `fetch.py` deliberately doesn't touch). The day the record goes live:
@@ -176,7 +176,7 @@ docs/               screenshots + IQ dataset notes
 ingest/             database-build tooling (CBRS + IQ), all resumable
 ```
 
-This repo contains **only code** — no spectrum data. The measurements are public
+This repo contains **only code**, no spectrum data. The measurements are public
 NIST datasets; the ingest scripts expect their file products laid out locally.
 
 # Contact
