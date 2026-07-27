@@ -1,5 +1,5 @@
 """
-pfp_ingest.py  -  ingest PFP (periodic-frame-power) numbers into a compact store.
+pfp_ingest.py: ingest PFP (periodic-frame-power) numbers into a compact store.
 
 PFP = power across a 10 ms frame (560 positions, ~17.86 us each) per 10 MHz
 channel, one trace per ~4-min capture. We store one int8-quantized BLOB per

@@ -1,5 +1,5 @@
 """
-repack_psd.py  -  convert the existing long-form psd.duckdb (sensor,t,fi,p) into
+repack_psd.py: convert the existing long-form psd.duckdb (sensor,t,fi,p) into
 the compact int8-BLOB format (one spectrum per capture), locally. No Box needed.
 
     py repack_psd.py CBBT-Directional

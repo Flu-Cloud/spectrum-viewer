@@ -1,4 +1,4 @@
-"""serve.py  -  Flask backend for the spectrum viewer.
+"""serve.py: Flask backend for the spectrum viewer.
 
 One canvas, three continuous CBRS layers (summary -> PSD -> PFP) plus the
 independent IQ-capture mode. For any requested window the server picks the
@@ -108,7 +108,7 @@ def _tile(rgb, meta):
     ~25% fewer bytes and the browser decodes the image natively)."""
     buf = io.BytesIO()
     # q80/method=4: visually identical to lossless for spectrograms and ~7x
-    # faster to encode than method=6 - encode speed dominates felt zoom latency.
+    # faster to encode than method=6; encode speed dominates felt zoom latency.
     Image.fromarray(rgb, "RGB").save(buf, format="WEBP", quality=80, method=4)
     resp = Response(buf.getvalue(), mimetype="image/webp")
     resp.headers["X-Meta"] = json.dumps(meta)

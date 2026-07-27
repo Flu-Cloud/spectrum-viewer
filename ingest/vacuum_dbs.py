@@ -1,4 +1,4 @@
-"""vacuum_dbs.py - rewrite the *_c.duckdb build files into densely-packed files.
+"""vacuum_dbs.py: rewrite the *_c.duckdb build files into densely-packed files.
 
 The per-sensor transaction pattern in compact_db.py leaves ~25% of each file as
 partially-filled blocks; COPY FROM DATABASE into a fresh file recovers it.

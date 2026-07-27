@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RF Spectrum Viewer</title>
 <style>
-  /* Design tokens — one source of truth for the whole UI. */
+  /* Design tokens: one source of truth for the whole UI. */
   :root {
     color-scheme: dark;
     --bg: #0b0d12;            /* page chrome */
@@ -147,19 +147,19 @@
     <canvas id="cv"></canvas>
     <div id="freqslider" class="zoombar" tabindex="0" role="slider" aria-label="Frequency zoom"
          aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-orientation="vertical"
-         title="Frequency zoom — knob at BOTTOM = full band; drag UP to zoom into frequency. The amber zone near the top = one channel, where the PFP (~18µs frame) layer appears. Drag the heatmap up/down to pan frequency."><div id="freqtrack"></div><div id="freqpfp" title="PFP zone — narrow to one channel here for ~18µs frame detail"></div><div id="freqknob" class="knob"></div></div>
+         title="Frequency zoom: knob at BOTTOM = full band; drag UP to zoom into frequency. The amber zone near the top = one channel, where the PFP (~18µs frame) layer appears. Drag the heatmap up/down to pan frequency."><div id="freqtrack"></div><div id="freqpfp" title="PFP zone: narrow to one channel here for ~18µs frame detail"></div><div id="freqknob" class="knob"></div></div>
     <div id="freqlabel">freq zoom</div>
     <div id="loadbar"></div>
   </div>
   <div id="timebar" class="zoombar" tabindex="0" role="slider" aria-label="Time zoom"
        aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
-       title="Time zoom — knob at LEFT = full span; drag RIGHT to zoom into time. Drag the heatmap left/right to pan time."><div id="timetrack"></div><div id="timeknob" class="knob"></div></div>
+       title="Time zoom: knob at LEFT = full span; drag RIGHT to zoom into time. Drag the heatmap left/right to pan time."><div id="timetrack"></div><div id="timeknob" class="knob"></div></div>
   <div id="sliderhint">time zoom · drag image to pan</div>
   <footer>
-    <div><span class="k">Window</span><b id="winRange">—</b></div>
-    <div><span class="k">Span</span><b id="winSpan">—</b></div>
-    <div><span class="k">Detail</span><b id="level">—</b></div>
-    <div><span class="k">Cursor</span><b id="cursor">—</b></div>
+    <div><span class="k">Window</span><b id="winRange">-</b></div>
+    <div><span class="k">Span</span><b id="winSpan">-</b></div>
+    <div><span class="k">Detail</span><b id="level">-</b></div>
+    <div><span class="k">Cursor</span><b id="cursor">-</b></div>
   </footer>
 </div>
 <script>
@@ -342,7 +342,7 @@ function drawCrisp(){
     const span = view.t1 - view.t0;
     const bw = bucket>0 ? Math.max(1, bucket/span*plotW()) : Math.max(1, plotW()/Math.max(1,data.count/meta.freqs.length));
     // Each sample paints exactly one bucket-wide cell. Where a sensor has no data
-    // for a bucket, no cell is drawn, so the dark plot background shows through —
+    // for a bucket, no cell is drawn, so the dark plot background shows through;
     // the black GAPS are real missing-data, intentionally visible.
     for (let i=0;i<data.t.length;i++){
       const v = vals[i]; if (v==null) continue;
@@ -464,7 +464,7 @@ function schedulePreview(){     // coalesce rapid zoom/pan into one draw per fra
   previewRAF = requestAnimationFrame(()=>{ previewRAF=null; drawPreview(); });
 }
 // In-memory tile cache: revisiting an exact window (zoom out then back, cmap
-// toggle, etc.) renders instantly — no network, no re-decode. Keyed by the full
+// toggle, etc.) renders instantly, no network, no re-decode. Keyed by the full
 // URL (encodes sensor/window/size/colours/cmap), LRU-evicted.
 const tileCache = new Map();
 const TILE_CACHE_MAX = 48;
@@ -512,7 +512,7 @@ function requestData(){
   clearTimeout(fetchTimer);
   fetchTimer=setTimeout(doFetch, 45);       // shorter debounce → crisp appears sooner
 }
-// Tiles arrive as raw WebP bytes with the axis metadata in an X-Meta header —
+// Tiles arrive as raw WebP bytes with the axis metadata in an X-Meta header,
 // no base64/JSON wrapping (~25% fewer bytes) and the browser decodes natively.
 async function fetchTile(url){
   const r = await fetch(url);
@@ -581,8 +581,8 @@ function updateReadout(){
   document.getElementById('level').textContent =
     (layerMode==='iq' && iqView) ? `IQ STFT · pyramid level ${iqView.level} · ${iqView.cols} cols × ${iqView.nf} bins (${(iqCap.fs/iqCap.nfft/1e3).toFixed(1)} kHz)`
     : (layerMode==='pfp' && pfpView) ? `PFP frame · ${(pfpView.freq/1e6).toFixed(0)} MHz · ${pfpView.ncap} captures × ${pfpView.npos} pts (≈${(pfpFrameMs*1000/pfpView.npos).toFixed(1)} µs)`
-    : (layerMode==='psd' && psdView) ? (psdView.gap ? `PSD detail · ⚠ data gap — holding last capture` : `PSD detail · ${psdView.ncap} captures × 2250 bins @ 80 kHz`)
-    : (data ? `${data.level} (${data.count.toLocaleString()} cells)` : '—');
+    : (layerMode==='psd' && psdView) ? (psdView.gap ? `PSD detail · ⚠ data gap, holding last capture` : `PSD detail · ${psdView.ncap} captures × 2250 bins @ 80 kHz`)
+    : (data ? `${data.level} (${data.count.toLocaleString()} cells)` : '-');
 }
 
 // Invert the colormap at a canvas pixel -> approximate power (IQ readout).
@@ -671,7 +671,7 @@ function layoutFreqSlider(){
   sl.setAttribute('aria-valuenow', Math.round(z*100));
   sl.setAttribute('aria-valuetext', ((viewF.f1-viewF.f0)/1e6).toFixed(2)+' MHz span');
   // amber "PFP zone" band: from the top of the track down to the one-channel
-  // threshold (CBRS only — IQ captures have no PFP layer)
+  // threshold (CBRS only; IQ captures have no PFP layer)
   const pfpEl=document.getElementById('freqpfp');
   if (pfpEl){
     if (mode==='iq'){ pfpEl.style.height='0px'; }
@@ -854,7 +854,7 @@ function exportPNG(){
   let y=M;
   g.textBaseline='top'; g.textAlign='left';
   g.fillStyle='#dde2ea'; g.font='bold 24px ui-sans-serif, system-ui, Segoe UI, sans-serif';
-  g.fillText('RF Spectrum Viewer — '+srcName, M, y);
+  g.fillText('RF Spectrum Viewer: '+srcName, M, y);
   g.fillStyle='#97a0b2'; g.font='14px ui-sans-serif';
   g.fillText(layerName, M, y+32);
   y += titleH+14;
@@ -891,7 +891,7 @@ document.getElementById('cmap').addEventListener('change', e=>{
   cmapName = e.target.value;
   try { localStorage.setItem('cmap', cmapName); } catch(_){}
   drawLegend();
-  if (layerMode==='summary'){ drawCrisp(); }          // summary is client-drawn — recolours instantly
+  if (layerMode==='summary'){ drawCrisp(); }          // summary is client-drawn; recolours instantly
   else { psdImg=null; pfpImg=null; iqImg=null; requestData(); }  // PSD/PFP/IQ tiles must re-render server-side
 });
 
@@ -950,7 +950,7 @@ async function boot(){
     meta.tmin = meta.sensors[0].t_min; meta.tmax = meta.sensors[0].t_max;
     view = { t0: meta.tmin, t1: meta.tmax };
     resize(); requestData();              // paint the (full-span) summary immediately
-    checkPsd(); checkPfp();               // availability flags load in parallel — don't block first paint
+    checkPsd(); checkPfp();               // availability flags load in parallel; don't block first paint
   } else if (caps.length){
     // No CBRS databases present (e.g. a fresh clone running only the IQ demo):
     // drop the CBRS option and open the first capture directly in IQ mode.

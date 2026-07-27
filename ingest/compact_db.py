@@ -1,4 +1,4 @@
-"""compact_db.py - repack the live DBs into much smaller files (lossless).
+"""compact_db.py: repack the live DBs into much smaller files (lossless).
 
   spectrum.duckdb : dBm DOUBLE -> SMALLINT (dBm*10), t -> BIGINT    ~1.9 -> ~0.7 GB
   psd.duckdb      : per-capture rows -> zlib chunks of 256 spectra  ~5.4 -> ~3.3 GB
@@ -21,7 +21,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
-Z = 6                # zlib level (PFP 3.1x, PSD 1.7x at z6 - measured on live data)
+Z = 6                # zlib level (PFP 3.1x, PSD 1.7x at z6; measured on live data)
 PSD_CHUNK = 256      # spectra per chunk  (256*2250 = 576 KB raw)
 PFP_CHUNK = 1024     # frames per chunk   (1024*560 = 573 KB raw)
 
@@ -110,7 +110,7 @@ def compact_psd():
         dst.execute("COMMIT")
         want = src.execute("SELECT count(*) FROM psd WHERE sensor=?", [s]).fetchone()[0]
         if total != want:
-            log(f"  psd {s}: MISMATCH {total} != {want} - NOT marking done")
+            log(f"  psd {s}: MISMATCH {total} != {want}. NOT marking done")
             continue
         dst.execute("INSERT INTO done VALUES (?)", [s])
         log(f"  psd {s}: {total} spectra in {time.time()-t0:.0f}s")
@@ -160,7 +160,7 @@ def compact_pfp():
         dst.execute("COMMIT")
         want = src.execute("SELECT count(*) FROM pfp WHERE sensor=?", [s]).fetchone()[0]
         if total != want:
-            log(f"  pfp {s}: MISMATCH {total} != {want} - NOT marking done")
+            log(f"  pfp {s}: MISMATCH {total} != {want}. NOT marking done")
             continue
         dst.execute("INSERT INTO done VALUES (?)", [s])
         log(f"  pfp {s}: {total} frames in {time.time()-t0:.0f}s")

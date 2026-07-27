@@ -1,5 +1,5 @@
 """
-sigmf_io.py  -  unified reader for IQ capture files (SigMF and friends).
+sigmf_io.py: unified reader for IQ capture files (SigMF and friends).
 
 Gives iq_ingest.py / serve.py one interface over the formats the NIST
 "I/Q Data Sets" actually ship:
@@ -140,7 +140,7 @@ class TdmsCapture(IQCapture):
 
 
 class ArrayCapture(IQCapture):
-    """Fallback for .npy (complex array) — memory-mapped."""
+    """Fallback for .npy (complex array), memory-mapped."""
 
     def __init__(self, path, sample_rate, center_freq=0.0):
         arr = np.load(path, mmap_mode="r")
@@ -167,5 +167,5 @@ def open_capture(path, sample_rate=None, center_freq=None):
         return ArrayCapture(path, sample_rate, center_freq or 0.0)
     if low.endswith(".mat"):
         raise ValueError(f"{path}: .mat needs a per-dataset adapter "
-                         "(variable names differ) — add one in sigmf_io.py")
+                         "(variable names differ). Add one in sigmf_io.py")
     raise ValueError(f"{path}: unsupported capture format")

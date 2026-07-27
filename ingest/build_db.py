@@ -1,5 +1,5 @@
 """
-build_db.py  -  Tier 1 ingest + time-pyramid builder for the RF spectrum viewer.
+build_db.py: Tier 1 ingest and time-pyramid builder for the RF spectrum viewer.
 
 Reads every Summaries CSV in ./csv, loads the columns we care about into a single
 DuckDB database, then precomputes coarse "zoom levels" so the viewer never has to
@@ -82,7 +82,7 @@ def main():
             SELECT sensor, freq,
                    floor(t/{bucket})*{bucket} AS t,
                    max(mx) AS mx,      -- true peak of peaks
-                   avg(md) AS md,      -- approx (mean of medians) - fine for overview
+                   avg(md) AS md,      -- approx (mean of medians), fine for overview
                    avg(mn) AS mn,
                    count(*) AS c
             FROM raw

@@ -1,5 +1,5 @@
 """
-iq_ingest.py  -  precompute a multi-resolution STFT spectrogram pyramid for
+iq_ingest.py: precompute a multi-resolution STFT spectrogram pyramid for
 IQ captures (SigMF / TDMS / npy) into iq.duckdb. Resumable like psd_ingest.py.
 
 Per capture: Hann-window STFT (nfft bins, hop = nfft), power in dBm (50 ohm),

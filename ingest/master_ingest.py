@@ -1,5 +1,5 @@
 """
-master_ingest.py  -  download + ingest ALL sensors (PSD + PFP) into build DBs,
+master_ingest.py: download and ingest ALL sensors (PSD + PFP) into build DBs,
 then atomically swap them live and restart the server. Fully autonomous.
 
 - Writes to psd_build.duckdb / pfp_build.duckdb so the LIVE layers keep serving
