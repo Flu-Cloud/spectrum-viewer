@@ -11,7 +11,7 @@ NOTE: this writes the ROW-PER-CAPTURE schema (table `psd`). The live server
 reads the compacted chunk schema (`psd_chunk`, built by compact_db.py). After
 ingesting new data: run compact_db.py, then swap psd_c.duckdb -> psd.duckdb.
 
-    cd C:\\Users\\pipyt\\spectrum-viewer
+    cd /path/to/spectrum-viewer
     py psd_ingest.py CBBT-Directional            # one sensor
     py psd_ingest.py CBBT-Directional --limit 5  # quick test
 """
@@ -25,7 +25,9 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
-DATA_ROOT = os.environ.get("SEA_DATA_ROOT", r"C:\Users\pipyt\Box\SEA-DATA")
+# Where the CBRS source CSVs live. Set SEA_DATA_ROOT to your copy; defaults to
+# ./SEA-DATA in the repo so a fresh clone never points at someone else's disk.
+DATA_ROOT = os.environ.get("SEA_DATA_ROOT", os.path.join(ROOT, "SEA-DATA"))
 SUMM_DB = os.path.join(ROOT, "spectrum.duckdb")
 PSD_DB = os.environ.get("PSD_DB", os.path.join(ROOT, "psd.duckdb"))
 

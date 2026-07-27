@@ -44,8 +44,20 @@ def _skip(dst, key):
     return dst.execute("SELECT 1 FROM done WHERE k=?", [key]).fetchone() is not None
 
 
+def _missing(src_p):
+    """True (with a clear message) when the source DB hasn't been built yet.
+    Keeps a fresh clone from dying on a raw DuckDB traceback."""
+    if os.path.exists(src_p):
+        return False
+    log(f"  skip: {os.path.basename(src_p)} not found in {ROOT}. "
+        "Build it with the matching ingest script first (see README).")
+    return True
+
+
 def compact_spectrum():
     src_p = os.path.join(ROOT, "spectrum.duckdb")
+    if _missing(src_p):
+        return
     dst = duckdb.connect(os.path.join(ROOT, "spectrum_c.duckdb"))
     dst.execute("CREATE TABLE IF NOT EXISTS done (k VARCHAR)")
     dst.execute(f"ATTACH '{src_p}' AS s (READ_ONLY)")
@@ -81,6 +93,8 @@ def _copy_meta(dst, src_path, table):
 
 def compact_psd():
     src_p = os.path.join(ROOT, "psd.duckdb")
+    if _missing(src_p):
+        return
     src = duckdb.connect(src_p, read_only=True)
     dst = duckdb.connect(os.path.join(ROOT, "psd_c.duckdb"))
     _prep(dst, """CREATE TABLE IF NOT EXISTS psd_chunk (
@@ -120,6 +134,8 @@ def compact_psd():
 
 def compact_pfp():
     src_p = os.path.join(ROOT, "pfp.duckdb")
+    if _missing(src_p):
+        return
     src = duckdb.connect(src_p, read_only=True)
     dst = duckdb.connect(os.path.join(ROOT, "pfp_c.duckdb"))
     _prep(dst, """CREATE TABLE IF NOT EXISTS pfp_chunk (
@@ -176,7 +192,7 @@ if __name__ == "__main__":
     log("compacting pfp.duckdb (the big one) ...")
     compact_pfp()
     for f in ("spectrum_c.duckdb", "psd_c.duckdb", "pfp_c.duckdb"):
-        p = os.path.join(HERE, f)
+        p = os.path.join(ROOT, f)      # the compacted DBs land beside serve.py
         if os.path.exists(p):
             log(f"  {f}: {os.path.getsize(p)/1e9:.2f} GB")
     log("DONE ALL")

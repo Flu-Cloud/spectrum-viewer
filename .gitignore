@@ -37,3 +37,6 @@ env/
 # ---- OS junk ----
 Thumbs.db
 desktop.ini
+
+# Local copy of the CBRS source CSVs (default SEA_DATA_ROOT)
+SEA-DATA/

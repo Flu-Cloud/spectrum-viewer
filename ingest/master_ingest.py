@@ -14,7 +14,7 @@ the live server now reads the compacted chunk schema (psd_chunk / pfp_chunk).
 If you re-run this, follow it with compact_db.py + vacuum_dbs.py and swap the
 *_c.duckdb files live instead of letting this script's swap stand alone.
 
-    cd C:\\Users\\pipyt\\spectrum-viewer
+    cd /path/to/spectrum-viewer
     py master_ingest.py
 """
 
@@ -29,7 +29,7 @@ import duckdb
 HERE = os.path.dirname(os.path.abspath(__file__))       # ingest/ (holds the scripts)
 ROOT = os.path.dirname(HERE)                             # repo root (holds serve.py + DBs)
 SUMM = os.path.join(ROOT, "spectrum.duckdb")
-BOX = os.environ.get("SEA_DATA_ROOT", r"C:\Users\pipyt\Box\SEA-DATA")
+BOX = os.environ.get("SEA_DATA_ROOT", os.path.join(ROOT, "SEA-DATA"))
 LIVE_PSD = os.path.join(ROOT, "psd.duckdb")
 LIVE_PFP = os.path.join(ROOT, "pfp.duckdb")
 PSD_BUILD = os.path.join(ROOT, "psd_build.duckdb")

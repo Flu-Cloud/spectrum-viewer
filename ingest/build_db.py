@@ -7,7 +7,7 @@ scan raw rows when you're looking at months or years at a time.
 
 Run once (re-run any time the CSVs change):
 
-    cd C:\\Users\\pipyt\\spectrum-viewer
+    cd /path/to/spectrum-viewer
     py build_db.py
 """
 

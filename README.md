@@ -132,7 +132,7 @@ id, the landing/DOI URL, or a direct file URL; `--list` previews a record and
 [mds2-3177](https://data.nist.gov/od/id/mds2-3177), rendered end to end:
 
 ```bash
-python ingest/fetch.py mds2-3177 --list                    # see what's inside (~34 GB total)
+python ingest/fetch.py mds2-3177 --list                    # see what's inside (902 files, ~189 GB total)
 python ingest/fetch.py mds2-3177 --filter 1.4MHz/config_0 --dest iqdata/mds2-3177   # one 37 MB capture
 python ingest/iq_ingest.py iqdata/mds2-3177 --dataset mds2-3177
 python serve.py                                            # Source dropdown -> the new capture

@@ -11,7 +11,7 @@ Storage (built by build_db.py / *_ingest.py, then compact_db.py):
     pfp.duckdb       pfp_chunk: zlib blobs of 1024 consecutive int8 frames
     iq.duckdb        iq_stft: int8 STFT pyramid per capture (iq_ingest.py)
 
-    cd C:\\Users\\pipyt\\spectrum-viewer
+    cd /path/to/spectrum-viewer
     py serve.py            # http://127.0.0.1:8090
 """
 

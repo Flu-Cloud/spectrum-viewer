@@ -10,7 +10,7 @@ NOTE: this writes the ROW-PER-CAPTURE schema (table `pfp`). The live server
 reads the compacted chunk schema (`pfp_chunk`, built by compact_db.py). After
 ingesting new data: run compact_db.py, then swap pfp_c.duckdb -> pfp.duckdb.
 
-    cd C:\\Users\\pipyt\\spectrum-viewer
+    cd /path/to/spectrum-viewer
     py pfp_ingest.py CBBT-Directional               # default stat max_peak
     py pfp_ingest.py CBBT-Directional --limit 30    # quick prototype
     py pfp_ingest.py CBBT-Directional --stat mean_rms
@@ -25,7 +25,9 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
-DATA_ROOT = os.environ.get("SEA_DATA_ROOT", r"C:\Users\pipyt\Box\SEA-DATA")
+# Where the CBRS source CSVs live. Set SEA_DATA_ROOT to your copy; defaults to
+# ./SEA-DATA in the repo so a fresh clone never points at someone else's disk.
+DATA_ROOT = os.environ.get("SEA_DATA_ROOT", os.path.join(ROOT, "SEA-DATA"))
 SUMM_DB = os.path.join(ROOT, "spectrum.duckdb")
 PFP_DB = os.environ.get("PFP_DB", os.path.join(ROOT, "pfp.duckdb"))
 
