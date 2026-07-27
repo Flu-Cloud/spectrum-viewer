@@ -923,6 +923,16 @@ function showNoBackend(){
     + '<p style="font-size:18px;color:#5f93ff">Open <b>http://localhost:8090</b> in your browser.</p></div></div>';
 }
 
+function showNoData(){
+  document.body.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:center;height:100%;padding:30px;text-align:center">'
+    + '<div><h2 style="color:#f0a500">No spectrum data found</h2>'
+    + '<p style="color:#dde2ea">The server is running, but there are no databases next to <b>serve.py</b>.</p>'
+    + '<p style="font-size:16px;color:#5f93ff">Build the zero-download demo, then reload:</p>'
+    + '<pre style="text-align:left;display:inline-block;background:#151922;padding:12px 16px;border-radius:8px;color:#dde2ea;font-size:14px">python examples/make_sample.py\npython serve.py</pre>'
+    + '<p style="color:#8b93a3">See the README for the full CBRS / IQ datasets.</p></div></div>';
+}
+
 async function boot(){
   document.getElementById('cmap').value = cmapName;
   drawLegend();
@@ -933,25 +943,40 @@ async function boot(){
   meta.freqs.sort((a,b)=>a-b);
   const sel = document.getElementById('sensor');
   meta.sensors.forEach(s=>{ const o=document.createElement('option'); o.value=s.sensor; o.textContent=s.sensor; sel.appendChild(o); });
-  sensor = meta.sensors[0].sensor;
-  meta.tmin = meta.sensors[0].t_min; meta.tmax = meta.sensors[0].t_max;
-  view = { t0: meta.tmin, t1: meta.tmax };
   new ResizeObserver(resize).observe(stage);
-  resize(); requestData();              // paint the (full-span) summary immediately
-  checkPsd(); checkPfp();               // availability flags load in parallel — don't block first paint
-  loadIqIndex();                        // IQ capture library (optional; header dropdown)
+  const caps = await loadIqIndex();       // populate the Source dropdown; returns captures[]
+  if (meta.sensors.length){
+    sensor = meta.sensors[0].sensor;
+    meta.tmin = meta.sensors[0].t_min; meta.tmax = meta.sensors[0].t_max;
+    view = { t0: meta.tmin, t1: meta.tmax };
+    resize(); requestData();              // paint the (full-span) summary immediately
+    checkPsd(); checkPfp();               // availability flags load in parallel — don't block first paint
+  } else if (caps.length){
+    // No CBRS databases present (e.g. a fresh clone running only the IQ demo):
+    // drop the CBRS option and open the first capture directly in IQ mode.
+    const cbrsOpt = document.querySelector('#source option[value="cbrs"]');
+    if (cbrsOpt) cbrsOpt.remove();
+    document.getElementById('sensor').disabled = true;
+    resize();
+    document.getElementById('source').value = 'iq:'+caps[0].id;
+    enterIqMode(caps[0].id);
+  } else {
+    showNoData();                         // server up, but no data at all
+  }
 }
 async function loadIqIndex(){
   try{
     const j = await (await fetch('/api/iq_index')).json();
     const sel = document.getElementById('source');
-    (j.captures||[]).forEach(c=>{
+    const caps = j.captures || [];
+    caps.forEach(c=>{
       const o=document.createElement('option');
       o.value='iq:'+c.id;
       o.textContent=`IQ capture: ${c.name} (${c.dataset} · ${(c.fc/1e6).toFixed(0)} MHz · ${(c.fs/1e6).toFixed(2)} Msps · ${c.duration.toFixed(1)} s)`;
       sel.appendChild(o);
     });
-  }catch(e){}
+    return caps;
+  }catch(e){ return []; }
 }
 async function checkPsd(){
   psdAvail = false;

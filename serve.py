@@ -41,18 +41,29 @@ LEVELS = [
 ]
 
 app = Flask(__name__)
-con = duckdb.connect(DB_PATH, read_only=True)
 _con_lock = threading.Lock()
 
-# Static per-boot metadata (sensor list + channel freqs): computed once so
-# /api/meta never rescans the 47M-row raw table per page load.
-_META = {
-    "sensors": [{"sensor": r[0], "t_min": r[1], "t_max": r[2], "n": r[3]}
-                for r in con.execute(
-                    "SELECT sensor, t_min, t_max, n FROM meta ORDER BY sensor").fetchall()],
-    "freqs": [r[0] for r in con.execute(
-        "SELECT DISTINCT freq FROM raw ORDER BY freq").fetchall()],
-}
+# The CBRS monitoring databases (spectrum/psd/pfp .duckdb) are OPTIONAL: they are
+# multi-GB and not shipped with the repo. When spectrum.duckdb is absent -- e.g. a
+# fresh clone running only the IQ demo (examples/make_sample.py) -- the server
+# still starts and serves IQ captures; the CBRS endpoints simply report no data.
+if os.path.exists(DB_PATH):
+    con = duckdb.connect(DB_PATH, read_only=True)
+    # Static per-boot metadata (sensor list + channel freqs): computed once so
+    # /api/meta never rescans the 47M-row raw table per page load.
+    _META = {
+        "sensors": [{"sensor": r[0], "t_min": r[1], "t_max": r[2], "n": r[3]}
+                    for r in con.execute(
+                        "SELECT sensor, t_min, t_max, n FROM meta ORDER BY sensor").fetchall()],
+        "freqs": [r[0] for r in con.execute(
+            "SELECT DISTINCT freq FROM raw ORDER BY freq").fetchall()],
+    }
+else:
+    con = None
+    _META = {"sensors": [], "freqs": []}
+    print(f"[serve] {os.path.basename(DB_PATH)} not found -- CBRS monitoring "
+          "disabled; IQ capture mode still works. Run examples/make_sample.py "
+          "for a zero-download demo.")
 
 
 # ---- Colormaps + tile encoding (mirrored in viewer.html) ---------------
@@ -140,6 +151,9 @@ def meta():
 
 @app.route("/api/heatmap")
 def heatmap():
+    if con is None:                     # no CBRS database present (IQ-only install)
+        return _gz(jsonify({"level": None, "bucket": 0, "count": 0,
+                            "freq": [], "t": [], "max": [], "median": [], "mean": []}))
     sensor = request.args.get("sensor")
     t0 = float(request.args.get("t0"))
     t1 = float(request.args.get("t1"))
