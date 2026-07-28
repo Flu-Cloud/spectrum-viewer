@@ -1,8 +1,8 @@
 # ATLAS - Automatic Tiled Layering for Analyzing Spectra
 
 "Google Maps for RF spectrum": one interface where **X is always time**
-and color is power. Continuously zoom from a TWO-YEAR overview down to the microsecond
-structure instantly. The viewer swaps resolution layers automatically as
+and color is power. Continuously zoom from a two-year overview down to the microsecond
+structure, instantly. The viewer swaps resolution layers automatically as
 you go.
 
 ![CBRS spectrum overview](docs/cbrs_overview.jpg)
@@ -28,8 +28,8 @@ Below, use whichever of `python` / `python3` / `py` works on your machine.
 **1. Get the code**
 
 ```bash
-git clone https://github.com/Flu-Cloud/spectrum-viewer.git
-cd spectrum-viewer
+git clone https://github.com/jimmylu7/ATLAS.git
+cd ATLAS
 ```
 
 **2. Create a virtual environment, then install**
@@ -89,7 +89,7 @@ That is the whole install. Everything below is optional.
 | `error: externally-managed-environment` | You skipped the virtual environment in step 2. |
 | `ModuleNotFoundError: No module named 'duckdb'` | The venv isn't active, or step 2's `pip install` didn't run. Re-activate and re-run it. |
 | `Address already in use` / page won't load | Port 8090 is taken. Run on another port: `SEA_PORT=8095 python serve.py` (PowerShell: `$env:SEA_PORT=8095; python serve.py`), then open that port. |
-| Browser shows "No spectrum data found" | Run `python examples/verify.py` — the demo database wasn't built. |
+| Browser shows "No spectrum data found" | Run `python examples/verify.py`. The demo database wasn't built. |
 | Server prints "spectrum.duckdb not found" | Expected. That's the optional multi-GB CBRS data; IQ mode still works. |
 
 # For AI agents (Claude Code, Cowork, etc.)
@@ -97,7 +97,7 @@ That is the whole install. Everything below is optional.
 Paste this to have an agent entirely install the project:
 
 ```text
-Clone https://github.com/Flu-Cloud/spectrum-viewer.git and install it.
+Clone https://github.com/jimmylu7/ATLAS.git and install it.
 Create a virtual environment, install requirements.txt into it, then run
 `python examples/verify.py` and show me the output. Do not modify any
 repository files. The install is correct only if that command prints
@@ -145,7 +145,7 @@ Repository record has a JSON manifest at `data.nist.gov/rmm/records/<id>`
 listing each file's path, size and download URL. `fetch.py` accepts the record
 id, the landing/DOI URL, or a direct file URL. `--list` previews a record and
 `--filter` narrows it (all flags: `python ingest/fetch.py --help`). Downloads
-are resumable — press `Ctrl+C` and re-run to continue.
+are resumable: press `Ctrl+C` and re-run to continue.
 
 **IQ example**, a small slice of FDD-LTE record
 [mds2-3177](https://data.nist.gov/od/id/mds2-3177), end to end:
@@ -174,7 +174,7 @@ Summaries CSVs for `build_db.py` go flat into `ingest/csv/`: add
 Want to utilize AI (Claude Cowork / Code session)? Paste:
 
 ```text
-In the spectrum-viewer repo: given this NIST PDR URL <URL>, run
+In the ATLAS repo: given this NIST PDR URL <URL>, run
 `python ingest/fetch.py <URL> --list` to see the record, fetch a SMALL slice
 (--filter) into the layout the matching ingest script expects, then run that
 script unmodified: build_db.py for Summaries CSVs fetched flat into
@@ -236,7 +236,9 @@ NIST datasets; the ingest scripts expect their file products laid out locally.
 
 # Contact
 
-Jimmy Lu ([@jimmylu7](https://github.com/jimmylu7)(jflu@unc.edu)(jimmy.lu@nist.gov)
+Jimmy Lu
+GitHub: [@jimmylu7](https://github.com/jimmylu7)
+Email: [jflu@unc.edu](mailto:jflu@unc.edu) or [jimmy.lu@nist.gov](mailto:jimmy.lu@nist.gov)
 
 # NIST data acknowledgment & disclaimer
 
