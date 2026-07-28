@@ -1,5 +1,7 @@
 """serve.py: Flask backend for the spectrum viewer.
 
+linkedin.com/in/jimmy-lu-/
+
 One canvas, three continuous CBRS layers (summary -> PSD -> PFP) plus the
 independent IQ-capture mode. For any requested window the server picks the
 coarsest stored level that still fills the plot, renders it to a WebP tile
@@ -13,6 +15,7 @@ Storage (built by build_db.py / *_ingest.py, then compact_db.py):
 
     cd /path/to/spectrum-viewer
     py serve.py            # http://127.0.0.1:8090
+
 """
 
 import gzip
@@ -514,3 +517,5 @@ if __name__ == "__main__":
         serve(app, host="127.0.0.1", port=port, threads=8)
     except ImportError:
         app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+
+#GDTBATH
