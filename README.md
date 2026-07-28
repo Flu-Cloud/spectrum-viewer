@@ -1,8 +1,8 @@
-# Spectrum Viewer
+# NIST-Lu: Spectrum Viewer
 
-A "Google Maps for RF spectrum": one pan/zoom canvas where **X is always time**
-and colour is power. Zoom from a two-year overview down to the microsecond
-structure of a single burst. The viewer swaps resolution layers automatically as
+"Google Maps for RF spectrum": one interface where **X is always time**
+and color is power. Zoom from a TWO-YEAR overview down to the microsecond
+structure instantly & in a single page. The viewer swaps resolution layers automatically as
 you go.
 
 ![CBRS spectrum overview](docs/cbrs_overview.jpg)
@@ -74,7 +74,7 @@ Open **http://127.0.0.1:8090** in your browser. In the header, open the
 
 ![Synthetic demo spectrogram](docs/demo_spectrogram.png)
 
-You should see a steady horizontal line (a carrier), stepping horizontal
+You should see a horizontal line (a carrier), stepping horizontal
 segments (a hopping tone), and evenly spaced vertical bands (periodic bursts).
 Scroll to zoom in time, `Ctrl`+scroll to zoom in frequency, drag to pan. To
 stop the server, press `Ctrl+C` in the terminal.
@@ -94,7 +94,7 @@ That is the whole install. Everything below is optional.
 
 # For AI agents (Claude Code, Cowork, etc.)
 
-Paste this to have an agent install and verify the project from scratch:
+Paste this to have an agent entirely install the project:
 
 ```text
 Clone https://github.com/Flu-Cloud/spectrum-viewer.git and install it.
@@ -105,7 +105,7 @@ repository files. The install is correct only if that command prints
 Finally, start `python serve.py` and confirm http://127.0.0.1:8090 responds.
 ```
 
-`examples/verify.py` is the single source of truth for "did this work": it
+`examples/verify.py` is the main tell for "did this work": it
 checks the Python version, the imports, the demo database and every API
 endpoint in-process (no browser or free port required), and exits 0 on success.
 
@@ -113,7 +113,7 @@ endpoint in-process (no browser or free port required), and exits 0 on success.
 
 ## CBRS monitoring mode
 
-One continuous canvas where X is always time. As you zoom in, the viewer swaps
+One continuous interface where X is always time. As you zoom in, the viewer swaps
 between three stored-resolution layers automatically:
 
 | Layer | Source | Resolution | Shown when |
@@ -123,7 +123,7 @@ between three stored-resolution layers automatically:
 | **PFP** | `pfp.duckdb` | 560 pts across a 10 ms frame (~18 µs/pt) | freq narrowed to ~1 channel, or span ≤ 30 min |
 
 Frequency zoom is the vertical slider on the left (drag up = zoom in); drag the
-heatmap vertically to pan frequency.
+screen vertically to pan frequency.
 
 ## IQ capture mode
 
@@ -171,7 +171,7 @@ python ingest/psd_ingest.py CBBT-Directional         # then pfp_ingest.py, compa
 Summaries CSVs for `build_db.py` go flat into `ingest/csv/`: add
 `--dest ingest/csv --flat`.
 
-Handing that job to a Claude / Cowork session? Paste:
+Want to utilize AI (Claude Cowork / Code session)? Paste:
 
 ```text
 In the spectrum-viewer repo: given this NIST PDR URL <URL>, run
@@ -236,7 +236,7 @@ NIST datasets; the ingest scripts expect their file products laid out locally.
 
 # Contact
 
-Jimmy Lu ([@Flu-Cloud](https://github.com/Flu-Cloud))
+Jimmy Lu ([@jimmylu7](https://github.com/jimmylu7)(jflu@unc.edu)(jimmy.lu@nist.gov)
 
 # NIST data acknowledgment & disclaimer
 
