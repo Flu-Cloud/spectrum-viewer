@@ -1,8 +1,8 @@
-# NIST-Lu: Spectrum Viewer
+# ATLAS - Automatic Tiled Layering for Analyzing Spectra
 
 "Google Maps for RF spectrum": one interface where **X is always time**
-and color is power. Zoom from a TWO-YEAR overview down to the microsecond
-structure instantly & in a single page. The viewer swaps resolution layers automatically as
+and color is power. Continuously zoom from a TWO-YEAR overview down to the microsecond
+structure instantly. The viewer swaps resolution layers automatically as
 you go.
 
 ![CBRS spectrum overview](docs/cbrs_overview.jpg)
