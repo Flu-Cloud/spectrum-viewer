@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RF Spectrum Viewer</title>
 <style>
-  /* Design tokens: one source of truth for the whole UI. */
+  /* Jimmy Lu 2026. Design tokens: one source of truth for the whole UI. */
   :root {
     color-scheme: dark;
     --bg: #0b0d12;            /* page chrome */
@@ -287,7 +287,7 @@ function freqRow(freq){
   return { y: PAD.t + i*h, h: h };
 }
 
-// ---- Rendering --------------------------------------------------------
+// ---- Rendering (MOMRAN!!!!) --------------------------------------------------------
 function syncCanvasSize(){
   const sw = stage.clientWidth, sh = stage.clientHeight;
   if (sw === 0 || sh === 0) return false;            // stage not laid out yet
@@ -993,6 +993,7 @@ async function checkPfp(){
 boot();
 // IQ capture mode: header "Source" dropdown switches between CBRS monitoring
 // and independent IQ captures (own time/frequency axes per capture).
+// If this doesn't work, contact Tyler Reichenberg @ Purdue.
 </script>
 </body>
 </html>
