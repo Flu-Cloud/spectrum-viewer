@@ -137,15 +137,19 @@ capture showing the burst / resource-block structure.
 
 # Bring your own dataset
 
-`ingest/fetch.py` downloads a NIST dataset into the layout the ingest scripts
-expect; then the matching ingest script builds the database.
+`ingest/fetch.py` downloads a dataset; then the matching ingest script builds
+the database. Each ingest script finds its own source files by name, searched
+recursively, so the folder layout the download produced does not have to match
+anything.
 
 A dataset's DOI landing page is a JavaScript app, but every NIST Public Data
 Repository record has a JSON manifest at `data.nist.gov/rmm/records/<id>`
 listing each file's path, size and download URL. `fetch.py` accepts the record
-id, the landing/DOI URL, or a direct file URL. `--list` previews a record and
-`--filter` narrows it (all flags: `python ingest/fetch.py --help`). Downloads
-are resumable: press `Ctrl+C` and re-run to continue.
+id, an `ark:` id, the landing/DOI URL, or a direct file URL to any https host.
+`--list` summarises a record by folder, `--tree` shows its structure, `--long`
+prints every file, and `--filter` narrows what gets downloaded (all flags:
+`python ingest/fetch.py --help`). Downloads are resumable and retry transient
+network errors: press `Ctrl+C` and re-run to continue.
 
 **IQ example**, a small slice of FDD-LTE record
 [mds2-3177](https://data.nist.gov/od/id/mds2-3177), end to end:
@@ -159,17 +163,29 @@ python serve.py                                            # Source dropdown -> 
 
 **CBRS SEA example**: the [SEA data portal](https://pages.nist.gov/SEA-DATA/)
 designates PDR record [mds2-4214](https://data.nist.gov/od/id/mds2-4214) (not
-yet published as of July 2026; its Box mirror is invite-only, which `fetch.py`
-deliberately doesn't touch). The day the record goes live:
+yet published as of July 2026). The day the record goes live:
 
 ```bash
-export SEA_DATA_ROOT="/path/to/SEA-DATA"    # PowerShell: $env:SEA_DATA_ROOT="..."
-python ingest/fetch.py mds2-4214 --filter CBBT-Directional --dest "$SEA_DATA_ROOT"
-python ingest/psd_ingest.py CBBT-Directional         # then pfp_ingest.py, compact_db.py
+python ingest/fetch.py mds2-4214 --filter CBBT-Directional --dest SEA-DATA
+python ingest/psd_ingest.py --root SEA-DATA --list     # what landed on disk
+python ingest/psd_ingest.py CBBT-Directional --root SEA-DATA
+python ingest/pfp_ingest.py CBBT-Directional --root SEA-DATA
+python serve.py
 ```
+
+`--root` defaults to `$SEA_DATA_ROOT`, else `./SEA-DATA`. Nothing else has to
+be built first: the PSD and PFP layers read their CSVs directly.
 
 Summaries CSVs for `build_db.py` go flat into `ingest/csv/`: add
 `--dest ingest/csv --flat`.
+
+If you already have the data on disk, skip `fetch.py` entirely and point
+`--root` at wherever it is.
+
+**Downloading from somewhere that is not NIST** works by default; you get one
+warning line naming the host. Use `--nist-only` to refuse anything off
+`nist.gov`, `--allow-host HOST` to re-permit one host under it, and
+`--allow-http` for an unencrypted server.
 
 Want to utilize AI (Claude Cowork / Code session)? Paste:
 
@@ -190,18 +206,32 @@ Per-dataset format notes for the four NIST I/Q sets are in
 # Building the databases
 
 The `ingest/` scripts write the DuckDB files next to `serve.py`. All are
-resumable. Set `SEA_DATA_ROOT` to your copy of the CBRS source CSVs (it
-defaults to `./SEA-DATA` inside the repo).
+resumable. Pass `--root` (or set `SEA_DATA_ROOT`) to point the CBRS scripts at
+your copy of the source CSVs; it defaults to `./SEA-DATA` inside the repo.
 
 | Script | Builds | Notes |
 |--------|--------|-------|
-| `ingest/fetch.py` | (downloads) | pulls a NIST record onto disk |
+| `ingest/fetch.py` | (downloads) | pulls a record onto disk, from NIST or anywhere else |
 | `ingest/build_db.py` | `spectrum.duckdb` | summaries + pyramid levels (lvl_m10/h1/h6/d1) |
-| `ingest/psd_ingest.py` | `psd.duckdb` | PSD `max`, int8 per capture |
+| `ingest/psd_ingest.py` | `psd.duckdb` | PSD `max`, int8 per capture. `--list` shows what is on disk |
 | `ingest/pfp_ingest.py` | `pfp.duckdb` | PFP `max_peak`, int8 per channel/capture |
-| `ingest/master_ingest.py` | both CBRS DBs | all 10 sensors, then swaps build → live |
-| `ingest/compact_db.py` | `*_c.duckdb` | **run after any CBRS ingest**: repacks into the chunked/zlib schema the server reads |
+| `ingest/master_ingest.py` | both CBRS DBs | all sensors, then swaps build → live |
+| `ingest/compact_db.py` | smaller DBs | **optional.** Repacks into the chunked/zlib schema and swaps it in, keeping a `.bak` |
 | `ingest/iq_ingest.py` | `iq.duckdb` | STFT pyramid for IQ captures (SigMF/TDMS/npy) |
+
+The server reads both the schema the ingest scripts write and the compacted
+one, so `compact_db.py` only changes file size and speed. Run it when the
+databases get big; skip it otherwise.
+
+## Checking a change
+
+Three self-contained checks, none of which need a network or a browser:
+
+```bash
+python examples/verify.py        # install + the synthetic IQ demo
+python examples/test_fetch.py    # fetch.py against a local fake repository
+python examples/test_ingest.py   # the CBRS path, uncompacted and compacted
+```
 
 # Architecture
 
@@ -211,7 +241,8 @@ defaults to `./SEA-DATA` inside the repo).
   that still has detail for the window and renders WebP tiles (numpy + Pillow;
   axis metadata rides in the `X-Meta` response header). Reads the DuckDB files
   read-only, with a per-request connection so renders are thread-safe. The CBRS
-  databases are optional — without them the server still serves IQ captures.
+  databases are optional: without them the server still serves IQ captures, and
+  it reads each one in whichever of the two schemas is on disk.
 - **`viewer.html`**: single-file canvas app, no build step. Zoom/pan, the layer
   swaps, the zoom sliders and colour locking all live here.
 - **`ingest/`**: the data-build tooling. `sigmf_io.py` is a unified reader for

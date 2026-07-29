@@ -1,5 +1,15 @@
 # ATLAS install and data-pipeline audit
 
+> **Status.** This documents the state *before* the fetch and database-building
+> fixes. Now closed: F1-F7 (fetch source parsing, host policy, network errors,
+> retries, listing), P1-P5 and P7 (the spectrum.duckdb dependency, the schema
+> mismatch, the silent empty database, the fixed folder layout, the unchecked
+> column count), and the Windows-only parts of P6. Regression cover lives in
+> `examples/test_fetch.py` and `examples/test_ingest.py`.
+> Still open: F8 and D1-D3, which are the single-entry-point work
+> (`atlas.py`, `environment.yml`, `datasets.json`, the prebuilt-database path)
+> described in [MASTER_PROMPT.md](MASTER_PROMPT.md).
+
 What actually happens when someone follows the README on a clean machine, tested
 end to end rather than read off the page. Every item marked VERIFIED below was
 reproduced on a wiped environment; items marked RISK are reasoned from the code

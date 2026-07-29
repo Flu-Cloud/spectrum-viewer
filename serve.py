@@ -32,7 +32,9 @@ from PIL import Image
 from flask import Flask, Response, jsonify, make_response, request, send_file
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(HERE, "spectrum.duckdb")
+# Each database path is overridable, like IQ_DB below, so a test run or a
+# second dataset can point somewhere else without moving files around.
+DB_PATH = os.environ.get("SPECTRUM_DB", os.path.join(HERE, "spectrum.duckdb"))
 
 # (table, bucket_seconds), finest first. 0 == raw native cadence.
 LEVELS = [
@@ -186,7 +188,7 @@ def heatmap():
 
 
 # ---- PSD continuous layer (chunked int8 spectra, zlib) -----------------
-PSD_DB = os.path.join(HERE, "psd.duckdb")
+PSD_DB = os.environ.get("PSD_DB", os.path.join(HERE, "psd.duckdb"))
 F0 = 3530040000.0     # first PSD bin (Hz)
 DF = 80000.0          # bin spacing (Hz)
 NF = 2250             # bins  (full band 3530.04 .. 3709.96 MHz)
@@ -197,17 +199,35 @@ PSD_DBM_OFFSET = 70.0
 _psd_con = None
 _psd_lock = threading.Lock()
 _psd_scale_cache = {}   # sensor -> (vmin, vmax) sampled across the whole range
+_psd_kind = None        # 'chunk' | 'rows' | None
+
+
+def table_names(c):
+    try:
+        return {r[0] for r in c.execute(
+            "SELECT table_name FROM information_schema.tables").fetchall()}
+    except Exception:
+        return set()
 
 
 def psd_conn():
     """Persistent read-only handle (saves the ~15ms reopen per zoom). The live
     DB is never written while serving; ingest builds a fresh file and swaps."""
-    global _psd_con
+    global _psd_con, _psd_kind
     if _psd_con is None and os.path.exists(PSD_DB):
         try:
             _psd_con = duckdb.connect(PSD_DB, read_only=True)
         except Exception:
             return None
+        # Two on-disk shapes are valid: the compact chunk schema written by
+        # compact_db.py, and the row-per-capture schema psd_ingest.py writes.
+        # Reading both means compaction is a size optimisation, not a step you
+        # can forget and end up with a viewer that renders nothing.
+        t = table_names(_psd_con)
+        _psd_kind = "chunk" if "psd_chunk" in t else ("rows" if "psd" in t else None)
+        if _psd_kind == "rows":
+            print("[serve] psd.duckdb is the uncompacted row schema; serving it "
+                  "directly. Run ingest/compact_db.py to shrink it.")
     return _psd_con
 
 
@@ -219,16 +239,29 @@ def _unpack(rows, width):
     return ts, mat
 
 
+def _unpack_rows(rows, width):
+    """(times, mat) from row-per-capture rows of (t, blob)."""
+    ts = np.array([r[0] for r in rows], dtype=np.float64)
+    mat = np.stack([np.frombuffer(r[1], np.uint8) for r in rows]) if rows \
+        else np.zeros((0, width), np.uint8)
+    return ts, mat.reshape(len(rows), width)
+
+
 def _psd_scale(c, sensor, qmin, qmax):
     sc = _psd_scale_cache.get(sensor)
     if sc is not None:
         return sc
-    rows = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? "
-                     "USING SAMPLE reservoir(4 ROWS)", [sensor]).fetchall()
-    if not rows:
+    if _psd_kind == "chunk":
+        rows = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? "
+                         "USING SAMPLE reservoir(4 ROWS)", [sensor]).fetchall()
+        specs = _unpack(rows, NF)[1] if rows else None
+    else:
+        rows = c.execute("SELECT t, spec FROM psd WHERE sensor=? "
+                         "USING SAMPLE reservoir(400 ROWS)", [sensor]).fetchall()
+        specs = _unpack_rows(rows, NF)[1] if rows else None
+    if specs is None or not len(specs):
         sc = (qmin, qmax)
     else:
-        _, specs = _unpack(rows, NF)
         specs = specs[:: max(1, len(specs) // 400)]
         full = qmin + (specs.astype(np.float32) / 255.0) * (qmax - qmin) + PSD_DBM_OFFSET
         sc = (float(np.percentile(full, 2)), float(np.percentile(full, 98)))
@@ -239,34 +272,50 @@ def _psd_scale(c, sensor, qmin, qmax):
 def _psd_window(c, sensor, t0, t1):
     """Spectra in [t0,t1). Data gap -> hold the nearest capture (matches the
     summary layer's gap-fill so zooming keeps showing last-known data)."""
-    rows = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? "
-                     "AND t1>=? AND t0<? ORDER BY t0", [sensor, t0, t1]).fetchall()
+    if _psd_kind == "chunk":
+        rows = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? "
+                         "AND t1>=? AND t0<? ORDER BY t0", [sensor, t0, t1]).fetchall()
+        if rows:
+            ts, specs = _unpack(rows, NF)
+            m = (ts >= t0) & (ts < t1)
+            if m.any():
+                return specs[m], False
+        row = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? AND t0<? "
+                        "ORDER BY t0 DESC LIMIT 1", [sensor, t1]).fetchone()
+        if row is None:
+            row = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? "
+                            "ORDER BY t0 LIMIT 1", [sensor]).fetchone()
+        if row is None:
+            return None, False
+        ts, specs = _unpack([row], NF)
+        i = max(0, int(np.searchsorted(ts, t1)) - 1)
+        return specs[i:i + 1], True
+
+    rows = c.execute("SELECT t, spec FROM psd WHERE sensor=? AND t>=? AND t<? "
+                     "ORDER BY t", [sensor, t0, t1]).fetchall()
     if rows:
-        ts, specs = _unpack(rows, NF)
-        m = (ts >= t0) & (ts < t1)
-        if m.any():
-            return specs[m], False
-    row = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? AND t0<? "
-                    "ORDER BY t0 DESC LIMIT 1", [sensor, t1]).fetchone()
+        return _unpack_rows(rows, NF)[1], False
+    row = c.execute("SELECT t, spec FROM psd WHERE sensor=? AND t<? "
+                    "ORDER BY t DESC LIMIT 1", [sensor, t1]).fetchone()
     if row is None:
-        row = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? "
-                        "ORDER BY t0 LIMIT 1", [sensor]).fetchone()
+        row = c.execute("SELECT t, spec FROM psd WHERE sensor=? ORDER BY t LIMIT 1",
+                        [sensor]).fetchone()
     if row is None:
         return None, False
-    ts, specs = _unpack([row], NF)
-    i = max(0, int(np.searchsorted(ts, t1)) - 1)
-    return specs[i:i + 1], True
+    return _unpack_rows([row], NF)[1], True
 
 
 @app.route("/api/psd_meta")
 def psd_meta():
     c = psd_conn()
-    if c is None:
+    if c is None or _psd_kind is None:
         return jsonify({"has": False})
     with _psd_lock:
         row = c.execute("SELECT f0, df, nf, t_min, t_max FROM psd_meta WHERE sensor=?",
                         [request.args.get("sensor")]).fetchone()
-    if not row:
+    # An ingest that read no files leaves a meta row with a null time range.
+    # Never advertise a layer whose backing rows are not actually there.
+    if not row or row[3] is None or row[4] is None:
         return jsonify({"has": False})
     f0, df, nf, tmin, tmax = row
     return jsonify({"has": True, "fmin": f0, "fmax": f0 + (nf - 1) * df,
@@ -285,7 +334,7 @@ def psd_layer():
     if fi1 <= fi0:
         fi0, fi1 = 0, NF - 1
     c = psd_conn()
-    if c is None:
+    if c is None or _psd_kind is None:
         return jsonify({"error": "psd layer not ready"}), 503
     with _psd_lock:
         specs, gap = _psd_window(c, sensor, t0, t1)
@@ -318,19 +367,25 @@ def psd_layer():
 
 
 # ---- PFP layer (periodic-frame-power, ~18 us within a 10 ms frame) ----
-PFP_DB = os.path.join(HERE, "pfp.duckdb")
+PFP_DB = os.environ.get("PFP_DB", os.path.join(HERE, "pfp.duckdb"))
 _pfp_con = None
 _pfp_lock = threading.Lock()
 _pfp_freqs_cache = {}
+_pfp_kind = None        # 'chunk' | 'rows' | None
 
 
 def pfp_conn():
-    global _pfp_con
+    global _pfp_con, _pfp_kind
     if _pfp_con is None and os.path.exists(PFP_DB):
         try:
             _pfp_con = duckdb.connect(PFP_DB, read_only=True)
         except Exception:
             return None
+        t = table_names(_pfp_con)       # same dual-schema rule as PSD above
+        _pfp_kind = "chunk" if "pfp_chunk" in t else ("rows" if "pfp" in t else None)
+        if _pfp_kind == "rows":
+            print("[serve] pfp.duckdb is the uncompacted row schema; serving it "
+                  "directly. Run ingest/compact_db.py to shrink it.")
     return _pfp_con
 
 
@@ -338,17 +393,18 @@ def pfp_conn():
 def pfp_meta():
     sensor = request.args.get("sensor")
     c = pfp_conn()
-    if c is None:
+    if c is None or _pfp_kind is None:
         return jsonify({"has": False})
     with _pfp_lock:
         m = c.execute("SELECT npos, frame_ms, t_min, t_max, stat FROM pfp_meta WHERE sensor=?",
                       [sensor]).fetchone()
-        if not m:
+        if not m or m[2] is None or m[3] is None:
             return jsonify({"has": False})
         freqs = _pfp_freqs_cache.get(sensor)
         if freqs is None:
+            src = "pfp_chunk" if _pfp_kind == "chunk" else "pfp"
             freqs = [r[0] for r in c.execute(
-                "SELECT DISTINCT freq FROM pfp_chunk WHERE sensor=? ORDER BY 1",
+                f"SELECT DISTINCT freq FROM {src} WHERE sensor=? ORDER BY 1",
                 [sensor]).fetchall()]
             _pfp_freqs_cache[sensor] = freqs
     return jsonify({"has": True, "npos": m[0], "frame_ms": m[1],
@@ -363,18 +419,24 @@ def pfp_frame():
     t0 = float(request.args.get("t0")); t1 = float(request.args.get("t1"))
     H = max(1, int(request.args.get("h", 600)))
     c = pfp_conn()
-    if c is None:
+    if c is None or _pfp_kind is None:
         return jsonify({"error": "pfp not ready"}), 503
     with _pfp_lock:
-        rows = c.execute(
-            "SELECT n, times, frames FROM pfp_chunk WHERE sensor=? AND freq=? "
-            "AND t1>=? AND t0<? ORDER BY t0", [sensor, freq, t0, t1]).fetchall()
+        if _pfp_kind == "chunk":
+            rows = c.execute(
+                "SELECT n, times, frames FROM pfp_chunk WHERE sensor=? AND freq=? "
+                "AND t1>=? AND t0<? ORDER BY t0", [sensor, freq, t0, t1]).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT t, frame FROM pfp WHERE sensor=? AND freq=? "
+                "AND t>=? AND t<? ORDER BY t", [sensor, freq, t0, t1]).fetchall()
         m = c.execute("SELECT npos, frame_ms, qmin, qmax FROM pfp_meta WHERE sensor=?",
                       [sensor]).fetchone()
-    if not rows:
+    if not rows or not m:
         return jsonify({"error": "no pfp in window"}), 404
     npos, frame_ms, qmin, qmax = m
-    ts, frames = _unpack(rows, npos)
+    ts, frames = (_unpack(rows, npos) if _pfp_kind == "chunk"
+                  else _unpack_rows(rows, npos))
     keep = (ts >= t0) & (ts < t1)
     if not keep.any():
         return jsonify({"error": "no pfp in window"}), 404

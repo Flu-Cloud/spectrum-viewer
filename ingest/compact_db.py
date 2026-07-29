@@ -5,12 +5,18 @@
   pfp.duckdb      : per-capture rows -> zlib chunks of 1024 frames  ~14.3 -> ~5.5 GB
                     (consecutive same-channel frames compress 3.1x; measured)
 
-Writes *_c.duckdb build files next to the originals. The caller swaps them in
-after "DONE ALL" appears in the log. Resumable: finished units are recorded in
-a `done` table, a crashed partial unit is deleted and redone.
+Writes *_c.duckdb build files next to the originals, then moves each one into
+place, keeping the original as <name>.duckdb.bak. Pass --no-swap to skip that
+last step. Resumable: finished units are recorded in a `done` table, a crashed
+partial unit is deleted and redone.
+
+This step is optional. serve.py reads the uncompacted files the ingest scripts
+write, so compaction only makes them smaller and faster.
 
     py compact_db.py
+    py compact_db.py --no-swap
 """
+import argparse
 import os
 import sys
 import time
@@ -21,6 +27,8 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
+# Where the .duckdb files live; override to compact a copy elsewhere.
+DB_DIR = os.environ.get("ATLAS_DB_DIR", ROOT)
 Z = 6                # zlib level (PFP 3.1x, PSD 1.7x at z6; measured on live data)
 PSD_CHUNK = 256      # spectra per chunk  (256*2250 = 576 KB raw)
 PFP_CHUNK = 1024     # frames per chunk   (1024*560 = 573 KB raw)
@@ -49,16 +57,16 @@ def _missing(src_p):
     Keeps a fresh clone from dying on a raw DuckDB traceback."""
     if os.path.exists(src_p):
         return False
-    log(f"  skip: {os.path.basename(src_p)} not found in {ROOT}. "
+    log(f"  skip: {os.path.basename(src_p)} not found in {DB_DIR}. "
         "Build it with the matching ingest script first (see README).")
     return True
 
 
 def compact_spectrum():
-    src_p = os.path.join(ROOT, "spectrum.duckdb")
+    src_p = os.path.join(DB_DIR, "spectrum.duckdb")
     if _missing(src_p):
         return
-    dst = duckdb.connect(os.path.join(ROOT, "spectrum_c.duckdb"))
+    dst = duckdb.connect(os.path.join(DB_DIR, "spectrum_c.duckdb"))
     dst.execute("CREATE TABLE IF NOT EXISTS done (k VARCHAR)")
     dst.execute(f"ATTACH '{src_p}' AS s (READ_ONLY)")
     if not _skip(dst, "meta"):
@@ -92,11 +100,11 @@ def _copy_meta(dst, src_path, table):
 
 
 def compact_psd():
-    src_p = os.path.join(ROOT, "psd.duckdb")
+    src_p = os.path.join(DB_DIR, "psd.duckdb")
     if _missing(src_p):
         return
     src = duckdb.connect(src_p, read_only=True)
-    dst = duckdb.connect(os.path.join(ROOT, "psd_c.duckdb"))
+    dst = duckdb.connect(os.path.join(DB_DIR, "psd_c.duckdb"))
     _prep(dst, """CREATE TABLE IF NOT EXISTS psd_chunk (
         sensor VARCHAR, t0 DOUBLE, t1 DOUBLE, n INT, times BLOB, specs BLOB)""")
     if not _skip(dst, "meta"):
@@ -133,11 +141,11 @@ def compact_psd():
 
 
 def compact_pfp():
-    src_p = os.path.join(ROOT, "pfp.duckdb")
+    src_p = os.path.join(DB_DIR, "pfp.duckdb")
     if _missing(src_p):
         return
     src = duckdb.connect(src_p, read_only=True)
-    dst = duckdb.connect(os.path.join(ROOT, "pfp_c.duckdb"))
+    dst = duckdb.connect(os.path.join(DB_DIR, "pfp_c.duckdb"))
     _prep(dst, """CREATE TABLE IF NOT EXISTS pfp_chunk (
         sensor VARCHAR, freq DOUBLE, t0 DOUBLE, t1 DOUBLE, n INT, times BLOB, frames BLOB)""")
     if not _skip(dst, "meta"):
@@ -184,7 +192,42 @@ def compact_pfp():
     log("pfp_c.duckdb complete")
 
 
+def swap_in(name):
+    """Move <name>_c.duckdb onto <name>.duckdb, keeping a .bak of the original.
+
+    Doing this here is the point: leaving the compacted file sitting next to
+    the original under a different name is how a run ends up "finished" while
+    the server still reads the old file.
+    """
+    built = os.path.join(DB_DIR, f"{name}_c.duckdb")
+    live = os.path.join(DB_DIR, f"{name}.duckdb")
+    if not os.path.exists(built):
+        return False
+    bak = live + ".bak"
+    try:
+        if os.path.exists(live):
+            if os.path.exists(bak):
+                os.remove(bak)
+            os.replace(live, bak)
+        os.replace(built, live)
+    except OSError as e:
+        log(f"  could not swap {name}_c.duckdb -> {name}.duckdb: {e}")
+        log("    Stop serve.py (it holds the file open on Windows) and re-run, "
+            "or rename the files by hand.")
+        return False
+    log(f"  {name}.duckdb <- {name}_c.duckdb "
+        f"({os.path.getsize(live)/1e9:.2f} GB; previous kept as "
+        f"{os.path.basename(bak)})")
+    return True
+
+
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--no-swap", action="store_true",
+                    help="leave the compacted files as *_c.duckdb instead of "
+                         "moving them into place")
+    args = ap.parse_args()
+
     log("compacting spectrum.duckdb ...")
     compact_spectrum()
     log("compacting psd.duckdb ...")
@@ -195,4 +238,11 @@ if __name__ == "__main__":
         p = os.path.join(ROOT, f)      # the compacted DBs land beside serve.py
         if os.path.exists(p):
             log(f"  {f}: {os.path.getsize(p)/1e9:.2f} GB")
+    if args.no_swap:
+        log("--no-swap: rename *_c.duckdb yourself before serve.py will see them")
+    else:
+        log("swapping compacted files into place ...")
+        swapped = [n for n in ("spectrum", "psd", "pfp") if swap_in(n)]
+        if not swapped:
+            log("  nothing to swap")
     log("DONE ALL")
