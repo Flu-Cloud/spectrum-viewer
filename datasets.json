@@ -4,17 +4,20 @@
     "Public Data Repository record and, optionally, a default --filter so a",
     "first run pulls a small slice rather than the whole record.",
     "Add your own: any record id, ark, DOI or landing URL works here, and",
-    "atlas.py works without this file at all if you pass the id directly."
+    "atlas.py works without this file at all if you pass the id directly.",
+    "sample: how many of the smallest files 'a sample' means in the menu."
   ],
   "lte-uplink": {
     "record": "mds2-3177",
     "title": "NIST high-SNR FDD-LTE uplink I/Q captures",
     "filter": "1.4MHz/config_0",
-    "note": "the full record is ~189 GB across 902 files; the default filter takes one ~37 MB capture. Pass --filter '' for everything."
+    "note": "the full record is ~189 GB across 902 files; the default filter takes one ~37 MB capture. Pass --filter '' for everything.",
+    "sample": 3
   },
   "cbrs-sea": {
     "record": "mds2-4214",
     "title": "NASCTN CBRS SEA monitoring data",
-    "note": "designated by the SEA data portal but not published as of July 2026, so this will report HTTP 404 until it goes live."
+    "note": "designated by the SEA data portal but not published as of July 2026, so this will report HTTP 404 until it goes live.",
+    "sample": 3
   }
 }

@@ -584,6 +584,9 @@ def main():
                     help="list every matching file with size and URL, and exit")
     ap.add_argument("--tree", action="store_true",
                     help="print the record's folder structure and exit")
+    ap.add_argument("--first", type=int, default=None, metavar="N",
+                    help="only the N smallest matching files. The quickest way "
+                         "to try a record without pulling all of it")
     ap.add_argument("--flat", action="store_true",
                     help="ignore record folder structure; write basenames "
                          "directly into --dest (for ingest/csv)")
@@ -633,6 +636,11 @@ def main():
     if args.filter:
         needle = args.filter.lower().replace("\\", "/")
         files = [f for f in files if needle in f["filepath"].lower()]
+    n_filtered = len(files)
+    if args.first:
+        # Smallest first, so "try this record" costs megabytes, not gigabytes.
+        files = sorted(files, key=lambda f: (f["size"] is None, f["size"] or 0)
+                       )[:args.first]
     if not files:
         msg = "no downloadable files"
         if args.filter:
@@ -645,6 +653,8 @@ def main():
     known = all(f["size"] is not None for f in files)
     print(f"{len(files)} file(s), {fmt_size(total)}{'' if known else '+'} total"
           + (f" (filter: {args.filter})" if args.filter else "")
+          + (f"; smallest {len(files)} of {n_filtered} matching"
+             if args.first and n_filtered > len(files) else "")
           + (f"; {len(checksums)} .sha256 sidecar(s) for verification"
              if checksums else ""))
 

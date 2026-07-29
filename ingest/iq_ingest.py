@@ -20,6 +20,7 @@ import time
 import duckdb
 import numpy as np
 
+import cbrs_files
 import sigmf_io
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,16 +37,12 @@ except Exception:
     pass
 
 
+CAPTURE_EXT = (".sigmf-meta", ".tdms", ".npy")
+
+
 def discover(root):
     """Capture files under root (or root itself): .sigmf-meta / .tdms / .npy."""
-    if os.path.isfile(root):
-        return [root]
-    out = []
-    for dirpath, _, names in os.walk(root):
-        for n in sorted(names):
-            if n.lower().endswith((".sigmf-meta", ".tdms", ".npy")):
-                out.append(os.path.join(dirpath, n))
-    return out
+    return cbrs_files.walk_ext(root, CAPTURE_EXT)
 
 
 def stft_db(cap, s0, nframes, win):

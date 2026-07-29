@@ -22,6 +22,9 @@ import time
 
 import duckdb
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cbrs_files                                    # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 CSV_DIR = os.path.join(HERE, "csv")
@@ -43,12 +46,7 @@ LEVELS = [
 
 
 def find_csvs(csv_dir):
-    out = []
-    for dirpath, _, names in os.walk(csv_dir):
-        for n in sorted(names):
-            if n.lower().endswith(".csv"):
-                out.append(os.path.join(dirpath, n))
-    return sorted(out)
+    return cbrs_files.walk_ext(csv_dir, (".csv",))
 
 
 def no_data(csv_dir):

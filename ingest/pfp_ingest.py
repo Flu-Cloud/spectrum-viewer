@@ -29,6 +29,9 @@ import time
 import duckdb
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cbrs_files                                    # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 # Where the CBRS source CSVs live. Set SEA_DATA_ROOT to your copy, or pass
@@ -54,58 +57,11 @@ except Exception:
 
 
 def discover(root, stat=None):
-    """Walk root -> {sensor: {day: path}} for matching PFP CSVs, any layout."""
-    found = {}
-    for dirpath, _, names in os.walk(root):
-        for n in names:
-            m = NAME_RE.match(n)
-            if not m or (stat and m.group("stat") != stat):
-                continue
-            found.setdefault(m.group("sensor"), {})[m.group("day")] = \
-                os.path.join(dirpath, n)
-    return found
+    return cbrs_files.discover(root, NAME_RE, stat)
 
 
 def stats_present(root):
-    out = set()
-    for _, _, names in os.walk(root):
-        for n in names:
-            m = NAME_RE.match(n)
-            if m:
-                out.add(m.group("stat"))
-    return sorted(out)
-
-
-def sample_of(root, limit=8):
-    out = []
-    for dirpath, _, names in os.walk(root):
-        for n in sorted(names)[:limit]:
-            out.append(os.path.relpath(os.path.join(dirpath, n), root))
-            if len(out) >= limit:
-                return out
-    return out
-
-
-def no_data(root, stat):
-    print(f"No PFP CSVs found under {os.path.abspath(root)}", file=sys.stderr)
-    print(f"  looked for: {PATTERN}"
-          + (f" with stat '{stat}'" if stat else "") + " (searched recursively)",
-          file=sys.stderr)
-    other = stats_present(root)
-    if stat and other:
-        print(f"  files with that name shape exist, but their stats are: "
-              f"{', '.join(other)}. Try --stat {other[0]}.", file=sys.stderr)
-    else:
-        found = sample_of(root)
-        if found:
-            print("  what is actually there:", file=sys.stderr)
-            for f in found:
-                print(f"    {f}", file=sys.stderr)
-        else:
-            print("  that directory is empty.", file=sys.stderr)
-    print("  Point --root at your copy of the data, or set SEA_DATA_ROOT "
-          "(PowerShell: $env:SEA_DATA_ROOT=\"...\").", file=sys.stderr)
-    return 1
+    return cbrs_files.stats_present(root, NAME_RE)
 
 
 def read_frames(path, rcon):
@@ -142,15 +98,12 @@ def main():
 
     root = args.root
     if not os.path.isdir(root):
-        sys.exit(f"source directory not found: {os.path.abspath(root)}\n"
-                 "  Pass --root /path/to/your/data, or set SEA_DATA_ROOT "
-                 "(PowerShell: $env:SEA_DATA_ROOT=\"...\").\n"
-                 "  To download it: python ingest/fetch.py <record-id> "
-                 "--dest <that directory>")
+        sys.exit(cbrs_files.missing_root(root))
 
     found = discover(root, args.stat)
     if not found:
-        sys.exit(no_data(root, args.stat))
+        sys.exit(cbrs_files.no_data(root, args.stat, NAME_RE,
+                                    PATTERN, "PFP"))
 
     if args.list:
         print(f"{os.path.abspath(root)} (stat: {args.stat})\n")
@@ -161,22 +114,11 @@ def main():
         print("\nnext: python ingest/pfp_ingest.py <sensor>")
         return 0
 
-    sensor = args.sensor
-    if sensor is None:
-        if len(found) == 1:
-            sensor = next(iter(found))
-            print(f"one sensor on disk; ingesting {sensor}")
-        else:
-            sys.exit(f"which sensor? {len(found)} found under "
-                     f"{os.path.abspath(root)}:\n  "
-                     + "\n  ".join(sorted(found))
-                     + "\n  Pass one as the first argument.")
-    if sensor not in found:
-        near = [s for s in found if s.lower() == sensor.lower()]
-        hint = f"\n  Did you mean: {near[0]}" if near else \
-            "\n  Available: " + ", ".join(sorted(found))
-        sys.exit(f"no PFP CSVs for sensor '{sensor}' under "
-                 f"{os.path.abspath(root)}." + hint)
+    sensor, why = cbrs_files.resolve_sensor(args.sensor, found, root)
+    if why:
+        sys.exit(why)
+    if args.sensor is None:
+        print(f"one sensor on disk; ingesting {sensor}")
 
     by_day = found[sensor]
     days = sorted(by_day)
