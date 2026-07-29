@@ -50,7 +50,7 @@ pip install -r requirements.txt
 **3. Build the demo data and check the install**
 
 ```bash
-python examples/verify.py
+python atlas.py setup
 ```
 
 This builds a small synthetic capture (`iq.duckdb`, ~2 MB, created next to
@@ -66,7 +66,7 @@ If it says `FAIL`, the line above it names the problem. See
 **4. Start the viewer**
 
 ```bash
-python serve.py
+python atlas.py serve
 ```
 
 Open **http://127.0.0.1:8090** in your browser. In the header, open the
@@ -89,7 +89,7 @@ That is the whole install. Everything below is optional.
 | `error: externally-managed-environment` | You skipped the virtual environment in step 2. |
 | `ModuleNotFoundError: No module named 'duckdb'` | The venv isn't active, or step 2's `pip install` didn't run. Re-activate and re-run it. |
 | `Address already in use` / page won't load | Port 8090 is taken. Run on another port: `SEA_PORT=8095 python serve.py` (PowerShell: `$env:SEA_PORT=8095; python serve.py`), then open that port. |
-| Browser shows "No spectrum data found" | Run `python examples/verify.py`. The demo database wasn't built. |
+| Browser shows "No spectrum data found" | Run `python atlas.py status` to see what is built, then `python atlas.py setup`. |
 | Server prints "spectrum.duckdb not found" | Expected. That's the optional multi-GB CBRS data; IQ mode still works. |
 
 # For AI agents (Claude Code, Cowork, etc.)
@@ -99,15 +99,17 @@ Paste this to have an agent entirely install the project:
 ```text
 Clone https://github.com/jimmylu7/ATLAS.git and install it.
 Create a virtual environment, install requirements.txt into it, then run
-`python examples/verify.py` and show me the output. Do not modify any
+`python atlas.py setup` and show me the output. Do not modify any
 repository files. The install is correct only if that command prints
 "RESULT: PASS"; if it prints FAIL, report the failing check verbatim and stop.
-Finally, start `python serve.py` and confirm http://127.0.0.1:8090 responds.
+Finally, start `python atlas.py serve` and confirm http://127.0.0.1:8090
+responds.
 ```
 
-`examples/verify.py` is the main tell for "did this work": it
-checks the Python version, the imports, the demo database and every API
-endpoint in-process (no browser or free port required), and exits 0 on success.
+`atlas.py setup` runs `examples/verify.py`, which is the main tell for "did
+this work": it checks the Python version, the imports, the demo database and
+every API endpoint in-process (no browser or free port required), and exits 0
+on success. `python atlas.py status` answers "what is built" at any point.
 
 # What the two modes show
 
@@ -136,6 +138,26 @@ capture showing the burst / resource-block structure.
 ![IQ capture spectrogram](docs/iq_capture.jpg)
 
 # Bring your own dataset
+
+One command covers every case. Point it at what you have:
+
+```bash
+python atlas.py get ~/Downloads/mds2-3177   # data already on your disk
+python atlas.py get lte-uplink              # a name from datasets.json
+python atlas.py get mds2-3177               # a NIST PDR record id
+python atlas.py get https://doi.org/10.18434/mds2-3177    # a DOI or URL
+python atlas.py status                      # what is built, what is next
+```
+
+It downloads only when the target is not already local, classifies every file
+it finds (IQ captures, CBRS PSD or PFP exports, Summaries CSVs, or prebuilt
+`.duckdb` databases), runs the ingest each one needs, and prints the resulting
+state. Add `--dry-run` to see the plan without changing anything, or
+`--compact` to shrink the databases afterwards. A record that publishes
+finished `.duckdb` files is copied straight into place with no ingest at all.
+
+The rest of this section is what `atlas.py get` runs underneath, for when you
+want to drive it yourself.
 
 `ingest/fetch.py` downloads a dataset; then the matching ingest script builds
 the database. Each ingest script finds its own source files by name, searched
@@ -231,6 +253,7 @@ Three self-contained checks, none of which need a network or a browser:
 python examples/verify.py        # install + the synthetic IQ demo
 python examples/test_fetch.py    # fetch.py against a local fake repository
 python examples/test_ingest.py   # the CBRS path, uncompacted and compacted
+python examples/test_atlas.py    # atlas.py routing a mixed folder
 ```
 
 # Architecture
@@ -254,10 +277,12 @@ python examples/test_ingest.py   # the CBRS path, uncompacted and compacted
 per-capture `vmin/vmax` so colours never drift on zoom.
 
 ```
+atlas.py            one command: setup / get / status / serve
 serve.py            Flask backend (app entry point)
 viewer.html         single-file canvas frontend
+datasets.json       friendly names -> PDR records
 requirements.txt    dependencies, with tested versions
-examples/           make_sample.py (demo data) + verify.py (install check)
+examples/           demo data, the install check, and the offline tests
 docs/               screenshots + IQ dataset notes
 ingest/             fetch + database-build tooling, all resumable
 ```

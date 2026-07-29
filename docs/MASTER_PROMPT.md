@@ -5,12 +5,12 @@ self-contained: every defect it names was reproduced first, so the agent does
 not need to rediscover them. Evidence and line references are in
 [AUDIT.md](AUDIT.md).
 
-> **Already done on this branch:** defects F1-F7 and P1-P7, and build items 2,
-> 3, 4 and 5 below. `examples/test_fetch.py` and `examples/test_ingest.py`
-> cover them. What remains is build items 1, 6, 7 and 8: the single `atlas.py`
-> entry point, the state report, the conda bootstrap and dataset registry, and
-> the prebuilt-database download path. Acceptance criteria A2, A3, A4, A6 and
-> A7 already pass; A1, A5 and A8 depend on the remaining items.
+> **Already done on this branch:** defects F1-F8 and P1-P7, and build items 1,
+> 2, 3, 4, 5, 6 and 8 below, plus `datasets.json` from item 7. Covered by
+> `examples/test_fetch.py`, `examples/test_ingest.py` and
+> `examples/test_atlas.py`. Acceptance criteria A1-A7 pass. What remains of
+> item 7 is `environment.yml` and the bootstrap scripts, and A8 (a CI job that
+> runs every command printed in the README).
 
 ---
 

@@ -6,9 +6,10 @@
 > mismatch, the silent empty database, the fixed folder layout, the unchecked
 > column count), and the Windows-only parts of P6. Regression cover lives in
 > `examples/test_fetch.py` and `examples/test_ingest.py`.
-> Still open: F8 and D1-D3, which are the single-entry-point work
-> (`atlas.py`, `environment.yml`, `datasets.json`, the prebuilt-database path)
-> described in [MASTER_PROMPT.md](MASTER_PROMPT.md).
+> Also closed: F8 and D1-D2, by `atlas.py` (setup / get / status / serve),
+> `datasets.json` and `examples/test_atlas.py`. Still open: D3, the conda
+> `environment.yml` and bootstrap scripts, described in
+> [MASTER_PROMPT.md](MASTER_PROMPT.md).
 
 What actually happens when someone follows the README on a clean machine, tested
 end to end rather than read off the page. Every item marked VERIFIED below was
