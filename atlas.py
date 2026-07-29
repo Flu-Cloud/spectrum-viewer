@@ -310,11 +310,9 @@ def identify_db(path):
             pass
 
 
-def fmt_bytes(n):
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024.0
+# One size formatter for the whole project; fetch.py owns it because that is
+# the lowest layer that needs one.
+from fetch import fmt_size as fmt_bytes             # noqa: E402
 
 
 def dir_size(root, cap=400000):
@@ -860,22 +858,66 @@ def build_menu(state):
 
 
 def choose_dataset(names):
+    data = load_datasets()
     print("\nWhich dataset?")
     for i, n in enumerate(names, 1):
-        entry = load_datasets()[n]
-        print(f"  {i}) {n:<14} {entry.get('title', '')}")
+        entry = data[n]
+        print(f"  {i}) {n:<12} {entry.get('title', '')}")
+        if entry.get("note"):
+            print(f"     {entry['note']}")
     pick = prompt(len(names))
-    if pick is None:
+    if pick is None or pick is NO_INPUT:
         return 0
-    return cmd_get(ns(target=names[pick]))
+    name = names[pick]
+    entry = data[name]
+    sample = entry.get("sample", 3)
+
+    # These records run to hundreds of gigabytes. Default to a slice small
+    # enough that trying it out costs megabytes.
+    sizes = [(f"Just a sample: the {sample} smallest files (a few MB)",
+              ns(target=name, fetch_args=["--first", str(sample)]))]
+    if entry.get("filter"):
+        sizes.append((f"The usual slice (--filter {entry['filter']})",
+                      ns(target=name)))
+    sizes.append(("Everything in the record (this may be very large)",
+                  ns(target=name, filter="")))
+    print("\nHow much of it?")
+    for i, (label, _) in enumerate(sizes, 1):
+        print(f"  {i}) {label}" + ("      <- recommended" if i == 1 else ""))
+    how = prompt(len(sizes))
+    if how is None or how is NO_INPUT:
+        return 0
+    return cmd_get(sizes[how][1])
+
+
+# Returned by prompt() when there is nothing to read, as opposed to the user
+# choosing to quit. The two deserve different endings.
+NO_INPUT = object()
+
+
+def interactive():
+    """True only when there is a person who can both see and answer a menu.
+
+    stdin.isatty() alone is not enough: on Windows NUL is a character device,
+    so a run with stdin redirected from NUL reports a terminal and then hits
+    EOF on the first read. Requiring stdout to be a terminal as well means a
+    redirected or captured run takes the non-interactive path, which is the
+    one that prints advice instead of waiting.
+    """
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:                                       # noqa: BLE001
+        return False
 
 
 def prompt(n):
-    """Ask for a number in 1..n. -> zero-based index, or None to quit."""
+    """Ask for a number in 1..n. -> index, None to quit, NO_INPUT at EOF."""
     while True:
         try:
             raw = input(f"\nChoose 1-{n} (or q to quit): ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
+            return NO_INPUT
+        except KeyboardInterrupt:
             print()
             return None
         if raw in ("q", "quit", "exit", ""):
@@ -900,18 +942,24 @@ def cmd_auto(args):
     describe(state)
 
     items = build_menu(state)
-    if not sys.stdin.isatty():
-        # No terminal to ask on (a script, a CI job, a piped run). Say what the
+
+    def advise():
+        # No one to ask (a script, a CI job, a piped run). Say what the
         # recommended command is rather than guessing and doing it.
         print(f"\nRecommended: {items[0][0]}")
         print("Run 'python atlas.py doctor' for the full report, or "
               "'python atlas.py --help' for every command.")
         return 0
 
+    if not interactive():
+        return advise()
+
     print("\nWhat would you like to do?")
     for i, (label, _) in enumerate(items, 1):
         print(f"  {i}) {label}" + ("      <- recommended" if i == 1 else ""))
     pick = prompt(len(items))
+    if pick is NO_INPUT:
+        return advise()             # looked interactive, was not
     if pick is None:
         print("nothing done")
         return 0

@@ -161,8 +161,11 @@ def main():
 
         rc, out = run(["get", "<https://data.nist.gov/od/id/mds2-3177>",
                        "--dry-run"], dbs)
+        # normalise the separator: the folder name is what is being checked,
+        # and Windows spells the same path with backslashes
+        flat = out.replace("\\", "/")
         check("a URL pasted with angle brackets still names the folder cleanly",
-              rc == 0 and "--dest downloads/mds2-3177" in out
+              rc == 0 and "--dest downloads/mds2-3177" in flat
               and ">" not in out,
               next((l.strip() for l in out.splitlines() if "fetch.py" in l), ""))
 
@@ -203,7 +206,8 @@ def main():
                 "import sys, builtins\n"
                 f"sys.path.insert(0, {ROOT!r})\n"
                 "import atlas\n"
-                "sys.stdin = type('T', (), {'isatty': lambda s: True})()\n"
+                # interactive() checks stdout too, which is a pipe here
+                "atlas.interactive = lambda: True\n"
                 "builtins.input = lambda p='': sys.argv[2]\n"
                 "atlas.default_roots = lambda: [sys.argv[1]]\n"
                 "sys.exit(atlas.cmd_auto(atlas.ns()))\n")
@@ -225,6 +229,33 @@ def main():
               next((l.strip() for l in mo.splitlines() if l.strip().startswith("1)")), ""))
         check("quitting the menu does nothing",
               "nothing done" in mo and not os.listdir(dbs8))
+
+        # Windows reports NUL as a terminal, so a redirected run can look
+        # interactive and then hit EOF on the first read. Both layers of the
+        # guard are checked: the menu must be skipped, and if it somehow is
+        # not, EOF must fall back to advice rather than "nothing done".
+        eof_probe = os.path.join(tmp, "eof.py")
+        with open(eof_probe, "w") as f:
+            f.write(
+                "import sys, builtins\n"
+                f"sys.path.insert(0, {ROOT!r})\n"
+                "import atlas\n"
+                "atlas.interactive = lambda: True\n"
+                "def eof(p=''):\n"
+                "    print(p)\n"
+                "    raise EOFError\n"
+                "builtins.input = eof\n"
+                "atlas.default_roots = lambda: []\n"
+                "sys.exit(atlas.cmd_auto(atlas.ns()))\n")
+        p = subprocess.run([sys.executable, eof_probe],
+                           env={**os.environ, **env8}, cwd=ROOT,
+                           capture_output=True, text=True, timeout=300)
+        eo = p.stdout + p.stderr
+        check("a terminal that cannot actually be read falls back to advice",
+              p.returncode == 0 and "Recommended:" in eo
+              and "nothing done" not in eo,
+              next((l.strip() for l in eo.splitlines()
+                    if l.startswith("Recommended")), ""))
 
         p = subprocess.run([sys.executable, menu, data, "1"],
                            env={**os.environ, **env8}, cwd=ROOT,
