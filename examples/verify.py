@@ -52,7 +52,9 @@ if failed:
     sys.exit(1)
 
 # 3. Demo database: build it if the user hasn't yet
-iq_db = os.path.join(ROOT, "iq.duckdb")
+# Same resolution serve.py uses, so redirecting the databases to
+# another drive cannot make this check the wrong file.
+iq_db = os.environ.get("IQ_DB", os.path.join(ROOT, "iq.duckdb"))
 if not os.path.exists(iq_db):
     print("\n  iq.duckdb missing - running examples/make_sample.py ...")
     r = subprocess.run([sys.executable, os.path.join(HERE, "make_sample.py")],
@@ -60,7 +62,8 @@ if not os.path.exists(iq_db):
     if r.returncode != 0:
         print("\nRESULT: FAIL - examples/make_sample.py failed (see above)")
         sys.exit(1)
-check("iq.duckdb exists beside serve.py", os.path.exists(iq_db))
+check(f"{os.path.basename(iq_db)} exists where serve.py looks",
+      os.path.exists(iq_db), iq_db)
 
 # 4. Endpoints, driven in-process (no port, no browser)
 import serve                                             # noqa: E402

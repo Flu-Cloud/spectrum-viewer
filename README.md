@@ -89,7 +89,8 @@ That is the whole install. Everything below is optional.
 | `error: externally-managed-environment` | You skipped the virtual environment in step 2. |
 | `ModuleNotFoundError: No module named 'duckdb'` | The venv isn't active, or step 2's `pip install` didn't run. Re-activate and re-run it. |
 | `Address already in use` / page won't load | Port 8090 is taken. Run on another port: `SEA_PORT=8095 python serve.py` (PowerShell: `$env:SEA_PORT=8095; python serve.py`), then open that port. |
-| Browser shows "No spectrum data found" | Run `python atlas.py status` to see what is built, then `python atlas.py setup`. |
+| Browser shows "No spectrum data found" | Run `python atlas.py doctor`. It reports what is built and what to do next. |
+| Anything else | Run `python atlas.py doctor`. |
 | Server prints "spectrum.duckdb not found" | Expected. That's the optional multi-GB CBRS data; IQ mode still works. |
 
 # For AI agents (Claude Code, Cowork, etc.)
@@ -139,7 +140,38 @@ capture showing the burst / resource-block structure.
 
 # Bring your own dataset
 
-One command covers every case. Point it at what you have:
+**If anything at all is wrong, run this first.** It checks everything and
+fixes what it safely can:
+
+```bash
+python atlas.py doctor           # check environment, deps, disk, databases, data
+python atlas.py doctor --adopt   # also install oddly-named databases
+python atlas.py doctor --deep    # also search your whole machine for data
+```
+
+`doctor` walks seven checks in order: Python version and whether a venv or
+conda environment is active; every dependency with its installed version and
+the exact install command for *your* environment if one is missing; free disk
+space against what the databases need; every database file it can find,
+**identified by the tables inside rather than the filename**, so a
+`spectrum_viewer.db` is recognised for what it holds; source data anywhere on
+the machine; the demo; then a full end-to-end render test. It ends with one
+verdict line and the next command to run.
+
+**Not sure where your data is, or whether it will be recognised?** Look first:
+
+```bash
+python atlas.py scan          # search the usual download spots
+python atlas.py scan --deep   # search your home folder and every drive
+python atlas.py scan D:\some\folder
+```
+
+`scan` changes nothing. It reports what it found, which sensors and dates,
+**and every file it did not recognise**, so data named unexpectedly shows up as
+a warning rather than being silently skipped. It ends by printing the exact
+`get` command to run.
+
+Then one command covers every case. Point it at what you have:
 
 ```bash
 python atlas.py get ~/Downloads/mds2-3177   # data already on your disk
@@ -152,8 +184,9 @@ python atlas.py status                      # what is built, what is next
 It downloads only when the target is not already local, classifies every file
 it finds (IQ captures, CBRS PSD or PFP exports, Summaries CSVs, or prebuilt
 `.duckdb` databases), runs the ingest each one needs, and prints the resulting
-state. Add `--dry-run` to see the plan without changing anything, or
-`--compact` to shrink the databases afterwards. A record that publishes
+state. Add `--dry-run` to see the plan without changing anything, `--ask` to
+confirm the plan before it runs, or `--compact` to shrink the databases
+afterwards. A record that publishes
 finished `.duckdb` files is copied straight into place with no ingest at all.
 
 The rest of this section is what `atlas.py get` runs underneath, for when you
@@ -253,7 +286,7 @@ Three self-contained checks, none of which need a network or a browser:
 python examples/verify.py        # install + the synthetic IQ demo
 python examples/test_fetch.py    # fetch.py against a local fake repository
 python examples/test_ingest.py   # the CBRS path, uncompacted and compacted
-python examples/test_atlas.py    # atlas.py routing a mixed folder
+python examples/test_atlas.py    # atlas.py scan + routing a mixed folder
 ```
 
 # Architecture
