@@ -89,7 +89,8 @@ That is the whole install. Everything below is optional.
 | `error: externally-managed-environment` | You skipped the virtual environment in step 2. |
 | `ModuleNotFoundError: No module named 'duckdb'` | The venv isn't active, or step 2's `pip install` didn't run. Re-activate and re-run it. |
 | `Address already in use` / page won't load | Port 8090 is taken. Run on another port: `SEA_PORT=8095 python serve.py` (PowerShell: `$env:SEA_PORT=8095; python serve.py`), then open that port. |
-| Browser shows "No spectrum data found" | Run `python atlas.py status` to see what is built, then `python atlas.py setup`. |
+| Browser shows "No spectrum data found" | Run `python atlas.py doctor`. It reports what is built and what to do next. |
+| Anything else | Run `python atlas.py doctor`. |
 | Server prints "spectrum.duckdb not found" | Expected. That's the optional multi-GB CBRS data; IQ mode still works. |
 
 # For AI agents (Claude Code, Cowork, etc.)
@@ -138,6 +139,24 @@ capture showing the burst / resource-block structure.
 ![IQ capture spectrogram](docs/iq_capture.jpg)
 
 # Bring your own dataset
+
+**If anything at all is wrong, run this first.** It checks everything and
+fixes what it safely can:
+
+```bash
+python atlas.py doctor           # check environment, deps, disk, databases, data
+python atlas.py doctor --adopt   # also install oddly-named databases
+python atlas.py doctor --deep    # also search your whole machine for data
+```
+
+`doctor` walks seven checks in order: Python version and whether a venv or
+conda environment is active; every dependency with its installed version and
+the exact install command for *your* environment if one is missing; free disk
+space against what the databases need; every database file it can find,
+**identified by the tables inside rather than the filename**, so a
+`spectrum_viewer.db` is recognised for what it holds; source data anywhere on
+the machine; the demo; then a full end-to-end render test. It ends with one
+verdict line and the next command to run.
 
 **Not sure where your data is, or whether it will be recognised?** Look first:
 

@@ -24,6 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 ATLAS = os.path.join(ROOT, "atlas.py")
 sys.path.insert(0, HERE)
+sys.path.insert(0, ROOT)
 
 import test_ingest as TI                                     # noqa: E402
 
@@ -185,6 +186,72 @@ def main():
               rc != 0 and "none has a Summaries header" in out
               and "build_db.py" not in out, "")
 
+        # ---- doctor: one command on a hostile machine ----
+        import duckdb
+        legacy = os.path.join(tmp, "legacyrepo")
+        os.makedirs(legacy)
+        # a real PSD database under a name nothing would match on
+        lp = os.path.join(legacy, "spectrum_viewer.db")
+        con = duckdb.connect(lp)
+        con.execute("CREATE TABLE psd (sensor VARCHAR, t DOUBLE, spec BLOB)")
+        con.executemany("INSERT INTO psd VALUES (?,?,?)",
+                        [("LEGACY", 1.7e9 + i * 240, bytes(2250)) for i in range(8)])
+        con.execute("""CREATE TABLE psd_meta (sensor VARCHAR, f0 DOUBLE, df DOUBLE,
+            nf INT, qmin DOUBLE, qmax DOUBLE, t_min DOUBLE, t_max DOUBLE,
+            captures BIGINT)""")
+        con.execute("INSERT INTO psd_meta VALUES ('LEGACY',3530040000.0,80000.0,"
+                    "2250,-180.0,-90.0,1.7e9,1700001920.0,8)")
+        con.close()
+        with open(os.path.join(legacy, "notes.db"), "w") as f:
+            f.write("not a database")
+
+        import atlas                                        # noqa: E402
+        name, label, rows = atlas.identify_db(lp)
+        check("a database is identified by its tables, not its filename",
+              (name, rows) == ("psd", 8), f"{name} / {label} / {rows} rows")
+        name2, why, _ = atlas.identify_db(os.path.join(legacy, "notes.db"))
+        check("a file that only looks like a database is rejected with a reason",
+              name2 is None and "not readable" in why, why[:50])
+
+        dbs6 = os.path.join(tmp, "dbs6")
+        os.makedirs(dbs6)
+        shutil.copy2(lp, os.path.join(dbs6, "spectrum_viewer.db"))
+        shutil.copy2(os.path.join(legacy, "notes.db"),
+                     os.path.join(dbs6, "notes.db"))
+
+        rc, out = run(["doctor", data], dbs6)
+        check("doctor spots an oddly-named database and says what it holds",
+              "spectrum_viewer.db holds psd data" in out
+              and "re-run with --adopt" in out,
+              next((l.strip() for l in out.splitlines() if "holds psd" in l), ""))
+        check("doctor ignores a file that only looks like a database",
+              "notes.db ignored" in out)
+        check("an unadopted database is left where it was",
+              not os.path.exists(os.path.join(dbs6, "psd.duckdb")))
+
+        rc2, out2 = run(["doctor", "--adopt", data], dbs6)
+        check("doctor --adopt installs it where serve.py looks",
+              "adopted spectrum_viewer.db as psd.duckdb" in out2
+              and os.path.exists(os.path.join(dbs6, "psd.duckdb")))
+        real, _lbl, nrows = atlas.identify_db(os.path.join(dbs6, "psd.duckdb"))
+        check("the adopted database really is the PSD data",
+              (real, nrows) == ("psd", 8), f"{real} / {nrows} rows")
+        check("doctor checks environment, deps, disk, databases and data",
+              rc == 0 and "1. Python and environment" in out
+              and "2. Dependencies" in out and "3. Disk space" in out
+              and "4. Databases" in out and "5. Spectrum data" in out
+              and "7. End-to-end verification" in out)
+        check("doctor builds the demo and verifies it end to end",
+              "RESULT: PASS" in out and "VERDICT: working" in out)
+        check("doctor finds source data and prints the command to load it",
+              f'python atlas.py get "{data}"' in out)
+        check("doctor reports the free space it checked",
+              "free" in out and "Disk space" in out)
+
+        rc, out = run(["doctor", "--dry-run"], dbs6)
+        check("doctor --dry-run changes nothing",
+              rc == 0 and "nothing will change" in out)
+
         # ---- scan: find data without being told where it is ----
         before_scan = sorted(os.listdir(dbs))
         junkdir = os.path.join(tmp, "scanjunk")
@@ -256,13 +323,27 @@ def main():
               and "Nothing was ingested" in out,
               next((l.strip() for l in out.splitlines() if "ERR " in l), ""))
 
-        # a stray database name must not be mistaken for a prebuilt one
+        # a renamed ATLAS database IS recognised, by its tables
         stray = os.path.join(tmp, "stray")
         os.makedirs(stray)
         shutil.copy2(os.path.join(dbs, "psd.duckdb"),
                      os.path.join(stray, "my_capture.duckdb"))
-        rc, out = run(["get", stray], dbs)
-        check("an unrecognised .duckdb name is not installed blindly",
+        dbs7 = os.path.join(tmp, "dbs7")
+        os.makedirs(dbs7)
+        rc, out = run(["get", stray], dbs7)
+        check("a renamed ATLAS database is recognised by its tables",
+              rc == 0 and "no ingest needed" in out
+              and os.path.exists(os.path.join(dbs7, "psd.duckdb")))
+
+        # a database that is not ours must NOT be installed
+        import duckdb as _dd
+        foreign = os.path.join(tmp, "foreign")
+        os.makedirs(foreign)
+        fc = _dd.connect(os.path.join(foreign, "psd.duckdb"))
+        fc.execute("CREATE TABLE customers (id INT, name VARCHAR)")
+        fc.close()
+        rc, out = run(["get", foreign], dbs7)
+        check("a foreign database is refused even when named like ours",
               rc != 0 and "Nothing recognisable" in out)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -80,9 +80,11 @@ def main():
     meta_path = write_sigmf(synth())
     print(f"  wrote {meta_path}")
     print("Running the ingest pipeline (ingest/iq_ingest.py) -> iq.duckdb ...")
-    # IQ_DB defaults beside serve.py (repo root); force it explicitly so the
-    # demo always lands where the server looks.
-    env = {**os.environ, "IQ_DB": os.path.join(ROOT, "iq.duckdb")}
+    # Honour IQ_DB if the caller set it (a bigger drive, a test run) and only
+    # default to beside serve.py. Forcing it here made this disagree with
+    # serve.py whenever the databases were redirected elsewhere.
+    env = {**os.environ,
+           "IQ_DB": os.environ.get("IQ_DB", os.path.join(ROOT, "iq.duckdb"))}
     r = subprocess.run([sys.executable, os.path.join(INGEST, "iq_ingest.py"),
                         SAMPLE_DIR, "--dataset", "demo"], env=env, cwd=ROOT)
     if r.returncode != 0:
