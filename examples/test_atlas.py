@@ -186,6 +186,55 @@ def main():
               rc != 0 and "none has a Summaries header" in out
               and "build_db.py" not in out, "")
 
+        # ---- the no-argument path ----
+        dbs8 = os.path.join(tmp, "dbs8")
+        os.makedirs(dbs8)
+        rc, out = run([], dbs8)
+        check("bare 'python atlas.py' reports the situation without being asked",
+              rc == 0 and "checking this machine" in out
+              and "nothing built yet" in out and "disk" in out)
+        check("with no terminal it recommends rather than guessing",
+              "Recommended:" in out and "Choose 1" not in out)
+        check("a no-terminal run changes nothing", not os.listdir(dbs8))
+
+        menu = os.path.join(tmp, "menu.py")
+        with open(menu, "w") as f:
+            f.write(
+                "import sys, builtins\n"
+                f"sys.path.insert(0, {ROOT!r})\n"
+                "import atlas\n"
+                "sys.stdin = type('T', (), {'isatty': lambda s: True})()\n"
+                "builtins.input = lambda p='': sys.argv[2]\n"
+                "atlas.default_roots = lambda: [sys.argv[1]]\n"
+                "sys.exit(atlas.cmd_auto(atlas.ns()))\n")
+
+        env8 = {"SPECTRUM_DB": os.path.join(dbs8, "spectrum.duckdb"),
+                "PSD_DB": os.path.join(dbs8, "psd.duckdb"),
+                "PFP_DB": os.path.join(dbs8, "pfp.duckdb"),
+                "IQ_DB": os.path.join(dbs8, "iq.duckdb"),
+                "ATLAS_DB_DIR": dbs8}
+        p = subprocess.run([sys.executable, menu, data, "q"],
+                           env={**os.environ, **env8}, cwd=ROOT,
+                           capture_output=True, text=True, timeout=900)
+        mo = p.stdout + p.stderr
+        check("with a terminal it offers a numbered menu",
+              "What would you like to do?" in mo and "1)" in mo
+              and "<- recommended" in mo)
+        check("the recommendation is to load the data it found",
+              "1) Load the data in" in mo,
+              next((l.strip() for l in mo.splitlines() if l.strip().startswith("1)")), ""))
+        check("quitting the menu does nothing",
+              "nothing done" in mo and not os.listdir(dbs8))
+
+        p = subprocess.run([sys.executable, menu, data, "1"],
+                           env={**os.environ, **env8}, cwd=ROOT,
+                           capture_output=True, text=True, timeout=900)
+        built8 = sorted(f for f in os.listdir(dbs8) if f.endswith(".duckdb"))
+        check("choosing 1 runs the whole ingest",
+              p.returncode == 0 and built8 == ["iq.duckdb", "pfp.duckdb",
+                                               "psd.duckdb", "spectrum.duckdb"],
+              str(built8))
+
         # ---- doctor: one command on a hostile machine ----
         import duckdb
         legacy = os.path.join(tmp, "legacyrepo")
