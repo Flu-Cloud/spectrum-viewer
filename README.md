@@ -139,7 +139,20 @@ capture showing the burst / resource-block structure.
 
 # Bring your own dataset
 
-One command covers every case. Point it at what you have:
+**Not sure where your data is, or whether it will be recognised?** Look first:
+
+```bash
+python atlas.py scan          # search the usual download spots
+python atlas.py scan --deep   # search your home folder and every drive
+python atlas.py scan D:\some\folder
+```
+
+`scan` changes nothing. It reports what it found, which sensors and dates,
+**and every file it did not recognise**, so data named unexpectedly shows up as
+a warning rather than being silently skipped. It ends by printing the exact
+`get` command to run.
+
+Then one command covers every case. Point it at what you have:
 
 ```bash
 python atlas.py get ~/Downloads/mds2-3177   # data already on your disk
@@ -152,8 +165,9 @@ python atlas.py status                      # what is built, what is next
 It downloads only when the target is not already local, classifies every file
 it finds (IQ captures, CBRS PSD or PFP exports, Summaries CSVs, or prebuilt
 `.duckdb` databases), runs the ingest each one needs, and prints the resulting
-state. Add `--dry-run` to see the plan without changing anything, or
-`--compact` to shrink the databases afterwards. A record that publishes
+state. Add `--dry-run` to see the plan without changing anything, `--ask` to
+confirm the plan before it runs, or `--compact` to shrink the databases
+afterwards. A record that publishes
 finished `.duckdb` files is copied straight into place with no ingest at all.
 
 The rest of this section is what `atlas.py get` runs underneath, for when you
@@ -253,7 +267,7 @@ Three self-contained checks, none of which need a network or a browser:
 python examples/verify.py        # install + the synthetic IQ demo
 python examples/test_fetch.py    # fetch.py against a local fake repository
 python examples/test_ingest.py   # the CBRS path, uncompacted and compacted
-python examples/test_atlas.py    # atlas.py routing a mixed folder
+python examples/test_atlas.py    # atlas.py scan + routing a mixed folder
 ```
 
 # Architecture

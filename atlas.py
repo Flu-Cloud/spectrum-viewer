@@ -43,6 +43,18 @@ sys.path.insert(0, ING)
 DATASETS = os.path.join(HERE, "datasets.json")
 DBS = ("spectrum", "psd", "pfp", "iq")
 IQ_EXT = (".sigmf-meta", ".tdms", ".npy")
+# Files that belong to a capture but are not the thing you point an
+# ingest at. Counting these as "unrecognised" would be misleading.
+COMPANION_EXT = (".sigmf-data", ".sha256")
+
+# Directories a search never needs to descend into. Skipping these is the
+# difference between scanning a home folder in seconds and in hours.
+SKIP_DIRS = {
+    "__pycache__", "node_modules", "site-packages", "venv", "env",
+    "AppData", "Library", "Windows", "Program Files", "Program Files (x86)",
+    "ProgramData", "$Recycle.Bin", "System Volume Information", "OneDriveTemp",
+    "Application Data", "Local Settings", "Recovery", "PerfLogs", "tmp",
+}
 
 # Which table proves a database actually holds data, per schema.
 SCHEMAS = {
@@ -109,15 +121,75 @@ def looks_like_summaries(path):
     return "sensor_name" in head and "channel_frequency_mhz" in head
 
 
+_NAME_RES = None
+
+
+def name_res():
+    """(psd, pfp) filename patterns, loaded from the ingest scripts themselves
+    so there is exactly one definition of what a CBRS export is called."""
+    global _NAME_RES
+    if _NAME_RES is None:
+        import psd_ingest
+        import pfp_ingest
+        _NAME_RES = (psd_ingest.NAME_RE, pfp_ingest.NAME_RE)
+    return _NAME_RES
+
+
+def kind_of(dirpath, name):
+    """What one file is: 'iq' | 'duckdb' | 'pfp' | 'psd' | 'summaries' | None.
+
+    Everything is decided by extension, by filename shape, or by a CSV's own
+    header. Nothing here depends on the folder a file happens to sit in.
+    """
+    psd_re, pfp_re = name_res()
+    low = name.lower()
+    if low.endswith(IQ_EXT):
+        return "iq"
+    if low.endswith(".duckdb"):
+        return "duckdb"
+    if pfp_re.match(name):
+        return "pfp"
+    if psd_re.match(name):
+        return "psd"
+    if low.endswith(".csv"):
+        return "summaries" if looks_like_summaries(
+            os.path.join(dirpath, name)) else None
+    return None
+
+
+def walk_limited(root, max_files=200000, max_depth=12):
+    """Yield (dirpath, name) under root, skipping system and toolchain noise.
+
+    Sets truncated[0] when the file budget runs out, so a search over a whole
+    drive says so instead of quietly reporting a partial answer.
+    """
+    root = os.path.abspath(root)
+    base = root.rstrip(os.sep).count(os.sep)
+    truncated = [False]
+    n = 0
+
+    def gen():
+        nonlocal n
+        for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+            if dirpath.count(os.sep) - base >= max_depth:
+                dirnames[:] = []
+            dirnames[:] = [d for d in dirnames
+                           if d not in SKIP_DIRS and not d.startswith(".")]
+            for name in filenames:
+                yield dirpath, name
+                n += 1
+                if n >= max_files:
+                    truncated[0] = True
+                    return
+    return gen(), truncated
+
+
 def classify(root):
     """Walk root -> what kinds of data are in it, and where.
 
     Returns a dict of kind -> sorted list of directories (or files) to hand to
     the matching ingest script.
     """
-    import psd_ingest
-    import pfp_ingest
-
     out = {"iq": set(), "psd": set(), "pfp": set(), "csv": set(),
            "duckdb": [], "other": []}
     # A single file means that file, not everything sitting beside it. The CBRS
@@ -129,19 +201,19 @@ def classify(root):
     else:
         names = [(dp, n) for dp, _, ns in os.walk(root) for n in ns]
     for dirpath, n in names:
-        low = n.lower()
-        if low.endswith(IQ_EXT):
+        kind = kind_of(dirpath, n)
+        if kind == "iq":
             out["iq"].add(os.path.join(dirpath, n) if one else root)
-        elif low.endswith(".duckdb"):
+        elif kind == "duckdb":
             out["duckdb"].append(os.path.join(dirpath, n))
-        elif pfp_ingest.NAME_RE.match(n):
+        elif kind == "pfp":
             out["pfp"].add(dirpath if one else root)
-        elif psd_ingest.NAME_RE.match(n):
+        elif kind == "psd":
             out["psd"].add(dirpath if one else root)
-        elif low.endswith(".csv"):
-            full = os.path.join(dirpath, n)
-            (out["csv"].add(dirpath) if looks_like_summaries(full)
-             else out["other"].append(full))
+        elif kind == "summaries":
+            out["csv"].add(dirpath)
+        elif n.lower().endswith(".csv"):
+            out["other"].append(os.path.join(dirpath, n))
     out["duckdb"].sort()
     return out
 
@@ -179,6 +251,155 @@ def plan_for(root, found, compact):
     if compact and any(k for k in ("psd", "pfp") if found[k]):
         steps.append(("compact the CBRS databases", script("compact_db.py")))
     return steps, prebuilt
+
+
+# ---- searching for data you already have ------------------------------
+
+def default_roots():
+    """Where a spectrum download plausibly landed on someone's machine."""
+    home = os.path.expanduser("~")
+    cand = [os.environ.get("SEA_DATA_ROOT"),
+            os.path.join(HERE, "SEA-DATA"), os.path.join(HERE, "iqdata"),
+            os.path.join(HERE, "downloads"), os.path.join(HERE, "data"),
+            os.path.join(home, "Downloads"), os.path.join(home, "Desktop"),
+            os.path.join(home, "Documents")]
+    out = []
+    for p in cand:
+        if p and os.path.isdir(p) and os.path.abspath(p) not in out:
+            out.append(os.path.abspath(p))
+    return out
+
+
+def deep_roots():
+    """Everything in default_roots, plus the whole home folder and, on
+    Windows, every other fixed drive. Slow on purpose."""
+    out = list(default_roots())
+    home = os.path.abspath(os.path.expanduser("~"))
+    if home not in out:
+        out.append(home)
+    if os.name == "nt":
+        import string
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if letter != "C" and os.path.isdir(drive):
+                out.append(drive)
+    return out
+
+
+def survey(root, max_files):
+    """Inventory one directory: what is recognised, and what is not."""
+    import collections
+    found = {"iq": 0, "psd": 0, "pfp": 0, "summaries": 0, "duckdb": []}
+    sensors, days, unknown = set(), set(), collections.Counter()
+    psd_re, pfp_re = name_res()
+    files = 0
+    gen, truncated = walk_limited(root, max_files=max_files)
+    for dirpath, name in gen:
+        files += 1
+        kind = kind_of(dirpath, name)
+        if kind == "duckdb":
+            found["duckdb"].append(os.path.join(dirpath, name))
+        elif kind in ("psd", "pfp"):
+            found[kind] += 1
+            m = (psd_re if kind == "psd" else pfp_re).match(name)
+            sensors.add(m.group("sensor"))
+            days.add(m.group("day"))
+        elif kind:
+            found[kind] += 1
+        elif not name.lower().endswith(COMPANION_EXT):
+            unknown[os.path.splitext(name)[1].lower() or "(no extension)"] += 1
+    return {"root": root, "found": found, "sensors": sorted(sensors),
+            "days": sorted(days), "unknown": unknown, "files": files,
+            "truncated": truncated[0]}
+
+
+def report(s):
+    """Print one directory's inventory. Returns True if anything was usable."""
+    f, any_hit = s["found"], False
+    print(f"\n  {s['root']}")
+    if f["iq"]:
+        print(f"      {f['iq']:>7} IQ capture file(s)")
+        any_hit = True
+    for kind, label in (("psd", "CBRS PSD export(s)"),
+                        ("pfp", "CBRS PFP export(s)")):
+        if f[kind]:
+            span = (f"{s['days'][0]} .. {s['days'][-1]}" if s["days"] else "")
+            print(f"      {f[kind]:>7} {label:<22} "
+                  f"{len(s['sensors'])} sensor(s)  {span}")
+            any_hit = True
+    if f["summaries"]:
+        print(f"      {f['summaries']:>7} CBRS Summaries CSV(s)")
+        any_hit = True
+    for p in f["duckdb"]:
+        stem = os.path.basename(p)[:-len(".duckdb")].rstrip("_c")
+        mark = "prebuilt database" if stem in DBS else "database (not one of ours)"
+        print(f"      {'':>7} {mark}: {os.path.basename(p)}")
+        any_hit = any_hit or stem in DBS
+    if s["sensors"]:
+        print(f"      sensors: {', '.join(s['sensors'])}")
+    unknown = sum(s["unknown"].values())
+    if unknown:
+        top = ", ".join(f"{ext} {n}" for ext, n in s["unknown"].most_common(6))
+        print(f"      {unknown:>7} file(s) not recognised  ({top})")
+    if not any_hit and not unknown:
+        print("           nothing here")
+    if s["truncated"]:
+        print("      NOTE: hit the file limit; re-run with a bigger --max-files "
+              "or point --root at a narrower folder")
+    return any_hit
+
+
+def cmd_scan(args):
+    """Find spectrum data anywhere on this machine and say what it is."""
+    roots = args.roots or (deep_roots() if args.deep else default_roots())
+    if not roots:
+        print("No obvious place to look. Pass a folder: "
+              "python atlas.py scan C:\\path\\to\\data", file=sys.stderr)
+        return 1
+    print(f"searching {len(roots)} place(s), up to {args.max_files:,} files each."
+          + ("" if args.deep else "  Add --deep to search wider, or name a "
+                                  "folder to search exactly that."))
+    missing = [r for r in roots if not os.path.isdir(r)]
+    roots = [r for r in roots if os.path.isdir(r)]
+    for r in roots:
+        print(f"  - {r}")
+    for r in missing:
+        print(f"  - {r}   (does not exist, skipped)")
+    if not roots:
+        print("\nNone of those folders exist.", file=sys.stderr)
+        return 1
+
+    hits, empty, csv_missed = [], [], 0
+    for r in roots:
+        s = survey(r, args.max_files)
+        if report(s):
+            hits.append(s)
+        else:
+            empty.append(r)
+        csv_missed += s["unknown"].get(".csv", 0)
+
+    print()
+    if csv_missed:
+        # The most likely way this misses real data: exports named differently.
+        print(f"{csv_missed} .csv file(s) were found but not recognised. CBRS "
+              "exports are matched by name:")
+        print("    PSD        <YYYY-MM-DD>_<sensor>_<stat>.csv")
+        print("    PFP        PFP_<YYYY-MM-DD>_<sensor>_<stat>.csv")
+        print("    Summaries  any .csv whose header has sensor_name and "
+              "channel_frequency_mhz")
+        print("  If yours look different, rename them to match or say so and "
+              "the pattern can be widened.\n")
+    if not hits:
+        print("Found nothing to ingest. Either the data is somewhere not "
+              "searched (pass the folder directly, or use --deep), or it is "
+              "named differently than the patterns above.")
+        return 1
+    print("To ingest what was found, run:")
+    for s in hits:
+        print(f'    python atlas.py get "{s["root"]}"')
+    if empty:
+        print(f"\n(nothing in: {', '.join(empty)})")
+    return 0
 
 
 # ---- subcommands ------------------------------------------------------
@@ -224,7 +445,8 @@ def cmd_status(args):
     if not present:
         print("Nothing is built yet. Start with:\n"
               "    python atlas.py setup            # zero-download demo\n"
-              "    python atlas.py get <folder>     # data you already have\n"
+              "    python atlas.py scan             # find data already on this machine\n"
+              "    python atlas.py get <folder>     # ingest a folder you have\n"
               "    python atlas.py get mds2-3177    # data from NIST PDR")
     else:
         print("Ready. Start the viewer with:\n    python atlas.py serve")
@@ -325,6 +547,20 @@ def cmd_get(args):
               f"(no ingest needed)")
     for label, _ in steps:
         print(f"  - {label}")
+    if found["other"]:
+        # Always say what was passed over, so data named unexpectedly cannot be
+        # skipped without the user seeing it.
+        print(f"  ({len(found['other'])} CSV file(s) ignored, no Summaries "
+              f"header; e.g. {short(found['other'][0])})")
+
+    if args.ask and not args.dry_run:
+        try:
+            if input("\nproceed? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("nothing done")
+                return 0
+        except EOFError:
+            print("\nno terminal to ask on; re-run without --ask")
+            return 1
 
     for src, dst in prebuilt:
         if args.dry_run:
@@ -364,6 +600,15 @@ def main():
     p = sub.add_parser("status", help="what is built, and what to run next")
     p.set_defaults(fn=cmd_status)
 
+    p = sub.add_parser("scan", help="search this machine for spectrum data")
+    p.add_argument("roots", nargs="*", default=None,
+                   help="folders to search (default: the usual download spots)")
+    p.add_argument("--deep", action="store_true",
+                   help="also search your home folder and every other drive")
+    p.add_argument("--max-files", type=int, default=200000,
+                   help="file budget per folder (default 200000)")
+    p.set_defaults(fn=cmd_scan)
+
     p = sub.add_parser("serve", help="start the viewer")
     p.set_defaults(fn=cmd_serve)
 
@@ -375,6 +620,8 @@ def main():
                    help="only files whose path contains this substring")
     p.add_argument("--compact", action="store_true",
                    help="also run compact_db.py when CBRS data was ingested")
+    p.add_argument("--ask", action="store_true",
+                   help="show the plan and wait for confirmation before running")
     p.epilog = ("any other flag is passed straight to ingest/fetch.py, "
                 "e.g. --nist-only, --allow-host HOST, --allow-http")
     p.set_defaults(fn=cmd_get)

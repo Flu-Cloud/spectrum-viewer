@@ -60,8 +60,10 @@ def run(args, dbs, extra=None):
            "PFP_DB": os.path.join(dbs, "pfp.duckdb"),
            "IQ_DB": os.path.join(dbs, "iq.duckdb"),
            "ATLAS_DB_DIR": dbs, **(extra or {})}
+    # stdin closed: --ask must not be able to block a non-interactive run
     p = subprocess.run([sys.executable, ATLAS] + args, env=env, cwd=ROOT,
-                       capture_output=True, text=True, timeout=900)
+                       stdin=subprocess.DEVNULL, capture_output=True,
+                       text=True, timeout=900)
     return p.returncode, p.stdout + p.stderr
 
 
@@ -163,6 +165,12 @@ def main():
               and ">" not in out,
               next((l.strip() for l in out.splitlines() if "fetch.py" in l), ""))
 
+        dbs5 = os.path.join(tmp, "dbs5")
+        os.makedirs(dbs5)
+        rc, out = run(["get", data, "--ask"], dbs5)
+        check("--ask with no terminal refuses rather than running blind",
+              rc != 0 and "no terminal" in out and not os.listdir(dbs5))
+
         rc, out = run(["status", "--not-a-flag"], dbs)
         check("a typo on another subcommand is still an error",
               rc != 0 and "unrecognized arguments" in out)
@@ -176,6 +184,43 @@ def main():
         check("a non-Summaries CSV is reported, not handed to build_db",
               rc != 0 and "none has a Summaries header" in out
               and "build_db.py" not in out, "")
+
+        # ---- scan: find data without being told where it is ----
+        before_scan = sorted(os.listdir(dbs))
+        junkdir = os.path.join(tmp, "scanjunk")
+        os.makedirs(junkdir)
+        with open(os.path.join(junkdir, "notes.txt"), "w") as f:
+            f.write("hi")
+        # a CBRS export named the wrong way round: the realistic miss case
+        with open(os.path.join(junkdir, "SENSOR_2024-01-01_max.csv"), "w") as f:
+            f.write("a,b\n1,2\n")
+
+        rc, out = run(["scan", data, junkdir], dbs)
+        check("scan finds data buried in a folder layout it was never told",
+              rc == 0 and "CBRS PSD export(s)" in out
+              and "CBRS PFP export(s)" in out and "IQ capture file(s)" in out,
+              next((l.strip() for l in out.splitlines() if "PSD export" in l), ""))
+        check("scan names the sensors it found",
+              TI.SENSOR in out, TI.SENSOR)
+        check("scan reports files it did not recognise",
+              "not recognised" in out and ".txt" in out)
+        check("scan warns loudly about unmatched CSVs and shows the patterns",
+              "were found but not recognised" in out
+              and "<YYYY-MM-DD>_<sensor>_<stat>.csv" in out)
+        check("scan ends with the exact command to run",
+              f'python atlas.py get "{data}"' in out)
+        check("scan does not count a .sigmf-data companion as unrecognised",
+              ".sigmf-data" not in out)
+
+        rc, out = run(["scan", os.path.join(tmp, "does-not-exist")], dbs)
+        check("scan says when a folder does not exist",
+              rc != 0 and "does not exist" in out)
+
+        rc, out = run(["scan", junkdir], dbs)
+        check("scan exits non-zero when it finds nothing usable",
+              rc != 0 and "Found nothing to ingest" in out)
+
+        check("scan changed nothing", sorted(os.listdir(dbs)) == before_scan)
 
         # a single FILE means that file, not everything sitting beside it
         pair = os.path.join(tmp, "pair")
