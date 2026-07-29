@@ -50,11 +50,12 @@ pip install -r requirements.txt
 **3. Build the demo data and check the install**
 
 ```bash
-python atlas.py setup
+python atlas.py
 ```
 
-This builds a small synthetic capture (`iq.duckdb`, ~2 MB, created next to
-`serve.py`) and tests every part of the app. It must end with:
+With nothing built yet it offers to build a small synthetic capture
+(`iq.duckdb`, ~2 MB, next to `serve.py`) and start the viewer. Pick that, and
+the check it runs must end with:
 
 ```
 RESULT: PASS
@@ -100,7 +101,8 @@ Paste this to have an agent entirely install the project:
 ```text
 Clone https://github.com/jimmylu7/ATLAS.git and install it.
 Create a virtual environment, install requirements.txt into it, then run
-`python atlas.py setup` and show me the output. Do not modify any
+`python atlas.py setup` and show me the output. (Use `setup`, not a bare
+`python atlas.py`, which is interactive and will wait for a choice.) Do not modify any
 repository files. The install is correct only if that command prints
 "RESULT: PASS"; if it prints FAIL, report the failing check verbatim and stop.
 Finally, start `python atlas.py serve` and confirm http://127.0.0.1:8090
@@ -140,154 +142,82 @@ capture showing the burst / resource-block structure.
 
 # Bring your own dataset
 
-**If anything at all is wrong, run this first.** It checks everything and
-fixes what it safely can:
-
 ```bash
-python atlas.py doctor           # check environment, deps, disk, databases, data
-python atlas.py doctor --adopt   # also install oddly-named databases
-python atlas.py doctor --deep    # also search your whole machine for data
+python atlas.py
 ```
 
-`doctor` walks seven checks in order: Python version and whether a venv or
-conda environment is active; every dependency with its installed version and
-the exact install command for *your* environment if one is missing; free disk
-space against what the databases need; every database file it can find,
-**identified by the tables inside rather than the filename**, so a
-`spectrum_viewer.db` is recognised for what it holds; source data anywhere on
-the machine; the demo; then a full end-to-end render test. It ends with one
-verdict line and the next command to run.
+That is the whole thing. With no arguments it checks the machine, works out
+which situation you are in, and offers the fix as a numbered choice:
 
-**Not sure where your data is, or whether it will be recognised?** Look first:
+```
+ATLAS
+checking this machine ...
 
-```bash
-python atlas.py scan          # search the usual download spots
-python atlas.py scan --deep   # search your home folder and every drive
-python atlas.py scan D:\some\folder
+  ready    nothing built yet
+  found    730 psd, 730 pfp, 12 summaries in C:\Users\you\Downloads  (2.1 GB)
+  disk     104.7 GB free
+
+What would you like to do?
+  1) Load the data in C:\Users\you\Downloads (2.1 GB)      <- recommended
+  2) Build the demo and start the viewer
+  3) Download a dataset from NIST (lte-uplink, cbrs-sea)
+  4) Search this whole machine for data
+  5) Check everything (environment, disk, databases)
 ```
 
-`scan` changes nothing. It reports what it found, which sensors and dates,
-**and every file it did not recognise**, so data named unexpectedly shows up as
-a warning rather than being silently skipped. It ends by printing the exact
-`get` command to run.
+It searches the usual download folders for you, identifies databases by the
+tables inside rather than the filename (so a `spectrum_viewer.db` is recognised
+for what it holds), and warns when free space is short. With no terminal
+attached it prints the recommendation instead of guessing.
 
-Then one command covers every case. Point it at what you have:
+If you already know what you want, every choice above is also a direct command:
+
+| Command | What it does |
+|---|---|
+| `python atlas.py` | the menu above |
+| `python atlas.py doctor` | full report: environment, dependencies, disk, databases, data |
+| `python atlas.py scan` | find spectrum data on this machine, change nothing |
+| `python atlas.py get <thing>` | a folder, a file, a dataset name, a record id, a DOI, or any URL |
+| `python atlas.py status` | what is built |
+| `python atlas.py serve` | start the viewer |
+
+`get` accepts anything: a local folder or file, a friendly name from
+`datasets.json`, a NIST PDR record id or `ark:`, a DOI or landing URL, or a
+direct file URL to any https host. It downloads only when the target is not
+already local, classifies every file it finds, and runs the ingest each one
+needs. Add `--dry-run` to see the plan, `--ask` to confirm it first, or
+`--compact` to shrink the databases afterwards.
+
+<details>
+<summary>Driving the ingest scripts directly</summary>
+
+`atlas.py` runs these for you; they also work standalone.
+
+| Script | Builds | Notes |
+|--------|--------|-------|
+| `ingest/fetch.py` | (downloads) | a record from NIST or anywhere else. `--list` summarises by folder, `--tree` shows structure, `--filter` narrows |
+| `ingest/build_db.py` | `spectrum.duckdb` | summaries + pyramid levels |
+| `ingest/psd_ingest.py` | `psd.duckdb` | PSD `max`. `--list` shows what is on disk |
+| `ingest/pfp_ingest.py` | `pfp.duckdb` | PFP `max_peak` |
+| `ingest/iq_ingest.py` | `iq.duckdb` | STFT pyramid (SigMF/TDMS/npy) |
+| `ingest/compact_db.py` | smaller files | optional; the server reads either schema |
+
+Each ingest finds its own source files by name, searched recursively, so the
+download layout does not have to match anything. `--root` defaults to
+`$SEA_DATA_ROOT`, else `./SEA-DATA`. A NIST record id, `ark:`, DOI, landing
+URL or direct file URL all work as a `fetch.py` source; non-NIST hosts are
+allowed with a warning (`--nist-only` to refuse, `--allow-host` to permit one).
 
 ```bash
-python atlas.py get ~/Downloads/mds2-3177   # data already on your disk
-python atlas.py get lte-uplink              # a name from datasets.json
-python atlas.py get mds2-3177               # a NIST PDR record id
-python atlas.py get https://doi.org/10.18434/mds2-3177    # a DOI or URL
-python atlas.py status                      # what is built, what is next
-```
-
-It downloads only when the target is not already local, classifies every file
-it finds (IQ captures, CBRS PSD or PFP exports, Summaries CSVs, or prebuilt
-`.duckdb` databases), runs the ingest each one needs, and prints the resulting
-state. Add `--dry-run` to see the plan without changing anything, `--ask` to
-confirm the plan before it runs, or `--compact` to shrink the databases
-afterwards. A record that publishes
-finished `.duckdb` files is copied straight into place with no ingest at all.
-
-The rest of this section is what `atlas.py get` runs underneath, for when you
-want to drive it yourself.
-
-`ingest/fetch.py` downloads a dataset; then the matching ingest script builds
-the database. Each ingest script finds its own source files by name, searched
-recursively, so the folder layout the download produced does not have to match
-anything.
-
-A dataset's DOI landing page is a JavaScript app, but every NIST Public Data
-Repository record has a JSON manifest at `data.nist.gov/rmm/records/<id>`
-listing each file's path, size and download URL. `fetch.py` accepts the record
-id, an `ark:` id, the landing/DOI URL, or a direct file URL to any https host.
-`--list` summarises a record by folder, `--tree` shows its structure, `--long`
-prints every file, and `--filter` narrows what gets downloaded (all flags:
-`python ingest/fetch.py --help`). Downloads are resumable and retry transient
-network errors: press `Ctrl+C` and re-run to continue.
-
-**IQ example**, a small slice of FDD-LTE record
-[mds2-3177](https://data.nist.gov/od/id/mds2-3177), end to end:
-
-```bash
-python ingest/fetch.py mds2-3177 --list                    # 902 files, ~189 GB total
-python ingest/fetch.py mds2-3177 --filter 1.4MHz/config_0 --dest iqdata/mds2-3177   # one 37 MB capture
+python ingest/fetch.py mds2-3177 --list
+python ingest/fetch.py mds2-3177 --filter 1.4MHz/config_0 --dest iqdata/mds2-3177
 python ingest/iq_ingest.py iqdata/mds2-3177 --dataset mds2-3177
-python serve.py                                            # Source dropdown -> the new capture
-```
-
-**CBRS SEA example**: the [SEA data portal](https://pages.nist.gov/SEA-DATA/)
-designates PDR record [mds2-4214](https://data.nist.gov/od/id/mds2-4214) (not
-yet published as of July 2026). The day the record goes live:
-
-```bash
-python ingest/fetch.py mds2-4214 --filter CBBT-Directional --dest SEA-DATA
-python ingest/psd_ingest.py --root SEA-DATA --list     # what landed on disk
-python ingest/psd_ingest.py CBBT-Directional --root SEA-DATA
-python ingest/pfp_ingest.py CBBT-Directional --root SEA-DATA
-python serve.py
-```
-
-`--root` defaults to `$SEA_DATA_ROOT`, else `./SEA-DATA`. Nothing else has to
-be built first: the PSD and PFP layers read their CSVs directly.
-
-Summaries CSVs for `build_db.py` go flat into `ingest/csv/`: add
-`--dest ingest/csv --flat`.
-
-If you already have the data on disk, skip `fetch.py` entirely and point
-`--root` at wherever it is.
-
-**Downloading from somewhere that is not NIST** works by default; you get one
-warning line naming the host. Use `--nist-only` to refuse anything off
-`nist.gov`, `--allow-host HOST` to re-permit one host under it, and
-`--allow-http` for an unencrypted server.
-
-Want to utilize AI (Claude Cowork / Code session)? Paste:
-
-```text
-In the ATLAS repo: given this NIST PDR URL <URL>, run
-`python ingest/fetch.py <URL> --list` to see the record, fetch a SMALL slice
-(--filter) into the layout the matching ingest script expects, then run that
-script unmodified: build_db.py for Summaries CSVs fetched flat into
-ingest/csv; psd_ingest.py / pfp_ingest.py with SEA_DATA_ROOT set to the
-fetch --dest; iq_ingest.py <folder> --dataset <name> for SigMF/TDMS/npy.
-compact_db.py afterwards is optional; it only shrinks the files. Finish by
-confirming the new source renders in serve.py.
 ```
 
 Per-dataset format notes for the four NIST I/Q sets are in
 [docs/IQ_DATASETS.md](docs/IQ_DATASETS.md).
 
-# Building the databases
-
-The `ingest/` scripts write the DuckDB files next to `serve.py`. All are
-resumable. Pass `--root` (or set `SEA_DATA_ROOT`) to point the CBRS scripts at
-your copy of the source CSVs; it defaults to `./SEA-DATA` inside the repo.
-
-| Script | Builds | Notes |
-|--------|--------|-------|
-| `ingest/fetch.py` | (downloads) | pulls a record onto disk, from NIST or anywhere else |
-| `ingest/build_db.py` | `spectrum.duckdb` | summaries + pyramid levels (lvl_m10/h1/h6/d1) |
-| `ingest/psd_ingest.py` | `psd.duckdb` | PSD `max`, int8 per capture. `--list` shows what is on disk |
-| `ingest/pfp_ingest.py` | `pfp.duckdb` | PFP `max_peak`, int8 per channel/capture |
-| `ingest/master_ingest.py` | both CBRS DBs | all sensors, then swaps build → live |
-| `ingest/compact_db.py` | smaller DBs | **optional.** Repacks into the chunked/zlib schema and swaps it in, keeping a `.bak` |
-| `ingest/iq_ingest.py` | `iq.duckdb` | STFT pyramid for IQ captures (SigMF/TDMS/npy) |
-
-The server reads both the schema the ingest scripts write and the compacted
-one, so `compact_db.py` only changes file size and speed. Run it when the
-databases get big; skip it otherwise.
-
-## Checking a change
-
-Three self-contained checks, none of which need a network or a browser:
-
-```bash
-python examples/verify.py        # install + the synthetic IQ demo
-python examples/test_fetch.py    # fetch.py against a local fake repository
-python examples/test_ingest.py   # the CBRS path, uncompacted and compacted
-python examples/test_atlas.py    # atlas.py scan + routing a mixed folder
-```
+</details>
 
 # Architecture
 

@@ -2,11 +2,15 @@
 """
 atlas.py: one command for the whole pipeline.
 
-You should not have to know which of five ingest scripts matches the bytes you
-have, nor what folder layout each one wants, nor whether to compact afterwards.
-Tell this what you have and it works the rest out.
+    python atlas.py
 
-    python atlas.py setup             check the install and build the demo
+That is it. With no arguments it checks the machine, works out which situation
+you are in, and offers the fix as a numbered choice. Everything below is the
+same thing with the choice made for you, for scripts and for people who
+already know what they want.
+
+    python atlas.py doctor            check everything, fix what is safe
+    python atlas.py scan              find spectrum data on this machine
     python atlas.py status            what is built, what to run next
     python atlas.py get <thing>       fetch if needed, ingest, done
     python atlas.py serve             start the viewer
@@ -758,6 +762,162 @@ def cmd_doctor(args):
     return 0 if verified else 1
 
 
+# ---- the no-argument path: work out the situation and offer the fix ----
+
+def assess(max_files=60000):
+    """One pass over everything that decides what to do next.
+
+    Deliberately quiet: this runs before the user has asked for anything, so
+    it reports nothing and just returns what it learned.
+    """
+    state = {"missing": [], "built": {}, "strays": [], "data": [], "free": None}
+    for mod, pkg in [("duckdb", "duckdb"), ("numpy", "numpy"),
+                     ("flask", "Flask"), ("PIL", "Pillow")]:
+        try:
+            __import__(mod)
+        except Exception:                                   # noqa: BLE001
+            state["missing"].append(pkg)
+    if state["missing"]:
+        return state                        # nothing else can be trusted yet
+
+    state["free"] = free_space()
+    for n in DBS:
+        p = db_path(n)
+        if os.path.exists(p):
+            real, label, rows = identify_db(p)
+            if real == n and rows:
+                state["built"][n] = (label, rows)
+    where = db_dir()
+    canonical = {os.path.abspath(db_path(n)) for n in DBS}
+    for name in sorted(os.listdir(where) if os.path.isdir(where) else []):
+        p = os.path.abspath(os.path.join(where, name))
+        if os.path.isfile(p) and name.lower().endswith(DB_EXT) \
+                and p not in canonical:
+            real, _label, rows = identify_db(p)
+            if real:
+                state["strays"].append((p, real, rows))
+    for root in default_roots():
+        s = survey(root, max_files)
+        f = s["found"]
+        if f["iq"] + f["psd"] + f["pfp"] + f["summaries"]:
+            state["data"].append((root, f, dir_size(root)))
+    return state
+
+
+def describe(state):
+    """The one-screen summary shown before the menu."""
+    if state["built"]:
+        for n, (label, rows) in state["built"].items():
+            print(f"  ready    {n}: {label}, {rows:,} rows")
+    else:
+        print("  ready    nothing built yet")
+    for p, real, rows in state["strays"]:
+        print(f"  found    {os.path.basename(p)} holds {real} data "
+              f"({rows:,} rows) but is not installed")
+    for root, f, size in state["data"]:
+        kinds = ", ".join(f"{f[k]} {k}" for k in
+                          ("iq", "psd", "pfp", "summaries") if f[k])
+        print(f"  found    {kinds} in {short(root)}  ({fmt_bytes(size)})")
+    if state["free"] is not None:
+        print(f"  disk     {fmt_bytes(state['free'])} free")
+
+
+def ns(**kw):
+    """An argparse-shaped object, for calling the subcommands directly."""
+    base = dict(dry_run=False, adopt=False, deep=False, max_files=200000,
+                roots=None, compact=False, ask=False, filter=None, dest=None,
+                fetch_args=[], target=None)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def build_menu(state):
+    """-> list of (label, action). The first entry is the recommendation."""
+    items = []
+
+    for p, real, rows in state["strays"]:
+        items.append((f"Install {os.path.basename(p)} as {real}.duckdb "
+                      f"({rows:,} rows)",
+                      lambda: cmd_doctor(ns(adopt=True))))
+    for root, f, size in state["data"]:
+        items.append((f"Load the data in {short(root)} ({fmt_bytes(size)})",
+                      lambda r=root: cmd_get(ns(target=r))))
+    if state["built"]:
+        items.append(("Start the viewer", lambda: cmd_serve(ns())))
+    else:
+        items.append(("Build the demo and start the viewer",
+                      lambda: (cmd_setup(ns()), cmd_serve(ns()))[-1]))
+
+    names = [k for k in load_datasets() if not k.startswith("_")]
+    if names:
+        items.append((f"Download a dataset from NIST ({', '.join(names)})",
+                      lambda: choose_dataset(names)))
+    items.append(("Search this whole machine for data",
+                  lambda: cmd_scan(ns(deep=True))))
+    items.append(("Check everything (environment, disk, databases)",
+                  lambda: cmd_doctor(ns())))
+    return items
+
+
+def choose_dataset(names):
+    print("\nWhich dataset?")
+    for i, n in enumerate(names, 1):
+        entry = load_datasets()[n]
+        print(f"  {i}) {n:<14} {entry.get('title', '')}")
+    pick = prompt(len(names))
+    if pick is None:
+        return 0
+    return cmd_get(ns(target=names[pick]))
+
+
+def prompt(n):
+    """Ask for a number in 1..n. -> zero-based index, or None to quit."""
+    while True:
+        try:
+            raw = input(f"\nChoose 1-{n} (or q to quit): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if raw in ("q", "quit", "exit", ""):
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= n:
+            return int(raw) - 1
+        print(f"  not a choice. Enter a number from 1 to {n}, or q.")
+
+
+def cmd_auto(args):
+    """`python atlas.py` with no arguments: figure it out and offer the fix."""
+    print("ATLAS")
+    print("checking this machine ...")
+    state = assess()
+
+    if state["missing"]:
+        print(f"\nMissing: {', '.join(state['missing'])}\n")
+        print(f"To fix: {install_hint()}")
+        return 1
+
+    print()
+    describe(state)
+
+    items = build_menu(state)
+    if not sys.stdin.isatty():
+        # No terminal to ask on (a script, a CI job, a piped run). Say what the
+        # recommended command is rather than guessing and doing it.
+        print(f"\nRecommended: {items[0][0]}")
+        print("Run 'python atlas.py doctor' for the full report, or "
+              "'python atlas.py --help' for every command.")
+        return 0
+
+    print("\nWhat would you like to do?")
+    for i, (label, _) in enumerate(items, 1):
+        print(f"  {i}) {label}" + ("      <- recommended" if i == 1 else ""))
+    pick = prompt(len(items))
+    if pick is None:
+        print("nothing done")
+        return 0
+    return items[pick][1]() or 0
+
+
 # ---- subcommands ------------------------------------------------------
 
 def cmd_status(args):
@@ -1002,8 +1162,11 @@ def main():
 
     args, extra = ap.parse_known_args()
     if not getattr(args, "cmd", None):
-        ap.print_help()
-        return 0
+        # No subcommand: work out the situation and offer the fix. This is the
+        # path a first-time user should ever need.
+        if extra:
+            ap.error(f"unrecognized arguments: {' '.join(extra)}")
+        return cmd_auto(ns())
     # Unknown flags are forwarded to fetch.py (--nist-only, --allow-host, ...);
     # anywhere else they are a typo and should not be swallowed.
     if extra and args.cmd != "get":
