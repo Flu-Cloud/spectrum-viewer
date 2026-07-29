@@ -50,7 +50,7 @@ pip install -r requirements.txt
 **3. Build the demo data and check the install**
 
 ```bash
-python examples/verify.py
+python atlas.py setup
 ```
 
 This builds a small synthetic capture (`iq.duckdb`, ~2 MB, created next to
@@ -66,7 +66,7 @@ If it says `FAIL`, the line above it names the problem. See
 **4. Start the viewer**
 
 ```bash
-python serve.py
+python atlas.py serve
 ```
 
 Open **http://127.0.0.1:8090** in your browser. In the header, open the
@@ -89,7 +89,7 @@ That is the whole install. Everything below is optional.
 | `error: externally-managed-environment` | You skipped the virtual environment in step 2. |
 | `ModuleNotFoundError: No module named 'duckdb'` | The venv isn't active, or step 2's `pip install` didn't run. Re-activate and re-run it. |
 | `Address already in use` / page won't load | Port 8090 is taken. Run on another port: `SEA_PORT=8095 python serve.py` (PowerShell: `$env:SEA_PORT=8095; python serve.py`), then open that port. |
-| Browser shows "No spectrum data found" | Run `python examples/verify.py`. The demo database wasn't built. |
+| Browser shows "No spectrum data found" | Run `python atlas.py status` to see what is built, then `python atlas.py setup`. |
 | Server prints "spectrum.duckdb not found" | Expected. That's the optional multi-GB CBRS data; IQ mode still works. |
 
 # For AI agents (Claude Code, Cowork, etc.)
@@ -99,15 +99,17 @@ Paste this to have an agent entirely install the project:
 ```text
 Clone https://github.com/jimmylu7/ATLAS.git and install it.
 Create a virtual environment, install requirements.txt into it, then run
-`python examples/verify.py` and show me the output. Do not modify any
+`python atlas.py setup` and show me the output. Do not modify any
 repository files. The install is correct only if that command prints
 "RESULT: PASS"; if it prints FAIL, report the failing check verbatim and stop.
-Finally, start `python serve.py` and confirm http://127.0.0.1:8090 responds.
+Finally, start `python atlas.py serve` and confirm http://127.0.0.1:8090
+responds.
 ```
 
-`examples/verify.py` is the main tell for "did this work": it
-checks the Python version, the imports, the demo database and every API
-endpoint in-process (no browser or free port required), and exits 0 on success.
+`atlas.py setup` runs `examples/verify.py`, which is the main tell for "did
+this work": it checks the Python version, the imports, the demo database and
+every API endpoint in-process (no browser or free port required), and exits 0
+on success. `python atlas.py status` answers "what is built" at any point.
 
 # What the two modes show
 
@@ -137,15 +139,39 @@ capture showing the burst / resource-block structure.
 
 # Bring your own dataset
 
-`ingest/fetch.py` downloads a NIST dataset into the layout the ingest scripts
-expect; then the matching ingest script builds the database.
+One command covers every case. Point it at what you have:
+
+```bash
+python atlas.py get ~/Downloads/mds2-3177   # data already on your disk
+python atlas.py get lte-uplink              # a name from datasets.json
+python atlas.py get mds2-3177               # a NIST PDR record id
+python atlas.py get https://doi.org/10.18434/mds2-3177    # a DOI or URL
+python atlas.py status                      # what is built, what is next
+```
+
+It downloads only when the target is not already local, classifies every file
+it finds (IQ captures, CBRS PSD or PFP exports, Summaries CSVs, or prebuilt
+`.duckdb` databases), runs the ingest each one needs, and prints the resulting
+state. Add `--dry-run` to see the plan without changing anything, or
+`--compact` to shrink the databases afterwards. A record that publishes
+finished `.duckdb` files is copied straight into place with no ingest at all.
+
+The rest of this section is what `atlas.py get` runs underneath, for when you
+want to drive it yourself.
+
+`ingest/fetch.py` downloads a dataset; then the matching ingest script builds
+the database. Each ingest script finds its own source files by name, searched
+recursively, so the folder layout the download produced does not have to match
+anything.
 
 A dataset's DOI landing page is a JavaScript app, but every NIST Public Data
 Repository record has a JSON manifest at `data.nist.gov/rmm/records/<id>`
 listing each file's path, size and download URL. `fetch.py` accepts the record
-id, the landing/DOI URL, or a direct file URL. `--list` previews a record and
-`--filter` narrows it (all flags: `python ingest/fetch.py --help`). Downloads
-are resumable: press `Ctrl+C` and re-run to continue.
+id, an `ark:` id, the landing/DOI URL, or a direct file URL to any https host.
+`--list` summarises a record by folder, `--tree` shows its structure, `--long`
+prints every file, and `--filter` narrows what gets downloaded (all flags:
+`python ingest/fetch.py --help`). Downloads are resumable and retry transient
+network errors: press `Ctrl+C` and re-run to continue.
 
 **IQ example**, a small slice of FDD-LTE record
 [mds2-3177](https://data.nist.gov/od/id/mds2-3177), end to end:
@@ -159,17 +185,29 @@ python serve.py                                            # Source dropdown -> 
 
 **CBRS SEA example**: the [SEA data portal](https://pages.nist.gov/SEA-DATA/)
 designates PDR record [mds2-4214](https://data.nist.gov/od/id/mds2-4214) (not
-yet published as of July 2026; its Box mirror is invite-only, which `fetch.py`
-deliberately doesn't touch). The day the record goes live:
+yet published as of July 2026). The day the record goes live:
 
 ```bash
-export SEA_DATA_ROOT="/path/to/SEA-DATA"    # PowerShell: $env:SEA_DATA_ROOT="..."
-python ingest/fetch.py mds2-4214 --filter CBBT-Directional --dest "$SEA_DATA_ROOT"
-python ingest/psd_ingest.py CBBT-Directional         # then pfp_ingest.py, compact_db.py
+python ingest/fetch.py mds2-4214 --filter CBBT-Directional --dest SEA-DATA
+python ingest/psd_ingest.py --root SEA-DATA --list     # what landed on disk
+python ingest/psd_ingest.py CBBT-Directional --root SEA-DATA
+python ingest/pfp_ingest.py CBBT-Directional --root SEA-DATA
+python serve.py
 ```
+
+`--root` defaults to `$SEA_DATA_ROOT`, else `./SEA-DATA`. Nothing else has to
+be built first: the PSD and PFP layers read their CSVs directly.
 
 Summaries CSVs for `build_db.py` go flat into `ingest/csv/`: add
 `--dest ingest/csv --flat`.
+
+If you already have the data on disk, skip `fetch.py` entirely and point
+`--root` at wherever it is.
+
+**Downloading from somewhere that is not NIST** works by default; you get one
+warning line naming the host. Use `--nist-only` to refuse anything off
+`nist.gov`, `--allow-host HOST` to re-permit one host under it, and
+`--allow-http` for an unencrypted server.
 
 Want to utilize AI (Claude Cowork / Code session)? Paste:
 
@@ -180,7 +218,7 @@ In the ATLAS repo: given this NIST PDR URL <URL>, run
 script unmodified: build_db.py for Summaries CSVs fetched flat into
 ingest/csv; psd_ingest.py / pfp_ingest.py with SEA_DATA_ROOT set to the
 fetch --dest; iq_ingest.py <folder> --dataset <name> for SigMF/TDMS/npy.
-After any CBRS ingest run compact_db.py then vacuum_dbs.py. Finish by
+compact_db.py afterwards is optional; it only shrinks the files. Finish by
 confirming the new source renders in serve.py.
 ```
 
@@ -190,18 +228,33 @@ Per-dataset format notes for the four NIST I/Q sets are in
 # Building the databases
 
 The `ingest/` scripts write the DuckDB files next to `serve.py`. All are
-resumable. Set `SEA_DATA_ROOT` to your copy of the CBRS source CSVs (it
-defaults to `./SEA-DATA` inside the repo).
+resumable. Pass `--root` (or set `SEA_DATA_ROOT`) to point the CBRS scripts at
+your copy of the source CSVs; it defaults to `./SEA-DATA` inside the repo.
 
 | Script | Builds | Notes |
 |--------|--------|-------|
-| `ingest/fetch.py` | (downloads) | pulls a NIST record onto disk |
+| `ingest/fetch.py` | (downloads) | pulls a record onto disk, from NIST or anywhere else |
 | `ingest/build_db.py` | `spectrum.duckdb` | summaries + pyramid levels (lvl_m10/h1/h6/d1) |
-| `ingest/psd_ingest.py` | `psd.duckdb` | PSD `max`, int8 per capture |
+| `ingest/psd_ingest.py` | `psd.duckdb` | PSD `max`, int8 per capture. `--list` shows what is on disk |
 | `ingest/pfp_ingest.py` | `pfp.duckdb` | PFP `max_peak`, int8 per channel/capture |
-| `ingest/master_ingest.py` | both CBRS DBs | all 10 sensors, then swaps build → live |
-| `ingest/compact_db.py` | `*_c.duckdb` | **run after any CBRS ingest**: repacks into the chunked/zlib schema the server reads |
+| `ingest/master_ingest.py` | both CBRS DBs | all sensors, then swaps build → live |
+| `ingest/compact_db.py` | smaller DBs | **optional.** Repacks into the chunked/zlib schema and swaps it in, keeping a `.bak` |
 | `ingest/iq_ingest.py` | `iq.duckdb` | STFT pyramid for IQ captures (SigMF/TDMS/npy) |
+
+The server reads both the schema the ingest scripts write and the compacted
+one, so `compact_db.py` only changes file size and speed. Run it when the
+databases get big; skip it otherwise.
+
+## Checking a change
+
+Three self-contained checks, none of which need a network or a browser:
+
+```bash
+python examples/verify.py        # install + the synthetic IQ demo
+python examples/test_fetch.py    # fetch.py against a local fake repository
+python examples/test_ingest.py   # the CBRS path, uncompacted and compacted
+python examples/test_atlas.py    # atlas.py routing a mixed folder
+```
 
 # Architecture
 
@@ -211,7 +264,8 @@ defaults to `./SEA-DATA` inside the repo).
   that still has detail for the window and renders WebP tiles (numpy + Pillow;
   axis metadata rides in the `X-Meta` response header). Reads the DuckDB files
   read-only, with a per-request connection so renders are thread-safe. The CBRS
-  databases are optional — without them the server still serves IQ captures.
+  databases are optional: without them the server still serves IQ captures, and
+  it reads each one in whichever of the two schemas is on disk.
 - **`viewer.html`**: single-file canvas app, no build step. Zoom/pan, the layer
   swaps, the zoom sliders and colour locking all live here.
 - **`ingest/`**: the data-build tooling. `sigmf_io.py` is a unified reader for
@@ -223,10 +277,12 @@ defaults to `./SEA-DATA` inside the repo).
 per-capture `vmin/vmax` so colours never drift on zoom.
 
 ```
+atlas.py            one command: setup / get / status / serve
 serve.py            Flask backend (app entry point)
 viewer.html         single-file canvas frontend
+datasets.json       friendly names -> PDR records
 requirements.txt    dependencies, with tested versions
-examples/           make_sample.py (demo data) + verify.py (install check)
+examples/           demo data, the install check, and the offline tests
 docs/               screenshots + IQ dataset notes
 ingest/             fetch + database-build tooling, all resumable
 ```

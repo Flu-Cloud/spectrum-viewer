@@ -6,16 +6,16 @@ then atomically swap them live and restart the server. Fully autonomous.
   the current data the whole time.
 - Each per-sensor ingest is resumable (skips days already done), so this whole
   run survives interruption: just launch it again and it continues.
-- When every sensor is done, it stops the server on :8090, moves the build DBs
-  over the live ones, and restarts the server -> all sensors live.
+- When every sensor is done, it moves the build DBs over the live ones and
+  restarts the server -> all sensors live.
 
-NOTE (schema change): the ingest scripts write the ROW-PER-CAPTURE schema, but
-the live server now reads the compacted chunk schema (psd_chunk / pfp_chunk).
-If you re-run this, follow it with compact_db.py + vacuum_dbs.py and swap the
-*_c.duckdb files live instead of letting this script's swap stand alone.
+The swap installs the row-per-capture schema, which serve.py reads directly.
+Run compact_db.py afterwards if you want the smaller files; it is optional.
 
-    cd /path/to/spectrum-viewer
-    py master_ingest.py
+Stopping a running server automatically only works on Windows. Elsewhere, stop
+serve.py yourself before this reaches the swap (it will tell you).
+
+    py ingest/master_ingest.py
 """
 
 import os
@@ -25,6 +25,9 @@ import sys
 import time
 
 import duckdb
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import psd_ingest                                            # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))       # ingest/ (holds the scripts)
 ROOT = os.path.dirname(HERE)                             # repo root (holds serve.py + DBs)
@@ -52,6 +55,11 @@ def run(script, sensor, dbenv, dbpath):
 
 
 def kill_server():
+    """Stop a serve.py holding the live DBs open. Windows only; elsewhere the
+    files can be replaced while open, so there is nothing to do."""
+    if os.name != "nt":
+        log("not Windows: if serve.py is running, restart it after the swap")
+        return
     out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True).stdout
     for line in out.splitlines():
         if ":8090" in line and "LISTENING" in line.upper():
@@ -60,10 +68,24 @@ def kill_server():
             log(f"stopped server pid {pid}")
 
 
+def sensors_available():
+    """Sensor list from the summary DB when it exists, else from the CSVs."""
+    if os.path.exists(SUMM):
+        con = duckdb.connect(SUMM, read_only=True)
+        names = [r[0] for r in con.execute(
+            "SELECT sensor FROM meta ORDER BY sensor").fetchall()]
+        con.close()
+        if names:
+            return names
+    return sorted(psd_ingest.discover(BOX, "max"))
+
+
 def main():
-    con = duckdb.connect(SUMM, read_only=True)
-    sensors = [r[0] for r in con.execute("SELECT sensor FROM meta ORDER BY sensor").fetchall()]
-    con.close()
+    sensors = sensors_available()
+    if not sensors:
+        sys.exit(f"no sensors found. Looked in {SUMM} and for PSD CSVs under "
+                 f"{os.path.abspath(BOX)}.\n"
+                 "  Set SEA_DATA_ROOT to your copy of the data, then re-run.")
     log(f"sensors ({len(sensors)}): {sensors}")
 
     # seed the PSD build DB from the live one (CBBT-Directional already ingested)

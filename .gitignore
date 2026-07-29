@@ -10,6 +10,9 @@ seadata/
 
 # Raw IQ capture downloads (NIST datasets; rebuild iq.duckdb via iq_ingest.py)
 iqdata/
+
+# Default --dest for `atlas.py get` on a remote record
+downloads/
 *.bak
 .fuse_hidden*
 

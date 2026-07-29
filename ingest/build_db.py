@@ -1,17 +1,21 @@
 """
 build_db.py: Tier 1 ingest and time-pyramid builder for the RF spectrum viewer.
 
-Reads every Summaries CSV in ./csv, loads the columns we care about into a single
-DuckDB database, then precomputes coarse "zoom levels" so the viewer never has to
-scan raw rows when you're looking at months or years at a time.
+Reads every Summaries CSV under ingest/csv (searched recursively, so the layout
+fetch.py produced works as-is), loads the columns we care about into a single
+DuckDB database, then precomputes coarse "zoom levels" so the viewer never has
+to scan raw rows when you're looking at months or years at a time.
+
+This database powers the zoomed-out summary layer. It is NOT required by
+psd_ingest.py or pfp_ingest.py; those read their own CSVs directly.
 
 Run once (re-run any time the CSVs change):
 
-    cd /path/to/spectrum-viewer
-    py build_db.py
+    py ingest/build_db.py
+    py ingest/build_db.py --csv-dir /path/to/summaries
 """
 
-import glob
+import argparse
 import os
 import sys
 import time
@@ -21,7 +25,12 @@ import duckdb
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 CSV_DIR = os.path.join(HERE, "csv")
-DB_PATH = os.path.join(ROOT, "spectrum.duckdb")
+DB_PATH = os.environ.get("SPECTRUM_DB", os.path.join(ROOT, "spectrum.duckdb"))
+
+# Summaries CSVs carry these columns; anything else in the folder is skipped
+# with a reason rather than aborting the whole run.
+NEEDED = ("sensor_name", "channel_frequency_mhz", "timestamp",
+          "max", "median", "mean")
 
 # Pyramid: bucket size in seconds -> table name. "raw" (native ~90s cadence) is
 # kept as-is; these are the coarser pre-aggregated levels for zoomed-out views.
@@ -33,10 +42,43 @@ LEVELS = [
 ]
 
 
+def find_csvs(csv_dir):
+    out = []
+    for dirpath, _, names in os.walk(csv_dir):
+        for n in sorted(names):
+            if n.lower().endswith(".csv"):
+                out.append(os.path.join(dirpath, n))
+    return sorted(out)
+
+
+def no_data(csv_dir):
+    """Say what was searched for and how to get it, not just 'no CSV files'."""
+    where = os.path.abspath(csv_dir)
+    print(f"No CSV files found under {where}", file=sys.stderr)
+    if not os.path.isdir(csv_dir):
+        print("  That directory does not exist yet.", file=sys.stderr)
+    print("\nThis script builds the zoomed-out summary layer from the CBRS\n"
+          "Summaries CSVs. To download them into the right place:\n\n"
+          "    python ingest/fetch.py <record-id> --filter Summaries \\\n"
+          "        --dest ingest/csv --flat\n\n"
+          "Or point at a copy you already have:\n\n"
+          "    python ingest/build_db.py --csv-dir /path/to/summaries\n\n"
+          "You do NOT need this database for the PSD or PFP layers; those read\n"
+          "their own CSVs directly (python ingest/psd_ingest.py --list).",
+          file=sys.stderr)
+    return 1
+
+
 def main():
-    files = sorted(glob.glob(os.path.join(CSV_DIR, "*.csv")))
+    ap = argparse.ArgumentParser(
+        description="Build spectrum.duckdb (the summary layer) from Summaries CSVs.")
+    ap.add_argument("--csv-dir", default=CSV_DIR,
+                    help=f"directory of Summaries CSVs (default {CSV_DIR})")
+    args = ap.parse_args()
+
+    files = find_csvs(args.csv_dir)
     if not files:
-        sys.exit(f"No CSV files found in {CSV_DIR}")
+        return no_data(args.csv_dir)
 
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
@@ -58,22 +100,44 @@ def main():
 
     print(f"Ingesting {len(files)} CSV files...")
     t0 = time.time()
+    used = skipped = 0
     for i, f in enumerate(files, 1):
         name = os.path.basename(f)
         # read_csv_auto figures out the schema; we only pull the 6 columns we need.
-        con.execute("""
-            INSERT INTO raw
-            SELECT
-                sensor_name,
-                channel_frequency_mhz,
-                epoch(CAST(timestamp AS TIMESTAMPTZ)),
-                "max", median, mean
-            FROM read_csv_auto(?, header=true,
-                               types={'channel_frequency_mhz':'DOUBLE',
-                                      'max':'DOUBLE','median':'DOUBLE','mean':'DOUBLE'})
-        """, [f])
+        try:
+            con.execute("""
+                INSERT INTO raw
+                SELECT
+                    sensor_name,
+                    channel_frequency_mhz,
+                    epoch(CAST(timestamp AS TIMESTAMPTZ)),
+                    "max", median, mean
+                FROM read_csv_auto(?, header=true,
+                                   types={'channel_frequency_mhz':'DOUBLE',
+                                          'max':'DOUBLE','median':'DOUBLE','mean':'DOUBLE'})
+            """, [f])
+        except duckdb.Error as e:
+            # A PSD or PFP export sitting in the same folder is not a Summaries
+            # CSV. Say so and keep going rather than aborting the whole build.
+            skipped += 1
+            first = str(e).strip().splitlines()[0]
+            print(f"  [{i:2}/{len(files)}] {name:18}  skipped: {first}")
+            continue
+        used += 1
         n = con.execute("SELECT count(*) FROM raw").fetchone()[0]
         print(f"  [{i:2}/{len(files)}] {name:18}  total rows: {n:,}  ({time.time()-t0:.0f}s)")
+
+    if used == 0:
+        con.close()
+        os.remove(DB_PATH)
+        print(f"\nNone of the {len(files)} CSV file(s) under "
+              f"{os.path.abspath(args.csv_dir)} are Summaries exports.\n"
+              f"  A Summaries CSV has the columns: {', '.join(NEEDED)}.\n"
+              "  PSD and PFP exports belong to psd_ingest.py / pfp_ingest.py "
+              "instead.", file=sys.stderr)
+        return 1
+    if skipped:
+        print(f"  ({skipped} file(s) skipped, not Summaries exports)")
 
     print("Building pyramid levels...")
     for tbl, bucket in LEVELS:
@@ -119,7 +183,9 @@ def main():
     con.close()
     size_gb = os.path.getsize(DB_PATH) / 1e9
     print(f"\nDone in {time.time()-t0:.0f}s. Database: {DB_PATH} ({size_gb:.2f} GB)")
+    print("next: python serve.py")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

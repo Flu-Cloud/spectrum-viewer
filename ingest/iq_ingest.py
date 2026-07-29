@@ -61,6 +61,10 @@ def stft_db(cap, s0, nframes, win):
 def scan_scale(cap, win):
     """Sparse pre-pass -> fixed quantization range for the whole capture."""
     total = cap.n_samples // NFFT
+    if total < 1:
+        raise ValueError(f"only {cap.n_samples} sample(s); an STFT needs at "
+                         f"least {NFFT}. This file is too short to render, or "
+                         "its .sigmf-data is truncated.")
     step = max(1, total // 64)
     samp = []
     for f0 in range(0, total, step):
@@ -73,6 +77,10 @@ def scan_scale(cap, win):
 def ingest_capture(con, path, dataset):
     cap = sigmf_io.open_capture(path)
     cid = cap.name
+    if cap.n_samples < NFFT:
+        raise ValueError(f"only {cap.n_samples} sample(s); an STFT needs at "
+                         f"least {NFFT}. This file is too short to render, or "
+                         "its .sigmf-data is truncated.")
     if con.execute("SELECT 1 FROM iq_meta WHERE id=?", [cid]).fetchone():
         print(f"  skip (already ingested): {cid}")
         return False
@@ -167,7 +175,18 @@ def main():
     con.close()
     size = os.path.getsize(IQ_DB) / 1e6
     print(f"\nDone: {done} ingested, {err} errors. {IQ_DB} = {size:.1f} MB")
+    if err and done == 0:
+        # Exiting 0 here is how a failed ingest used to look like a success to
+        # anything driving this script.
+        print(f"Nothing was ingested: all {err} capture(s) failed to read.",
+              file=sys.stderr)
+        return 1
+    if err:
+        print(f"{err} capture(s) failed; re-run to retry them.", file=sys.stderr)
+    if done:
+        print("next: python serve.py")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
