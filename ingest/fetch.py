@@ -215,22 +215,60 @@ def open_url(url, headers=None, timeout=60, retries=3):
 
 # ---- source parsing ---------------------------------------------------
 
+# Characters that ride along when a URL is pasted out of a browser, an email,
+# a chat message or a markdown link. Stripping them is the difference between
+# a working paste and a confusing 404 on a record id like 'mds2-3177>'.
+_PASTE_JUNK = " \t\r\n<>\"'`,;"
+
+
+def clean_source(src):
+    s = src.strip().strip(_PASTE_JUNK)
+    m = re.match(r"^\[[^\]]*\]\((.+)\)$", s)         # a whole markdown link
+    if m:
+        s = m.group(1).strip(_PASTE_JUNK)
+    elif s.endswith(")") and "(" not in s:           # just its trailing paren
+        s = s[:-1].strip(_PASTE_JUNK)
+    return s
+
+
+def _last_segment(s):
+    return s.rstrip("/").split("/")[-1]
+
+
 def parse_source(src):
-    """Classify the CLI argument -> ('record', id) or ('file', url)."""
-    s = src.strip()
+    """Classify the CLI argument -> ('record', id) or ('file', url).
+
+    Accepts every shape a NIST PDR page hands you: the landing URL, the ark
+    form, the RMM manifest URL and its ?@id= query form, a DOI, the record-level
+    /od/ds/ endpoint, a bare id, and any direct file URL.
+    """
+    s = clean_source(src)
+    if not s:
+        raise FetchError("empty source")
     low = s.lower()
     if low.startswith(("ark:", "doi:")):             # ark:/88434/mds2-3177
-        return "record", s.rstrip("/").split("/")[-1]
+        return "record", _last_segment(s)
     if not re.match(r"^[a-z][a-z0-9+.-]*://", s, re.I):
-        return "record", s.rstrip("/").split("/")[-1]     # bare record id
+        # No scheme. Either a bare id, or a pasted URL missing its https://.
+        return "record", _last_segment(s.split("?")[0].split("#")[0])
     parts = urllib.parse.urlsplit(s)
     host = (parts.hostname or "").lower()
     path = urllib.parse.unquote(parts.path)
     if host in ("doi.org", "dx.doi.org", "n2t.net"):
-        return "record", path.rstrip("/").split("/")[-1]
+        return "record", _last_segment(path)
     m = re.search(r"/(?:rmm/records|od/id)/(.+?)/?$", path)
     if m:                                            # record/landing URL
-        return "record", m.group(1).split("/")[-1]
+        return "record", _last_segment(m.group(1))
+    if re.search(r"/(?:rmm/records|od/id)/?$", path):
+        # the RMM query form: /rmm/records?@id=ark:/88434/mds2-3177
+        qs = urllib.parse.parse_qs(parts.query)
+        for key in ("@id", "id", "recordId"):
+            if qs.get(key):
+                return "record", _last_segment(urllib.parse.unquote(qs[key][0]))
+    m = re.search(r"/od/ds/(.+?)/?$", path)
+    if m and "." not in posixpath.basename(m.group(1).rstrip("/")):
+        # /od/ds/<id> with no filename is the record, not a file
+        return "record", _last_segment(m.group(1))
     if path in ("", "/"):
         raise FetchError(f"can't interpret source: {src}\n"
                          "  that URL has no path. Expected a PDR record "
@@ -296,6 +334,8 @@ def record_files(rec):
             refused.append(url)
             continue
         size = c.get("size")
+        if isinstance(size, str) and size.strip().isdigit():
+            size = int(size)                # some records quote the number
         size = int(size) if isinstance(size, (int, float)) else None
         if "nrdp:ChecksumFile" in types or fp.endswith(".sha256"):
             checksums[fp[:-len(".sha256")] if fp.endswith(".sha256") else fp] = url
@@ -591,7 +631,7 @@ def main():
     files, checksums = record_files(rec)
     n_all = len(files)
     if args.filter:
-        needle = args.filter.lower()
+        needle = args.filter.lower().replace("\\", "/")
         files = [f for f in files if needle in f["filepath"].lower()]
     if not files:
         msg = "no downloadable files"

@@ -218,7 +218,7 @@ In the ATLAS repo: given this NIST PDR URL <URL>, run
 script unmodified: build_db.py for Summaries CSVs fetched flat into
 ingest/csv; psd_ingest.py / pfp_ingest.py with SEA_DATA_ROOT set to the
 fetch --dest; iq_ingest.py <folder> --dataset <name> for SigMF/TDMS/npy.
-After any CBRS ingest run compact_db.py then vacuum_dbs.py. Finish by
+compact_db.py afterwards is optional; it only shrinks the files. Finish by
 confirming the new source renders in serve.py.
 ```
 

@@ -98,6 +98,17 @@ def load_datasets():
 
 # ---- classify what is on disk -----------------------------------------
 
+def looks_like_summaries(path):
+    """A Summaries CSV names its columns. Metadata and readme CSVs do not, and
+    handing those to build_db.py just produces a confusing failure."""
+    try:
+        with open(path, "r", errors="replace") as f:
+            head = f.readline().lower()
+    except OSError:
+        return False
+    return "sensor_name" in head and "channel_frequency_mhz" in head
+
+
 def classify(root):
     """Walk root -> what kinds of data are in it, and where.
 
@@ -107,23 +118,30 @@ def classify(root):
     import psd_ingest
     import pfp_ingest
 
-    out = {"iq": set(), "psd": set(), "pfp": set(), "csv": set(), "duckdb": []}
-    if os.path.isfile(root):
+    out = {"iq": set(), "psd": set(), "pfp": set(), "csv": set(),
+           "duckdb": [], "other": []}
+    # A single file means that file, not everything sitting beside it. The CBRS
+    # ingests take a directory, so those get the file's parent; the IQ ingest
+    # takes either, so it gets the file itself.
+    one = os.path.isfile(root)
+    if one:
         names = [(os.path.dirname(root) or ".", os.path.basename(root))]
     else:
         names = [(dp, n) for dp, _, ns in os.walk(root) for n in ns]
     for dirpath, n in names:
         low = n.lower()
         if low.endswith(IQ_EXT):
-            out["iq"].add(root if os.path.isdir(root) else dirpath)
+            out["iq"].add(os.path.join(dirpath, n) if one else root)
         elif low.endswith(".duckdb"):
             out["duckdb"].append(os.path.join(dirpath, n))
         elif pfp_ingest.NAME_RE.match(n):
-            out["pfp"].add(root)
+            out["pfp"].add(dirpath if one else root)
         elif psd_ingest.NAME_RE.match(n):
-            out["psd"].add(root)
+            out["psd"].add(dirpath if one else root)
         elif low.endswith(".csv"):
-            out["csv"].add(dirpath)
+            full = os.path.join(dirpath, n)
+            (out["csv"].add(dirpath) if looks_like_summaries(full)
+             else out["other"].append(full))
     out["duckdb"].sort()
     return out
 
@@ -135,21 +153,24 @@ def plan_for(root, found, compact):
     steps, prebuilt = [], []
 
     for p in found["duckdb"]:
-        stem = os.path.basename(p)[:-len(".duckdb")].replace("_c", "")
+        stem = os.path.basename(p)[:-len(".duckdb")]
+        if stem.endswith("_c"):          # a compact_db.py build file
+            stem = stem[:-2]
         if stem in DBS:
             prebuilt.append((p, db_path(stem)))
 
     for d in sorted(found["iq"]):
+        named = d if os.path.isdir(d) else os.path.dirname(d)
         steps.append((f"IQ captures in {short(d)}",
                       script("iq_ingest.py", d, "--dataset",
-                             os.path.basename(os.path.normpath(d)))))
+                             os.path.basename(os.path.normpath(named)))))
     for d in sorted(found["psd"]):
         for s in sorted(psd_ingest.discover(d, "max")):
-            steps.append((f"CBRS PSD, sensor {s}",
+            steps.append((f"CBRS PSD, sensor {s}, under {short(d)}",
                           script("psd_ingest.py", s, "--root", d)))
     for d in sorted(found["pfp"]):
         for s in sorted(pfp_ingest.discover(d, "max_peak")):
-            steps.append((f"CBRS PFP, sensor {s}",
+            steps.append((f"CBRS PFP, sensor {s}, under {short(d)}",
                           script("pfp_ingest.py", s, "--root", d)))
     # Summaries CSVs are whatever is left over that is still a CSV.
     for d in sorted(found["csv"]):
@@ -250,7 +271,7 @@ def cmd_get(args):
         if entry.get("note"):
             print(f"  note: {entry['note']}")
         target = entry["record"]
-        if entry.get("filter") and not args.filter:
+        if entry.get("filter") and args.filter is None:
             args.filter = entry["filter"]
 
     # Already on disk? Then there is nothing to download.
@@ -258,9 +279,18 @@ def cmd_get(args):
         root = os.path.abspath(target)
         print(f"using local data: {root}")
     else:
-        root = os.path.abspath(args.dest or os.path.join(
-            HERE, "downloads", os.path.basename(target.rstrip("/"))))
-        argv = script("fetch.py", target, "--dest", root)
+        # Derive the download folder from the PARSED source, so a pasted
+        # "<https://.../mds2-3177>" does not create a directory named
+        # "mds2-3177>". fetch.py cleans the argument the same way.
+        import fetch
+        try:
+            kind, val = fetch.parse_source(target)
+            name = val if kind == "record" else os.path.basename(
+                os.path.normpath(fetch.urllib.parse.urlsplit(val).path)) or "download"
+        except Exception:                                   # noqa: BLE001
+            name = os.path.basename(target.rstrip("/")) or "download"
+        root = os.path.abspath(args.dest or os.path.join(HERE, "downloads", name))
+        argv = script("fetch.py", fetch.clean_source(target), "--dest", root)
         if args.filter:
             argv += ["--filter", args.filter]
         argv += args.fetch_args
@@ -281,6 +311,12 @@ def cmd_get(args):
               "  Expected IQ captures (.sigmf-meta/.tdms/.npy), CBRS PSD or PFP\n"
               "  CSV exports, Summaries CSVs, or prebuilt .duckdb files.",
               file=sys.stderr)
+        if found["other"]:
+            print(f"  {len(found['other'])} CSV file(s) are there but none has a "
+                  "Summaries header (sensor_name, channel_frequency_mhz):",
+                  file=sys.stderr)
+            for f in found["other"][:5]:
+                print(f"    {short(f)}", file=sys.stderr)
         return 1
 
     print(f"\nplan for {root}:")
@@ -339,18 +375,23 @@ def main():
                    help="only files whose path contains this substring")
     p.add_argument("--compact", action="store_true",
                    help="also run compact_db.py when CBRS data was ingested")
-    p.add_argument("fetch_args", nargs="*", default=[],
-                   help="extra flags passed straight to fetch.py, e.g. --any-host")
+    p.epilog = ("any other flag is passed straight to ingest/fetch.py, "
+                "e.g. --nist-only, --allow-host HOST, --allow-http")
     p.set_defaults(fn=cmd_get)
 
     for q in sub.choices.values():
         q.add_argument("--dry-run", action="store_true",
                        help="print the plan and change nothing")
 
-    args = ap.parse_args()
+    args, extra = ap.parse_known_args()
     if not getattr(args, "cmd", None):
         ap.print_help()
         return 0
+    # Unknown flags are forwarded to fetch.py (--nist-only, --allow-host, ...);
+    # anywhere else they are a typo and should not be swallowed.
+    if extra and args.cmd != "get":
+        ap.error(f"unrecognized arguments: {' '.join(extra)}")
+    args.fetch_args = extra
     return args.fn(args)
 
 

@@ -200,6 +200,7 @@ _psd_con = None
 _psd_lock = threading.Lock()
 _psd_scale_cache = {}   # sensor -> (vmin, vmax) sampled across the whole range
 _psd_kind = None        # 'chunk' | 'rows' | None
+_psd_init = threading.Lock()
 
 
 def table_names(c):
@@ -214,7 +215,11 @@ def psd_conn():
     """Persistent read-only handle (saves the ~15ms reopen per zoom). The live
     DB is never written while serving; ingest builds a fresh file and swaps."""
     global _psd_con, _psd_kind
-    if _psd_con is None and os.path.exists(PSD_DB):
+    if _psd_con is not None or not os.path.exists(PSD_DB):
+        return _psd_con
+    with _psd_init:                 # two requests can race here on first load
+        if _psd_con is not None:
+            return _psd_con
         try:
             _psd_con = duckdb.connect(PSD_DB, read_only=True)
         except Exception:
@@ -372,11 +377,16 @@ _pfp_con = None
 _pfp_lock = threading.Lock()
 _pfp_freqs_cache = {}
 _pfp_kind = None        # 'chunk' | 'rows' | None
+_pfp_init = threading.Lock()
 
 
 def pfp_conn():
     global _pfp_con, _pfp_kind
-    if _pfp_con is None and os.path.exists(PFP_DB):
+    if _pfp_con is not None or not os.path.exists(PFP_DB):
+        return _pfp_con
+    with _pfp_init:                 # same first-load race as PSD above
+        if _pfp_con is not None:
+            return _pfp_con
         try:
             _pfp_con = duckdb.connect(PFP_DB, read_only=True)
         except Exception:

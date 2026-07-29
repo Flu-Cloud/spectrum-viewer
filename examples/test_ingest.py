@@ -23,6 +23,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 ING = os.path.join(ROOT, "ingest")
+sys.path.insert(0, ING)
 
 NF = 2250          # PSD bins, must match psd_ingest.NF
 NPOS = 560         # PFP frame positions, must match pfp_ingest.NPOS
@@ -198,6 +199,26 @@ def main():
                       env)
         check("build_db builds the summary layer",
               rc == 0 and os.path.exists(env["SPECTRUM_DB"]), out.strip()[-120:])
+
+        rc, out = run([sys.executable, os.path.join(ING, "compact_db.py"),
+                       "--no-swap"], {**env, "ATLAS_DB_DIR": dbs})
+        check("--no-swap leaves the build files and the live ones alone",
+              rc == 0 and os.path.exists(os.path.join(dbs, "psd_c.duckdb"))
+              and not os.path.exists(os.path.join(dbs, "psd.duckdb.bak")))
+
+        # compaction reports whether its output is safe to install, and a
+        # missing source is a False rather than a silent swap of nothing
+        import compact_db                                    # noqa: E402
+        compact_db.DB_DIR = dbs
+        check("compact_psd reports success on a good database",
+              compact_db.compact_psd() is True)
+        check("swap_in is a no-op when there is no build file",
+              compact_db.swap_in("nosuch") is False)
+        compact_db.DB_DIR = os.path.join(tmp, "no-databases-here")
+        check("a missing source compacts to False, so nothing is swapped",
+              (compact_db.compact_spectrum(), compact_db.compact_psd(),
+               compact_db.compact_pfp()) == (False, False, False))
+        compact_db.DB_DIR = dbs
 
         rc, out = run([sys.executable, os.path.join(ING, "compact_db.py")],
                       {**env, "ATLAS_DB_DIR": dbs})

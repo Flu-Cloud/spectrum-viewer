@@ -51,7 +51,7 @@ for _cfg in ("config_0", "config_1"):
             "captures": [{"core:sample_start": 0, "core:frequency": 2.412e9}],
             "annotations": [],
         }).encode()
-        BLOBS[f"{_bw}/{_cfg}/capture.sigmf-data"] = os.urandom(4096)
+        BLOBS[f"{_bw}/{_cfg}/capture.sigmf-data"] = os.urandom(16384)
 BLOBS["docs/readme.txt"] = b"a record-level readme\n"
 
 
@@ -139,16 +139,42 @@ def main():
 
     # ---- 1. source parsing, in-process (no server needed) ----
     import fetch                                            # noqa: E402
+    R = ("record", "mds2-3177")
     cases = {
-        "mds2-3177": ("record", "mds2-3177"),
-        "ark:/88434/mds2-3177": ("record", "mds2-3177"),
-        "ark:88434/mds2-3177": ("record", "mds2-3177"),
-        "doi:10.18434/mds2-3177": ("record", "mds2-3177"),
-        "https://doi.org/10.18434/mds2-3177": ("record", "mds2-3177"),
-        "https://data.nist.gov/od/id/mds2-3177": ("record", "mds2-3177"),
-        "https://data.nist.gov/rmm/records/mds2-3177": ("record", "mds2-3177"),
-        "https://data.nist.gov/od/id/ark:/88434/mds2-3177": ("record", "mds2-3177"),
-        "http://data.nist.gov/od/id/mds2-3177": ("record", "mds2-3177"),
+        # ids
+        "mds2-3177": R,
+        "ark:/88434/mds2-3177": R,
+        "ark:88434/mds2-3177": R,
+        "doi:10.18434/mds2-3177": R,
+        "10.18434/mds2-3177": R,
+        # what the PDR landing page puts in the address bar
+        "https://data.nist.gov/od/id/mds2-3177": R,
+        "https://data.nist.gov/od/id/mds2-3177/": R,
+        "https://data.nist.gov/od/id/ark:/88434/mds2-3177": R,
+        "https://data.nist.gov/od/id/ark:/88434/mds2-3177/": R,
+        "https://data.nist.gov/od/id/mds2-3177#files": R,
+        "https://data.nist.gov/od/id/mds2-3177?selectedItemId=x": R,
+        "https://data.nist.gov/rmm/records/mds2-3177": R,
+        "https://data.nist.gov/rmm/records?@id=ark:/88434/mds2-3177": R,
+        "https://doi.org/10.18434/mds2-3177": R,
+        "http://doi.org/10.18434/mds2-3177": R,
+        "http://data.nist.gov/od/id/mds2-3177": R,
+        # the record-level download endpoint is a record, not a file
+        "https://data.nist.gov/od/ds/mds2-3177": R,
+        "https://data.nist.gov/od/ds/ark:/88434/mds2-3177": R,
+        # scheme dropped by the paste
+        "data.nist.gov/od/id/mds2-3177": R,
+        "data.nist.gov/od/id/mds2-3177?x=1#f": R,
+        # punctuation that rides along from a browser, chat or markdown
+        "  https://data.nist.gov/od/id/mds2-3177  ": R,
+        "<https://data.nist.gov/od/id/mds2-3177>": R,
+        '"https://data.nist.gov/od/id/mds2-3177"': R,
+        "'mds2-3177'": R,
+        "https://data.nist.gov/od/id/mds2-3177,": R,
+        "[mds2-3177](https://data.nist.gov/od/id/mds2-3177)": R,
+        # direct file URLs, NIST and not
+        "https://data.nist.gov/od/ds/ark:/88434/mds2-3177/1.4MHz/c0/x.tdms":
+            ("file", "https://data.nist.gov/od/ds/ark:/88434/mds2-3177/1.4MHz/c0/x.tdms"),
         "https://nist-oar-cache.s3.amazonaws.com/x.tdms":
             ("file", "https://nist-oar-cache.s3.amazonaws.com/x.tdms"),
         "https://zenodo.org/records/1/files/x.npy":
@@ -162,7 +188,7 @@ def main():
             got = f"raised {type(e).__name__}"
         if got != want:
             bad.append(f"{src} -> {got}, wanted {want}")
-    check(f"parse_source handles all {len(cases)} documented forms",
+    check(f"parse_source handles all {len(cases)} real-world paste forms",
           not bad, "; ".join(bad))
 
     # host policy
@@ -235,9 +261,11 @@ def main():
             f.truncate(1000)
         rc, out = run(["mds2-test", "--filter", "1.4MHz/config_0",
                        "--dest", dest, "--allow-http"], env, expect=0)
+        want = BLOBS["1.4MHz/config_0/capture.sigmf-data"]
         check("a truncated file resumes over HTTP Range",
-              rc == 0 and os.path.getsize(part) == 4096
-              and BLOBS["1.4MHz/config_0/capture.sigmf-data"] == open(part, "rb").read())
+              rc == 0 and os.path.getsize(part) == len(want)
+              and want == open(part, "rb").read(),
+              f"{os.path.getsize(part)} of {len(want)} bytes")
 
         flat = os.path.join(tmp, "flat")
         rc, out = run(["mds2-test", "--filter", "readme", "--dest", flat,

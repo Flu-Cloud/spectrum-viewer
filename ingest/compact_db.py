@@ -63,9 +63,10 @@ def _missing(src_p):
 
 
 def compact_spectrum():
+    """-> True when spectrum_c.duckdb is complete and safe to swap in."""
     src_p = os.path.join(DB_DIR, "spectrum.duckdb")
     if _missing(src_p):
-        return
+        return False
     dst = duckdb.connect(os.path.join(DB_DIR, "spectrum_c.duckdb"))
     dst.execute("CREATE TABLE IF NOT EXISTS done (k VARCHAR)")
     dst.execute(f"ATTACH '{src_p}' AS s (READ_ONLY)")
@@ -89,6 +90,7 @@ def compact_spectrum():
         log(f"  spectrum.{t} in {time.time()-t0:.0f}s")
     dst.close()
     log("spectrum_c.duckdb complete")
+    return True
 
 
 def _copy_meta(dst, src_path, table):
@@ -100,9 +102,10 @@ def _copy_meta(dst, src_path, table):
 
 
 def compact_psd():
+    """-> True only if every sensor round-tripped with the same row count."""
     src_p = os.path.join(DB_DIR, "psd.duckdb")
     if _missing(src_p):
-        return
+        return False
     src = duckdb.connect(src_p, read_only=True)
     dst = duckdb.connect(os.path.join(DB_DIR, "psd_c.duckdb"))
     _prep(dst, """CREATE TABLE IF NOT EXISTS psd_chunk (
@@ -110,6 +113,7 @@ def compact_psd():
     if not _skip(dst, "meta"):
         _copy_meta(dst, src_p, "psd_meta")
     sensors = [r[0] for r in src.execute("SELECT DISTINCT sensor FROM psd ORDER BY 1").fetchall()]
+    bad = []
     for s in sensors:
         if _skip(dst, s):
             log(f"  psd {s}: already done")
@@ -133,17 +137,23 @@ def compact_psd():
         want = src.execute("SELECT count(*) FROM psd WHERE sensor=?", [s]).fetchone()[0]
         if total != want:
             log(f"  psd {s}: MISMATCH {total} != {want}. NOT marking done")
+            bad.append(s)
             continue
         dst.execute("INSERT INTO done VALUES (?)", [s])
         log(f"  psd {s}: {total} spectra in {time.time()-t0:.0f}s")
     src.close(); dst.close()
+    if bad:
+        log(f"psd_c.duckdb INCOMPLETE for {', '.join(bad)}; not swapping it in")
+        return False
     log("psd_c.duckdb complete")
+    return True
 
 
 def compact_pfp():
+    """-> True only if every sensor round-tripped with the same row count."""
     src_p = os.path.join(DB_DIR, "pfp.duckdb")
     if _missing(src_p):
-        return
+        return False
     src = duckdb.connect(src_p, read_only=True)
     dst = duckdb.connect(os.path.join(DB_DIR, "pfp_c.duckdb"))
     _prep(dst, """CREATE TABLE IF NOT EXISTS pfp_chunk (
@@ -151,6 +161,7 @@ def compact_pfp():
     if not _skip(dst, "meta"):
         _copy_meta(dst, src_p, "pfp_meta")
     sensors = [r[0] for r in src.execute("SELECT DISTINCT sensor FROM pfp ORDER BY 1").fetchall()]
+    bad = []
     for s in sensors:
         if _skip(dst, s):
             log(f"  pfp {s}: already done")
@@ -185,11 +196,16 @@ def compact_pfp():
         want = src.execute("SELECT count(*) FROM pfp WHERE sensor=?", [s]).fetchone()[0]
         if total != want:
             log(f"  pfp {s}: MISMATCH {total} != {want}. NOT marking done")
+            bad.append(s)
             continue
         dst.execute("INSERT INTO done VALUES (?)", [s])
         log(f"  pfp {s}: {total} frames in {time.time()-t0:.0f}s")
     src.close(); dst.close()
+    if bad:
+        log(f"pfp_c.duckdb INCOMPLETE for {', '.join(bad)}; not swapping it in")
+        return False
     log("pfp_c.duckdb complete")
+    return True
 
 
 def swap_in(name):
@@ -229,11 +245,11 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     log("compacting spectrum.duckdb ...")
-    compact_spectrum()
+    ok = {"spectrum": compact_spectrum()}
     log("compacting psd.duckdb ...")
-    compact_psd()
+    ok["psd"] = compact_psd()
     log("compacting pfp.duckdb (the big one) ...")
-    compact_pfp()
+    ok["pfp"] = compact_pfp()
     for f in ("spectrum_c.duckdb", "psd_c.duckdb", "pfp_c.duckdb"):
         p = os.path.join(ROOT, f)      # the compacted DBs land beside serve.py
         if os.path.exists(p):
@@ -242,7 +258,8 @@ if __name__ == "__main__":
         log("--no-swap: rename *_c.duckdb yourself before serve.py will see them")
     else:
         log("swapping compacted files into place ...")
-        swapped = [n for n in ("spectrum", "psd", "pfp") if swap_in(n)]
+        # Only a verified-complete build file replaces a live database.
+        swapped = [n for n in ("spectrum", "psd", "pfp") if ok[n] and swap_in(n)]
         if not swapped:
             log("  nothing to swap")
     log("DONE ALL")

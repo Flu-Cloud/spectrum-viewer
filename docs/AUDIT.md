@@ -7,7 +7,10 @@
 > column count), and the Windows-only parts of P6. Regression cover lives in
 > `examples/test_fetch.py` and `examples/test_ingest.py`.
 > Also closed: F8 and D1-D2, by `atlas.py` (setup / get / status / serve),
-> `datasets.json` and `examples/test_atlas.py`. Still open: D3, the conda
+> `datasets.json` and `examples/test_atlas.py`. A later cross-check pass fixed
+> seven more URL-paste forms, an unguarded swap of an incomplete compaction, an
+> IQ ingest that exited 0 after ingesting nothing, and single-file targets. 86
+> checks now run across four suites. Still open: D3, the conda
 > `environment.yml` and bootstrap scripts, described in
 > [MASTER_PROMPT.md](MASTER_PROMPT.md).
 
