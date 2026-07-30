@@ -302,6 +302,46 @@ def main():
         res = json.loads(line[6:]) if line else {}
         check("a null-range meta row is not advertised as a layer",
               res.get("psd_meta", {}).get("has") is False, str(res.get("psd_meta")))
+
+        # ---- the zero-download demo builds every layer ----
+        # serve.py tells anyone without CBRS databases to run make_sample.py.
+        # That script built only iq.duckdb for most of its life, so following
+        # the advice left the message on screen and the sensor dropdown empty.
+        demo = os.path.join(tmp, "demo-dbs")
+        os.makedirs(demo)
+        denv = {"ATLAS_DB_DIR": demo,
+                "SPECTRUM_DB": os.path.join(demo, "spectrum.duckdb"),
+                "PSD_DB": os.path.join(demo, "psd.duckdb"),
+                "PFP_DB": os.path.join(demo, "pfp.duckdb"),
+                "IQ_DB": os.path.join(demo, "iq.duckdb")}
+        rc, out = run([sys.executable, os.path.join(HERE, "make_sample.py")], denv)
+        made = [n for n in ("iq.duckdb", "spectrum.duckdb", "psd.duckdb",
+                            "pfp.duckdb")
+                if os.path.exists(os.path.join(demo, n))]
+        check("make_sample.py builds all four layers, not just the IQ one",
+              rc == 0 and len(made) == 4, ", ".join(made) or "none")
+
+        env3 = {**denv, "ATLAS_ROOT": ROOT, "SENSOR": "DEMO-Directional"}
+        rc, out = run([sys.executable, os.path.join(tmp, "probe.py")], env3)
+        line = next((l for l in out.splitlines() if l.startswith("PROBE ")), None)
+        res = json.loads(line[6:]) if line else {}
+        check("the demo leaves serve.py with CBRS enabled, not disabled",
+              "not found -- CBRS monitoring disabled" not in out
+              and res.get("meta_sensors", 0) == 2,
+              f"{res.get('meta_sensors')} sensor(s)")
+        check("the demo's PSD and PFP layers both render",
+              res.get("psd_meta", {}).get("has") is True
+              and res.get("pfp_meta", {}).get("has") is True
+              and res.get("psd_layer", [0])[0] == 200
+              and res.get("pfp_frame", [0])[0] == 200,
+              f"psd={res.get('psd_layer')} pfp={res.get('pfp_frame')}")
+
+        # Rebuilding on top of real CBRS data would delete spectrum.duckdb and
+        # merge demo sensors into psd/pfp, so it has to refuse by default.
+        rc, out = run([sys.executable, os.path.join(HERE, "make_sample.py"),
+                       "--cbrs"], denv)
+        check("a second run refuses to overwrite existing CBRS databases",
+              rc != 0 and "Not overwriting them" in out and "--force" in out)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
