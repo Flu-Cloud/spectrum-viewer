@@ -1085,8 +1085,14 @@ def cmd_doctor(args):
         print("  [ -- ] would build the synthetic demo")
     else:
         print("  building the synthetic demo so there is something to look at ...")
+        # --iq, because the only file this section checked before deciding to
+        # write is iq.duckdb. make_sample.py also builds the three CBRS
+        # databases, and creating those here would put demo sensors next to
+        # real data -- or on top of a legacy database still waiting to be
+        # adopted -- on the strength of a check that never looked at them.
         rc = subprocess.run([sys.executable,
-                             os.path.join(HERE, "examples", "make_sample.py")],
+                             os.path.join(HERE, "examples", "make_sample.py"),
+                             "--iq"],
                             cwd=HERE, capture_output=True, text=True)
         if rc.returncode == 0:
             r.ok("demo capture built")

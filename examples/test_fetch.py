@@ -26,11 +26,13 @@ import json
 import math
 import os
 import shutil
+import ssl
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -544,6 +546,53 @@ def main():
               rc == 1 and "Traceback" not in out
               and ("cannot resolve" in out or "cannot reach" in out),
               out.strip().splitlines()[-1] if out else "")
+
+        # ---- 3. TLS failures: permanent, and told apart ----
+        # A rejected certificate used to be classed transient (ssl.SSLError
+        # inherits OSError), so every one burned the full ladder -- three
+        # retries across three header profiles -- and then blamed a proxy
+        # whatever the actual reason was. Both halves are checked here: that
+        # it is not retried, and that the three verification failures give
+        # three different answers, since the fix for each is different.
+        def tls(msg, verify=None):
+            e = ssl.SSLCertVerificationError(1, msg)
+            e.reason = "CERTIFICATE_VERIFY_FAILED"
+            if verify:
+                e.verify_message = verify
+            return urllib.error.URLError(e)
+
+        expired = tls("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify "
+                      "failed: certificate has expired (_ssl.c:1081)",
+                      "certificate has expired")
+        selfsigned = tls("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify "
+                         "failed: self signed certificate in certificate chain",
+                         "self signed certificate in certificate chain")
+        mismatch = tls("hostname 'a' doesn't match 'b'", "Hostname mismatch")
+
+        check("a rejected certificate is never retried",
+              not any(fetch._is_transient(e)
+                      for e in (expired, selfsigned, mismatch)))
+        check("a dropped connection still is retried",
+              fetch._is_transient(urllib.error.URLError(
+                  ConnectionResetError("reset"))))
+
+        # "certifi" is a substring of "certificate", so the marker for the
+        # expired branch has to be the whole pip command.
+        UPGRADE = "upgrade certifi"
+        url = "https://data.nist.gov/od/ds/mds2-3177/x.csv"
+        msg = str(fetch.net_error(url, expired))
+        check("an expired certificate points at the local CA bundle",
+              UPGRADE in msg and "data.nist.gov" in msg
+              and "SSL_CERT_FILE" not in msg,
+              msg.splitlines()[1].strip()[:64])
+        msg = str(fetch.net_error(url, selfsigned))
+        check("a self-signed chain points at the proxy instead",
+              "SSL_CERT_FILE" in msg and UPGRADE not in msg,
+              msg.splitlines()[1].strip()[:64])
+        msg = str(fetch.net_error(url, mismatch))
+        check("a hostname mismatch says the certificate is for another host",
+              "not valid for data.nist.gov" in msg and UPGRADE not in msg,
+              msg.splitlines()[1].strip()[:64])
     finally:
         srv.shutdown()
         shutil.rmtree(tmp, ignore_errors=True)

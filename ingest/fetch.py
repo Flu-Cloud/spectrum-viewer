@@ -243,18 +243,75 @@ def _proxy_hint():
             "set HTTPS_PROXY before running this.")
 
 
+def _tls_error(exc):
+    """The ssl.SSLError inside exc, if this failure is a TLS one at all.
+
+    urlopen wraps it in a URLError, so the interesting exception is one level
+    down from what the caller catches.
+    """
+    for e in (getattr(exc, "reason", None), exc):
+        if isinstance(e, ssl.SSLError):
+            return e
+    return None
+
+
+def _cert_hint(host, err):
+    """Which of the three TLS failures this is, and the fix for that one.
+
+    Verification failures are not interchangeable and the wrong guess sends
+    people the wrong way. An expired certificate is nearly always the local
+    trust store rather than the server: a public host's certificate is renewed
+    long before it lapses, so a client alone in seeing it expired is a client
+    carrying a CA bundle old enough that the issuer it pins has itself run out.
+    """
+    # Which of these carries the detail varies by Python version and by how
+    # the error was wrapped: .reason is the bare code, .verify_message the
+    # human half, str() usually both. Read all three rather than pick one.
+    text = " ".join(str(v) for v in (err, getattr(err, "reason", ""),
+                                     getattr(err, "verify_message", "")) if v)
+    if "CERTIFICATE_VERIFY_FAILED" not in text.upper():
+        return ("  The handshake itself failed, before any certificate check."
+                + _proxy_hint())
+    low = text.lower()
+    if "expired" in low:
+        return (
+            f"  Almost certainly this machine's CA bundle, not {host}: a public\n"
+            "  host renews well before expiry, so a client alone in seeing it "
+            "expired\n"
+            "  is usually carrying roots old enough to have lapsed themselves.\n"
+            "  Update them:\n"
+            "      python -m pip install --upgrade certifi\n"
+            "  On macOS also run the bundled "
+            "\"Install Certificates.command\" for your\n"
+            "  Python. Then check what the host is actually serving:\n"
+            f"      python -c \"import ssl,socket;"
+            f"print(ssl.create_default_context().wrap_socket("
+            f"socket.create_connection(('{host}',443)),"
+            f"server_hostname='{host}').getpeercert()['notAfter'])\"\n"
+            "  If that prints a future date, the bundle was the problem and the "
+            "download\n  will now work." + _proxy_hint())
+    if "self signed" in low or "self-signed" in low:
+        return ("  A proxy is intercepting HTTPS with its own certificate. "
+                "Point\n  SSL_CERT_FILE at your organisation's CA bundle rather "
+                "than disabling\n  verification." + _proxy_hint())
+    if "hostname mismatch" in low or "doesn't match" in low:
+        return (f"  The certificate served is not valid for {host}. Check the "
+                "URL, and\n  whether something is redirecting the host."
+                + _proxy_hint())
+    return ("  Point SSL_CERT_FILE at the CA bundle this network needs rather "
+            "than\n  disabling verification." + _proxy_hint())
+
+
 def net_error(url, exc):
     """Turn any network exception into one sentence a human can act on."""
     host = urllib.parse.urlsplit(url).hostname or url
     if isinstance(exc, urllib.error.HTTPError):
         return FetchError(f"{host} returned HTTP {exc.code} {exc.reason} for {url}")
     cause = getattr(exc, "reason", exc)
-    if isinstance(cause, ssl.SSLError) or isinstance(exc, ssl.SSLError):
-        return FetchError(
-            f"TLS handshake with {host} failed: {cause}\n"
-            "  This is usually a proxy intercepting HTTPS with its own "
-            "certificate. Point SSL_CERT_FILE at your organisation's CA "
-            "bundle rather than disabling verification." + _proxy_hint())
+    tls = _tls_error(exc)
+    if tls is not None:
+        return FetchError(f"TLS verification against {host} failed: {cause}\n"
+                          + _cert_hint(host, tls))
     if isinstance(cause, socket.gaierror):
         return FetchError(f"cannot resolve {host}: {cause}. Check the URL "
                           "spelling and that you are online.")
@@ -264,6 +321,13 @@ def net_error(url, exc):
 def _is_transient(exc):
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in RETRY_CODES
+    # A rejected certificate is a decision, not a hiccup: the same bundle will
+    # reject it again every time. ssl.SSLError inherits OSError, so without
+    # this it matches TRANSIENT below and burns the whole retry ladder --
+    # nine handshakes and ~20s -- before reporting what was already known on
+    # the first. Checked ahead of TRANSIENT for exactly that reason.
+    if _tls_error(exc) is not None:
+        return False
     return isinstance(exc, TRANSIENT)
 
 
