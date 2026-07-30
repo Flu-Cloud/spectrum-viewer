@@ -88,25 +88,10 @@ def wait_up(port, proc, timeout=60):
 
 
 def build(tmp):
-    """A db dir with all four layers, from the offline fixtures."""
-    import test_atlas as TA
-    import test_ingest as TI
-    data = os.path.join(tmp, "data")
-    TI.make_data(data)
-    TA.make_iq(os.path.join(data, "iq", "run1"), n=1024 * 256)
-    dbs = os.path.join(tmp, "dbs")
-    os.makedirs(dbs)
-    env = {**os.environ, "ATLAS_DB_DIR": dbs,
-           "SPECTRUM_DB": os.path.join(dbs, "spectrum.duckdb"),
-           "PSD_DB": os.path.join(dbs, "psd.duckdb"),
-           "PFP_DB": os.path.join(dbs, "pfp.duckdb"),
-           "IQ_DB": os.path.join(dbs, "iq.duckdb")}
-    p = subprocess.run([sys.executable, os.path.join(ROOT, "atlas.py"),
-                        "get", data], env=env, cwd=ROOT, capture_output=True,
-                       text=True, timeout=1800)
-    if p.returncode != 0:
-        print(p.stdout + p.stderr)
-        raise SystemExit("could not build the fixture databases")
+    """A db dir with all four layers. A longer capture than test_serve.py uses,
+    so there is enough of a time axis to zoom into with the wheel."""
+    import test_serve as TS
+    dbs, _sensor, env = TS.build(tmp, iq_samples=1024 * 256)
     return dbs, env
 
 

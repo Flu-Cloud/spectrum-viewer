@@ -42,13 +42,17 @@ def check(name, ok, detail=""):
     return ok
 
 
-def build(tmp):
-    """Make one db dir holding spectrum, psd, pfp and iq. -> (dbs, sensor)."""
+def build(tmp, iq_samples=1024 * 64):
+    """One db dir holding all four layers. -> (dbs, sensor, env).
+
+    Shared with test_viewer.py, which needs the same four databases and a longer
+    capture: two copies of this drifted apart within a day of existing.
+    """
     data = os.path.join(tmp, "data")
     TI.make_data(data)
-    TA.make_iq(os.path.join(data, "iq", "run1"))
+    TA.make_iq(os.path.join(data, "iq", "run1"), n=iq_samples)
     dbs = os.path.join(tmp, "dbs")
-    os.makedirs(dbs)
+    os.makedirs(dbs, exist_ok=True)
     env = {**os.environ, "ATLAS_DB_DIR": dbs,
            "SPECTRUM_DB": os.path.join(dbs, "spectrum.duckdb"),
            "PSD_DB": os.path.join(dbs, "psd.duckdb"),
@@ -60,7 +64,7 @@ def build(tmp):
     if p.returncode != 0:
         print(p.stdout + p.stderr)
         raise SystemExit("could not build the fixture databases")
-    return dbs, TI.SENSOR
+    return dbs, TI.SENSOR, env
 
 
 def tile_ok(r):
@@ -99,7 +103,7 @@ def main():
     print("serve.py endpoint and control test\n")
     tmp = tempfile.mkdtemp(prefix="atlas-serve-test-")
     try:
-        dbs, sensor = build(tmp)
+        dbs, sensor, _env = build(tmp)
         # serve.py resolves its databases at import time, so the environment has
         # to be right before the import, not after.
         os.environ.update({
