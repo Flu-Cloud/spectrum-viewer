@@ -124,8 +124,108 @@ def main():
               and "psd_ingest.py" not in out)
 
         rc, out = run(["get", pre], dbs2)
-        check("re-installing a prebuilt database keeps the old one as .bak",
-              rc == 0 and os.path.exists(os.path.join(dbs2, "psd.duckdb.bak")))
+        check("re-loading the same prebuilt database adds nothing twice",
+              rc == 0 and "nothing new" in out
+              and not os.path.exists(os.path.join(dbs2, "psd.duckdb.bak")),
+              next((l.strip() for l in out.splitlines()
+                    if "nothing new" in l or "installed" in l), ""))
+
+        # ---- databases you already have, loaded without losing any ----
+        # Two IQ databases holding different captures. Copying the second over
+        # the first is how one of them used to disappear silently.
+        def iq_db(path, cid):
+            c = _dd.connect(path)
+            c.execute("""CREATE TABLE iq_meta (
+                id VARCHAR PRIMARY KEY, dataset VARCHAR, name VARCHAR,
+                path VARCHAR, fc DOUBLE, fs DOUBLE, duration DOUBLE,
+                n_samples BIGINT, nfft INT, nfreq INT, hop INT, nlevels INT,
+                qmin DOUBLE, qmax DOUBLE, vmin DOUBLE, vmax DOUBLE)""")
+            c.execute("CREATE TABLE iq_stft (id VARCHAR, level INT, "
+                      "col0 BIGINT, ncols INT, chunk BLOB)")
+            c.execute("INSERT INTO iq_meta VALUES (?,'ds',?,'/p',2.4e9,2e6,1.0,"
+                      "2048000,1024,1024,1024,1,-120,-20,-110,-30)", [cid, cid])
+            c.execute("INSERT INTO iq_stft VALUES (?,0,0,4,?)",
+                      [cid, bytes(4 * 1024)])
+            c.close()
+
+        import duckdb as _dd
+        two = os.path.join(tmp, "twodbs")
+        os.makedirs(two)
+        iq_db(os.path.join(two, "alpha.duckdb"), "capture-A")
+        iq_db(os.path.join(two, "beta.duckdb"), "capture-B")
+        dbs9 = os.path.join(tmp, "dbs9")
+        os.makedirs(dbs9)
+        rc, out = run(["get", two], dbs9)
+
+        def captures(path):
+            c = _dd.connect(path, read_only=True)
+            got = [r[0] for r in c.execute(
+                "SELECT id FROM iq_meta ORDER BY 1").fetchall()]
+            n = c.execute("SELECT count(*) FROM iq_stft").fetchone()[0]
+            c.close()
+            return got, n
+
+        got, nstft = captures(os.path.join(dbs9, "iq.duckdb"))
+        check("two databases of one kind are merged, not silently overwritten",
+              rc == 0 and got == ["capture-A", "capture-B"] and nstft == 2,
+              f"{got}, {nstft} stft row(s)")
+        check("the plan says merge rather than claiming two installs",
+              out.count("merge") >= 1 and "merged 1 new item(s)" in out,
+              next((l.strip() for l in out.splitlines() if "merged" in l), ""))
+
+        rc, out = run(["get", two], dbs9)
+        got, nstft = captures(os.path.join(dbs9, "iq.duckdb"))
+        check("merging is idempotent: a second run duplicates nothing",
+              rc == 0 and got == ["capture-A", "capture-B"] and nstft == 2
+              and "nothing new" in out, f"{got}, {nstft} stft row(s)")
+
+        # A third database merges into the library that is already live.
+        more = os.path.join(tmp, "onemore")
+        os.makedirs(more)
+        iq_db(os.path.join(more, "gamma.duckdb"), "capture-C")
+        rc, out = run(["get", more], dbs9)
+        got, _n = captures(os.path.join(dbs9, "iq.duckdb"))
+        check("a later database adds to the live library instead of replacing it",
+              rc == 0 and got == ["capture-A", "capture-B", "capture-C"],
+              str(got))
+
+        # doctor --adopt goes through the same path, so a stray database found
+        # beside serve.py is merged in rather than replacing what is there.
+        shutil.copy2(os.path.join(more, "gamma.duckdb"),
+                     os.path.join(dbs9, "delta.duckdb"))
+        iq_db(os.path.join(tmp, "eps.duckdb"), "capture-E")
+        shutil.copy2(os.path.join(tmp, "eps.duckdb"),
+                     os.path.join(dbs9, "eps.duckdb"))
+        rc, out = run(["doctor", "--adopt"], dbs9)
+        got, _n = captures(os.path.join(dbs9, "iq.duckdb"))
+        check("doctor --adopt merges strays into the existing library",
+              "capture-E" in got and "capture-A" in got,
+              str(got))
+
+        # spectrum cannot be merged (its pyramid is an aggregate), so a second
+        # one must be refused out loud rather than replacing the first.
+        def spec_db(path, sensor):
+            c = _dd.connect(path)
+            c.execute("CREATE TABLE raw (sensor VARCHAR, freq DOUBLE, "
+                      "t DOUBLE, mx DOUBLE, md DOUBLE, mn DOUBLE)")
+            c.executemany("INSERT INTO raw VALUES (?,?,?,?,?,?)",
+                          [(sensor, 3550.0, 1.7e9 + i, -70.0, -80.0, -85.0)
+                           for i in range(4)])
+            c.execute("CREATE TABLE meta AS SELECT sensor, min(t) AS t_min, "
+                      "max(t) AS t_max, count(*) AS n FROM raw GROUP BY sensor")
+            c.close()
+
+        twospec = os.path.join(tmp, "twospec")
+        os.makedirs(twospec)
+        spec_db(os.path.join(twospec, "one.duckdb"), "S-ONE")
+        spec_db(os.path.join(twospec, "two.duckdb"), "S-TWO")
+        dbs10 = os.path.join(tmp, "dbs10")
+        os.makedirs(dbs10)
+        rc, out = run(["get", twospec], dbs10)
+        check("an unmergeable second database is refused loudly, not applied",
+              rc == 0 and "NOT loaded" in out and "cannot be merged" in out
+              and "atlas.py get" in out,
+              next((l.strip() for l in out.splitlines() if "NOT loaded" in l), ""))
 
         empty = os.path.join(tmp, "empty")
         os.makedirs(empty)
@@ -425,6 +525,65 @@ def main():
         rc, out = run(["get", foreign], dbs7)
         check("a foreign database is refused even when named like ours",
               rc != 0 and "Nothing recognisable" in out)
+
+        # ---- download a record and ingest it, in one command ----
+        # Everything above hands `get` bytes that were already on disk. This is
+        # the path that was broken: resolve a record, download it, work out
+        # which ingest it needs, run it, and end with something renderable.
+        # Both records are served by the fixture in test_fetch.py; mds2-waf
+        # additionally 403s any client that does not look like a browser, which
+        # is what data.nist.gov does and what used to stop this dead.
+        import test_fetch as TF                              # noqa: E402
+        srv, port = TF.serve_fixture()
+        try:
+            pdr = {"ATLAS_PDR_BASE": f"http://127.0.0.1:{port}/rmm/records/{{}}"}
+            for rid, what in (("mds2-test", "a record"),
+                              ("mds2-waf", "a record behind bot protection")):
+                d = os.path.join(tmp, "dl-" + rid)
+                os.makedirs(d)
+                dl = os.path.join(d, "files")
+                rc, out = run(["get", rid, "--dest", dl, "--filter",
+                               "1.4MHz/config_0", "--allow-http"], d, pdr)
+                iq = os.path.join(d, "iq.duckdb")
+                check(f"get downloads and ingests {what} in one command",
+                      rc == 0 and os.path.exists(iq)
+                      and "2 downloaded" in out and "1 ingested" in out,
+                      next((l.strip() for l in out.splitlines()
+                            if "ingested" in l or "FAILED" in l), out[-200:]))
+                check(f"the downloaded files really are on disk for {rid}",
+                      os.path.exists(os.path.join(
+                          dl, "1.4MHz", "config_0", "capture.sigmf-data")))
+                # The database has to be usable, not merely present: verify.py
+                # renders a tile out of it through the real Flask app.
+                v = subprocess.run(
+                    [sys.executable, os.path.join(HERE, "verify.py")],
+                    env={**os.environ, "IQ_DB": iq, "ATLAS_DB_DIR": d,
+                         "SPECTRUM_DB": os.path.join(d, "spectrum.duckdb"),
+                         "PSD_DB": os.path.join(d, "psd.duckdb"),
+                         "PFP_DB": os.path.join(d, "pfp.duckdb")},
+                    cwd=ROOT, capture_output=True, text=True, timeout=600)
+                vo = v.stdout + v.stderr
+                check(f"the capture downloaded from {rid} renders a tile",
+                      v.returncode == 0 and "RESULT: PASS" in vo
+                      and "renders a spectrogram tile" in vo,
+                      next((l.strip() for l in vo.splitlines()
+                            if "iq_layer" in l), vo.strip()[-160:]))
+
+            # A record that cannot be resolved must fail loudly and say what to
+            # do, and must not leave a half-built database behind.
+            d = os.path.join(tmp, "dl-blocked")
+            os.makedirs(d)
+            rc, out = run(["get", "mds2-waf", "--dest", os.path.join(d, "f"),
+                           "--allow-http"], d,
+                          {**pdr, "ATLAS_USER_AGENT": "some-scraper/1.0"})
+            check("a download that is refused reports it and ingests nothing",
+                  rc != 0 and "nothing was ingested" in out
+                  and "python atlas.py get" in out and "Traceback" not in out
+                  and not [f for f in os.listdir(d) if f.endswith(".duckdb")],
+                  next((l.strip() for l in out.splitlines()
+                        if "403" in l), out.strip()[-160:]))
+        finally:
+            srv.shutdown()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

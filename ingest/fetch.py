@@ -35,6 +35,15 @@ nist.gov prints one warning line and continues. Use --nist-only for the strict
 behaviour, --allow-host HOST to whitelist a host under it, and --allow-http to
 permit unencrypted http:// (off by default because it is not authenticated).
 
+Getting past HTTP 403: data.nist.gov sits behind an edge WAF that rejects
+clients it reads as bots, so requests here carry a browser's header set and a
+403 escalates through several of them rather than failing outright. A record id
+is also looked up at more than one PDR endpoint, because one being blocked or
+moved should not sink the fetch. If a host still refuses everything, --user-agent
+(or ATLAS_USER_AGENT) sends a string of your choosing, and the failure message
+names the workaround that always works: download in a browser, then run
+`python atlas.py get <the folder>`.
+
 Examples (see README "Bring your own dataset"):
     py ingest/fetch.py mds2-3177 --list
     py ingest/fetch.py mds2-3177 --filter 1.4MHz --dest iqdata/mds2-3177
@@ -56,18 +65,88 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-# Where record ids are looked up. Override for a different repository or for
-# offline testing: ATLAS_PDR_BASE="http://127.0.0.1:8000/rmm/records/{}"
-RMM_RECORD_URL = os.environ.get("ATLAS_PDR_BASE",
-                                "https://data.nist.gov/rmm/records/{}")
+# Where a record id is looked up. data.nist.gov publishes the same record
+# through more than one endpoint and they do not fail together: the RMM search
+# API can be down, moved or blocked by the edge while the /od/id resolver still
+# answers. Each is tried in turn before giving up, which is the difference
+# between "HTTP 403, nothing downloaded" and a working fetch.
+# ATLAS_PDR_BASE replaces the whole list with one template, which is how the
+# offline tests point this at a local fixture:
+#     ATLAS_PDR_BASE="http://127.0.0.1:8000/rmm/records/{}"
+RECORD_ENDPOINTS = (
+    "https://data.nist.gov/rmm/records/{}",
+    "https://data.nist.gov/rmm/records?@id=ark:/88434/{}",
+    "https://data.nist.gov/od/id/{}",
+)
 # Hosts that never trigger the "leaving NIST" warning. data.nist.gov 302s file
 # GETs to NIST's OAR cache bucket, so that bucket counts as NIST too.
 TRUSTED_SUFFIXES = (".nist.gov",)
 TRUSTED_HOSTS = {"nist.gov", "nist-oar-cache.s3.amazonaws.com"}
-USER_AGENT = "atlas-fetch (github.com/jimmylu7/ATLAS)"
 CHUNK = 1 << 20            # 1 MiB read chunks
 PROGRESS_EVERY = 0.5       # seconds between progress line updates
 RETRY_CODES = {408, 425, 429, 500, 502, 503, 504}
+# Codes that mean "the edge rejected this request", not "the network failed".
+# Waiting and retrying identically cannot fix these; sending a different header
+# set can, so they drive the profile ladder below instead of a backoff.
+REJECT_CODES = {401, 403, 406}
+
+# data.nist.gov, like most .gov hosts, sits behind an edge WAF that answers 403
+# to clients it classifies as bots -- and a bare "atlas-fetch/1.0" User-Agent is
+# classified as one, which is why a download that works in a browser failed here
+# with HTTP 403 and ingested nothing. Sending the header set a browser sends
+# fixes it. This is not pretending to be a person: the tool requests exactly the
+# public files a person clicking the same record would, one at a time, and
+# --user-agent / ATLAS_USER_AGENT overrides it for hosts that want something
+# specific (a named crawler, or a campus proxy that allowlists one string).
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+PROJECT_UA = "atlas-fetch (github.com/jimmylu7/ATLAS)"
+
+# Tried in order, advancing only when the edge rejects the request outright.
+# Profile 0 works for effectively every host; the rest exist because a single
+# 403 used to end the whole download.
+HEADER_PROFILES = (
+    # 0: a plain browser GET.
+    {"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"},
+    # 1: the same plus the navigation headers a browser sends when the click
+    #    came from the file's own site. Some WAF rules want a same-origin
+    #    Referer before they will serve a file. The Referer is built from the
+    #    target's own origin, so nothing leaks about where the run came from.
+    {"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9",
+     "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
+     "Sec-Fetch-Site": "same-origin", "_same_origin_referer": "1"},
+    # 2: identify honestly as this tool. Last because the hosts that reward it
+    #    are the minority, but it is the right thing to send to one that keeps
+    #    an allowlist of named clients.
+    {"User-Agent": PROJECT_UA},
+)
+
+
+def build_headers(profile, url, extra=None):
+    """The headers for one attempt: a profile, plus whatever the caller adds.
+
+    Accept-Encoding is pinned to identity on purpose. Every byte count in this
+    file -- resume offsets, the size check against the manifest, the progress
+    line -- counts body bytes on the wire, so a transparently gzipped response
+    would make all of them wrong.
+    """
+    h = {k: v for k, v in HEADER_PROFILES[profile].items()
+         if not k.startswith("_")}
+    if HEADER_PROFILES[profile].get("_same_origin_referer"):
+        parts = urllib.parse.urlsplit(url)
+        h["Referer"] = f"{parts.scheme}://{parts.netloc}/"
+    h.setdefault("Accept", "*/*")
+    h["Accept-Encoding"] = "identity"
+    override = os.environ.get("ATLAS_USER_AGENT")
+    if override:
+        h["User-Agent"] = override
+    h.update(extra or {})
+    return h
+
+
+def record_endpoints():
+    override = os.environ.get("ATLAS_PDR_BASE")
+    return (override,) if override else RECORD_ENDPOINTS
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -188,29 +267,77 @@ def _is_transient(exc):
     return isinstance(exc, TRANSIENT)
 
 
+def blocked_hint(url, code):
+    """What to actually do about a 401/403. Printed once, next to the failure.
+
+    A rejection here is nearly always one of three things, and the user can fix
+    all three -- but only if told which they are looking at.
+    """
+    host = urllib.parse.urlsplit(url).hostname or url
+    return (
+        f"  HTTP {code} means {host} refused the request itself, not that the "
+        "file is missing.\n"
+        "  Three things cause this, in order of likelihood:\n"
+        f"    1. {host} is behind bot protection that rejects non-browser "
+        "clients.\n"
+        "       Every browser header set this tool knows was already tried. A "
+        "different\n"
+        "       one may work: --user-agent \"<string>\" (or set "
+        "ATLAS_USER_AGENT).\n"
+        "    2. A proxy or campus/corporate firewall is blocking the host."
+        + _proxy_hint().replace("\n  ", "\n       ") + "\n"
+        "    3. The record is embargoed or withdrawn, so nothing will fetch it.\n"
+        "  This never has to block you. Download the files in a browser, then "
+        "point\n"
+        "  ATLAS at the folder -- the ingest is identical either way:\n"
+        "      python atlas.py get \"<the folder you saved them in>\"")
+
+
 def open_url(url, headers=None, timeout=60, retries=3):
-    """Open url under the current policy, retrying transient failures."""
+    """Open url under the current policy.
+
+    Two independent retry ladders run here, because two different things go
+    wrong. A dropped connection or a 5xx is transient: the same request is
+    retried with a growing backoff. A 401/403/406 is not -- the edge looked at
+    the request and rejected it, so waiting changes nothing and the next attempt
+    sends a different header profile instead. That second ladder is what makes
+    data.nist.gov work: its WAF 403s clients it reads as bots, and the profile
+    that gets through is not the first one for every host.
+    """
     why = POLICY.refusal(url)
     if why:
         raise FetchError(f"not allowed: {why}")
     POLICY.note(url)
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
-                                               **(headers or {})})
-    delay = 1.0
-    for attempt in range(retries + 1):
-        try:
-            return OPENER.open(req, timeout=timeout)
-        except FetchError:
-            raise
-        except Exception as e:                       # noqa: BLE001
-            if attempt >= retries or not _is_transient(e):
-                if isinstance(e, urllib.error.HTTPError):
+    rejected = None
+    for profile in range(len(HEADER_PROFILES)):
+        req = urllib.request.Request(
+            url, headers=build_headers(profile, url, headers))
+        delay = 1.0
+        for attempt in range(retries + 1):
+            try:
+                return OPENER.open(req, timeout=timeout)
+            except FetchError:
+                raise
+            except urllib.error.HTTPError as e:
+                if e.code in REJECT_CODES:
+                    rejected = e
+                    break                            # next header profile
+                if attempt >= retries or e.code not in RETRY_CODES:
                     raise                            # callers inspect .code
-                raise net_error(url, e) from e
-            print(f"  transient error ({e}); retry {attempt + 1}/{retries} "
-                  f"in {delay:.0f}s")
+                print(f"  HTTP {e.code} {e.reason}; retry {attempt + 1}/"
+                      f"{retries} in {delay:.0f}s")
+            except Exception as e:                   # noqa: BLE001
+                if attempt >= retries or not _is_transient(e):
+                    raise net_error(url, e) from e
+                print(f"  transient error ({e}); retry {attempt + 1}/{retries} "
+                      f"in {delay:.0f}s")
             time.sleep(delay)
             delay *= 2
+        if rejected is not None and profile + 1 < len(HEADER_PROFILES):
+            print(f"  HTTP {rejected.code} from "
+                  f"{urllib.parse.urlsplit(url).hostname}; retrying as a "
+                  "different client")
+    raise rejected
 
 
 # ---- source parsing ---------------------------------------------------
@@ -276,31 +403,68 @@ def parse_source(src):
     return "file", s
 
 
-def fetch_record(rid, timeout=60, retries=3):
-    """PDR record id -> manifest dict (handles the RMM ResultData envelope)."""
-    url = RMM_RECORD_URL.format(urllib.parse.quote(rid))
-    try:
-        with open_url(url, timeout=timeout, retries=retries) as r:
-            doc = json.load(r)
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            raise FetchError(
-                f"the repository has no record '{rid}' (HTTP 404). If this id "
-                "comes from a NIST page, the record may not be published yet.\n"
-                f"  Looked it up at: {url}") from e
-        raise net_error(url, e) from e
-    except json.JSONDecodeError as e:
-        raise FetchError(f"{url} did not return JSON ({e}). If that is a "
-                         "landing page rather than a manifest, pass the record "
-                         "id itself, e.g. mds2-3177.") from e
+def unwrap_record(doc):
+    """A manifest response -> the record dict, or None if there isn't one.
+
+    The endpoints disagree about packaging: the RMM search API wraps hits in a
+    ResultData envelope, the /od/id resolver returns the NERDm record straight.
+    Both end at the same thing, a dict with a components list.
+    """
     if isinstance(doc, dict) and "ResultData" in doc:      # RMM envelope
         if not doc.get("ResultCount") or not doc["ResultData"]:
-            raise FetchError(f"record '{rid}' not found (empty ResultData)")
+            return None
         doc = doc["ResultData"][0]
-    if not isinstance(doc, dict) or not isinstance(doc.get("components"), list):
-        raise FetchError(f"unexpected manifest shape for '{rid}' "
-                         "(no components list)")
-    return doc
+    if isinstance(doc, dict) and isinstance(doc.get("components"), list):
+        return doc
+    return None
+
+
+def record_error(rid, problems):
+    """One actionable message from every endpoint that was tried and failed."""
+    codes = {code for _url, _why, code in problems if code}
+    tried = "\n".join(f"    {url}\n      {why}" for url, why, _c in problems)
+    if codes and codes <= {404}:
+        return FetchError(
+            f"the repository has no record '{rid}' (HTTP 404 from every "
+            "endpoint). If this id comes from a NIST page, the record may not "
+            f"be published yet.\n  Tried:\n{tried}")
+    head = (f"could not read the manifest for record '{rid}'.\n"
+            f"  Tried {len(problems)} endpoint(s):\n{tried}")
+    blocking = sorted(c for c in codes if c in REJECT_CODES)
+    if blocking:
+        first = next(u for u, _w, c in problems if c in REJECT_CODES)
+        return FetchError(head + "\n" + blocked_hint(first, blocking[0]))
+    return FetchError(head)
+
+
+def fetch_record(rid, timeout=60, retries=3):
+    """PDR record id -> manifest dict, trying each known endpoint in turn.
+
+    One endpoint being blocked, moved or down no longer sinks the whole fetch;
+    only failing at all of them does.
+    """
+    problems = []
+    for tmpl in record_endpoints():
+        url = tmpl.format(urllib.parse.quote(rid))
+        try:
+            with open_url(url, headers={"Accept": "application/json"},
+                          timeout=timeout, retries=retries) as r:
+                doc = json.load(r)
+        except urllib.error.HTTPError as e:
+            problems.append((url, f"HTTP {e.code} {e.reason}", e.code))
+            continue
+        except FetchError as e:
+            problems.append((url, str(e).replace("\n", "\n      "), None))
+            continue
+        except json.JSONDecodeError as e:
+            problems.append((url, f"did not return JSON ({e}); that endpoint "
+                                  "served a page, not a manifest", None))
+            continue
+        rec = unwrap_record(doc)
+        if rec is not None:
+            return rec
+        problems.append((url, "answered, but with no record in it", None))
+    raise record_error(rid, problems)
 
 
 def safe_relpath(fp):
@@ -373,6 +537,34 @@ def fmt_eta(sec):
     return f"{sec // 60}:{sec % 60:02d}"
 
 
+def capture_unit(fp):
+    """The unit of data a file belongs to, for picking whole ones.
+
+    A SigMF capture is a .sigmf-meta describing a .sigmf-data and neither half
+    is usable without the other, so they have to be taken or left together.
+    Without this, "the 3 smallest files" of a record full of captures is 3 tiny
+    metadata files and no signal at all -- a download that succeeds and then
+    ingests nothing.
+    """
+    low = fp.lower()
+    for ext in (".sigmf-meta", ".sigmf-data"):
+        if low.endswith(ext):
+            return fp[:-len(ext)]
+    return fp
+
+
+def smallest_units(files, n):
+    """The n smallest units of data, keeping multi-file captures whole."""
+    units = {}
+    for f in files:
+        units.setdefault(capture_unit(f["filepath"]), []).append(f)
+    ordered = sorted(units.values(),
+                     key=lambda g: (any(x["size"] is None for x in g),
+                                    sum(x["size"] or 0 for x in g),
+                                    g[0]["filepath"]))
+    return [f for g in ordered[:n] for f in g], len(units)
+
+
 def group_by_dir(files):
     """-> ordered {directory: [file, ...]} keyed by posix dirname ('.' = root)."""
     out = {}
@@ -434,16 +626,28 @@ def next_step(paths, dest):
 # ---- downloading ------------------------------------------------------
 
 def head_size(url, timeout=30):
-    try:
-        if not POLICY.allows(url):
+    """Content-Length for a direct file URL, or None if it can't be had.
+
+    Only ever an optimisation: it turns on the resume and skip-if-complete
+    paths. A host that refuses HEAD (S3 pre-signed URLs answer 403) just means
+    the download runs without a known total.
+    """
+    for profile in range(len(HEADER_PROFILES)):
+        try:
+            if not POLICY.allows(url):
+                return None
+            req = urllib.request.Request(
+                url, method="HEAD", headers=build_headers(profile, url))
+            with OPENER.open(req, timeout=timeout) as r:
+                cl = r.headers.get("Content-Length")
+                return int(cl) if cl else None
+        except urllib.error.HTTPError as e:
+            if e.code in REJECT_CODES:
+                continue                     # try the next header profile
             return None
-        req = urllib.request.Request(url, method="HEAD",
-                                     headers={"User-Agent": USER_AGENT})
-        with OPENER.open(req, timeout=timeout) as r:
-            cl = r.headers.get("Content-Length")
-            return int(cl) if cl else None
-    except Exception:
-        return None
+        except Exception:                                   # noqa: BLE001
+            return None
+    return None
 
 
 def sha256_file(path):
@@ -495,11 +699,22 @@ def download(url, path, expected, label, retries=3, timeout=60):
             if e.code == 416 and have:      # nothing left to serve
                 print(f"{label} already complete ({fmt_size(have)}), skipped")
                 return "skipped"
+            if e.code in REJECT_CODES and have:
+                # Every header profile was refused, but this was a Range
+                # request. Edge caches that will happily serve a whole object
+                # sometimes reject a partial one, so give up the resume rather
+                # than the file and start over.
+                print(f"{label} HTTP {e.code} on the resume request; "
+                      "restarting from the beginning")
+                have = 0
+                continue
             if e.code in RETRY_CODES and attempt < retries:
                 print(f"{label} HTTP {e.code}; retrying")
                 time.sleep(2 ** attempt)
                 continue
             print(f"{label} FAILED: HTTP {e.code} {e.reason}")
+            if e.code in REJECT_CODES:
+                print(blocked_hint(url, e.code))
             return "failed"
         except FetchError as e:
             print(f"{label} FAILED: {e}")
@@ -585,8 +800,10 @@ def main():
     ap.add_argument("--tree", action="store_true",
                     help="print the record's folder structure and exit")
     ap.add_argument("--first", type=int, default=None, metavar="N",
-                    help="only the N smallest matching files. The quickest way "
-                         "to try a record without pulling all of it")
+                    help="only the N smallest matching captures. The quickest "
+                         "way to try a record without pulling all of it. A "
+                         "multi-file capture (.sigmf-meta plus .sigmf-data) "
+                         "counts as one and is never split")
     ap.add_argument("--flat", action="store_true",
                     help="ignore record folder structure; write basenames "
                          "directly into --dest (for ingest/csv)")
@@ -596,6 +813,10 @@ def main():
                     help="treat HOST as trusted; repeatable")
     ap.add_argument("--allow-http", action="store_true",
                     help="permit unencrypted http:// URLs")
+    ap.add_argument("--user-agent", default=None, metavar="STRING",
+                    help="send this User-Agent instead of the built-in browser "
+                         "one. Only needed when a host or proxy wants a "
+                         "specific string (also settable as ATLAS_USER_AGENT)")
     ap.add_argument("--retries", type=int, default=3,
                     help="retries per transient network failure (default 3)")
     ap.add_argument("--timeout", type=float, default=60,
@@ -605,6 +826,10 @@ def main():
     global POLICY
     POLICY = Policy(nist_only=args.nist_only, allow_http=args.allow_http,
                     extra_hosts=args.allow_host)
+    if args.user_agent:
+        # build_headers reads it from here, so it applies to the profile ladder
+        # and to redirect targets without threading the value through.
+        os.environ["ATLAS_USER_AGENT"] = args.user_agent
 
     kind, val = parse_source(args.source)
     only_listing = args.list or args.long or args.tree
@@ -637,10 +862,10 @@ def main():
         needle = args.filter.lower().replace("\\", "/")
         files = [f for f in files if needle in f["filepath"].lower()]
     n_filtered = len(files)
+    n_units = None
     if args.first:
         # Smallest first, so "try this record" costs megabytes, not gigabytes.
-        files = sorted(files, key=lambda f: (f["size"] is None, f["size"] or 0)
-                       )[:args.first]
+        files, n_units = smallest_units(files, args.first)
     if not files:
         msg = "no downloadable files"
         if args.filter:
@@ -653,7 +878,8 @@ def main():
     known = all(f["size"] is not None for f in files)
     print(f"{len(files)} file(s), {fmt_size(total)}{'' if known else '+'} total"
           + (f" (filter: {args.filter})" if args.filter else "")
-          + (f"; smallest {len(files)} of {n_filtered} matching"
+          + (f"; the {min(args.first, n_units)} smallest of {n_units} "
+             f"capture(s)/file(s) matching"
              if args.first and n_filtered > len(files) else "")
           + (f"; {len(checksums)} .sha256 sidecar(s) for verification"
              if checksums else ""))

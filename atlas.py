@@ -44,7 +44,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ING = os.path.join(HERE, "ingest")
 sys.path.insert(0, ING)
 
-DATASETS = os.path.join(HERE, "datasets.json")
+# Friendly dataset names. Overridable so you can keep your own list of records
+# outside the repo (and so the tests can point the menu at a local fixture).
+DATASETS = os.environ.get("ATLAS_DATASETS", os.path.join(HERE, "datasets.json"))
 DBS = ("spectrum", "psd", "pfp", "iq")
 IQ_EXT = (".sigmf-meta", ".tdms", ".npy")
 # Files that belong to a capture but are not the thing you point an
@@ -78,6 +80,15 @@ def db_path(name):
     env = {"spectrum": "SPECTRUM_DB", "psd": "PSD_DB",
            "pfp": "PFP_DB", "iq": "IQ_DB"}[name]
     return os.environ.get(env, os.path.join(HERE, f"{name}.duckdb"))
+
+
+def download_dir():
+    """Where `get` puts a download when no --dest is given.
+
+    Overridable because these records run to hundreds of gigabytes and the
+    repository is often on the smallest disk in the machine.
+    """
+    return os.environ.get("ATLAS_DOWNLOAD_DIR", os.path.join(HERE, "downloads"))
 
 
 def db_dir():
@@ -229,18 +240,75 @@ def classify(root):
     return out
 
 
-def plan_for(root, found, compact):
-    """-> (list of (label, argv), list of prebuilt db files to copy)."""
-    import psd_ingest
-    import pfp_ingest
-    steps, prebuilt = [], []
+def prebuilt_plan(found):
+    """-> list of (src, dst, kind, action) for every prebuilt database found.
 
+    'install' copies a file into place. 'merge' folds its data into whatever is
+    already there, which is what happens whenever the destination already holds
+    usable data of that kind, or a second database of the same kind turns up in
+    the same folder. 'skip' is for the one case neither works: more than one
+    database of a kind that cannot be merged.
+    """
+    by_kind, out = {}, []
     for p in found["duckdb"]:
         # Identify by the tables inside, so spectrum_viewer.db or any other
         # name is recognised for what it holds.
-        real, _label, _rows = identify_db(p)
+        real, _label, rows = identify_db(p)
         if real:
-            prebuilt.append((p, db_path(real)))
+            by_kind.setdefault(real, []).append((p, rows))
+    for kind, entries in sorted(by_kind.items()):
+        # Biggest first, so the base is the one that needs the fewest inserts.
+        entries.sort(key=lambda e: (-e[1], e[0]))
+        dst = db_path(kind)
+        live = False
+        if os.path.exists(dst):
+            real, _label, rows = identify_db(dst)
+            live = real == kind and rows > 0
+        for i, (p, _rows) in enumerate(entries):
+            if kind in MERGEABLE and (live or i > 0):
+                out.append((p, dst, kind, "merge"))
+            elif i == 0:
+                out.append((p, dst, kind, "install"))
+            else:
+                out.append((p, dst, kind, "skip"))
+    return out
+
+
+def apply_prebuilt(src, dst, kind, action):
+    """Put one prebuilt database into place. -> True if dst gained its data."""
+    name, target = os.path.basename(src), os.path.basename(dst)
+    if action == "skip":
+        print(f"  {name}: NOT loaded. {target} holds one {kind} dataset and "
+              f"{kind} data cannot be merged, so this file would have replaced "
+              "the larger one.\n"
+              f"    To use this one instead, move it somewhere on its own and "
+              f"run: python atlas.py get \"{src}\"")
+        return False
+    if action == "merge":
+        added, skipped, problem = merge_db(kind, src, dst)
+        if problem:
+            print(f"  {name}: could NOT be merged into {target}: {problem}")
+            return False
+        if added:
+            print(f"  merged {len(added)} new item(s) from {name} into {target}"
+                  + (f", {len(skipped)} already there" if skipped else ""))
+        else:
+            print(f"  {name}: nothing new; all {len(skipped)} item(s) are "
+                  f"already in {target}")
+        return True
+    if os.path.exists(dst):
+        shutil.move(dst, dst + ".bak")
+        print(f"  kept the previous {target} as {target}.bak")
+    shutil.copy2(src, dst)
+    print(f"  installed {target}")
+    return True
+
+
+def plan_for(root, found, compact):
+    """-> (list of (label, argv), list of prebuilt database actions)."""
+    import psd_ingest
+    import pfp_ingest
+    steps, prebuilt = [], prebuilt_plan(found)
 
     for d in sorted(found["iq"]):
         named = d if os.path.isdir(d) else os.path.dirname(d)
@@ -275,6 +343,94 @@ DB_SIGNATURES = [
     ("spectrum", {"raw"}),
 ]
 DB_EXT = (".duckdb", ".db")
+
+
+# What it takes to fold one database into another of the same kind: the column
+# that identifies an independent unit of data, and every table keyed by it. The
+# first table listed is the index -- the one that says which units exist -- and
+# is always written by the matching ingest. Both the compacted and uncompacted
+# table names appear; whichever is present in both files gets merged.
+#
+# spectrum is deliberately absent. Its pyramid levels are aggregates over the
+# whole of `raw`, so two files cannot be combined without recomputing them,
+# which is build_db.py's job rather than a copy.
+MERGEABLE = {
+    "iq": ("id", ("iq_meta", "iq_stft")),
+    "psd": ("sensor", ("psd_meta", "psd", "psd_chunk")),
+    "pfp": ("sensor", ("pfp_meta", "pfp", "pfp_chunk")),
+}
+
+
+def sql_str(s):
+    """A path as a SQL literal. ATTACH takes no parameters, so it needs this."""
+    return "'" + s.replace("'", "''") + "'"
+
+
+def table_cols(con, catalog):
+    """-> {table: [column, ...]} for one attached database, in column order."""
+    out = {}
+    for t, c in con.execute(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_catalog = ? AND table_schema = 'main' "
+            "ORDER BY table_name, ordinal_position", [catalog]).fetchall():
+        out.setdefault(t, []).append(c)
+    return out
+
+
+def merge_db(kind, src, dst):
+    """Add everything in src that dst does not already have.
+
+    -> (added, skipped, problem). added and skipped are unit keys (capture ids,
+    or sensor names); problem is None on success, else one sentence saying why
+    nothing was merged. src is opened read-only and never modified, and a unit
+    already in dst is left alone rather than duplicated, so this is idempotent.
+
+    Merging rather than copying is the whole point: two databases of the same
+    kind used to mean the second one silently replacing the first.
+    """
+    import duckdb
+    key, tables = MERGEABLE[kind]
+    index = tables[0]
+    con = None
+    try:
+        con = duckdb.connect(dst)
+        con.execute(f"ATTACH {sql_str(os.path.abspath(src))} AS m (READ_ONLY)")
+        here = table_cols(con, con.execute(
+            "SELECT current_database()").fetchone()[0])
+        there = table_cols(con, "m")
+        if index not in there or index not in here:
+            missing = os.path.basename(src if index not in there else dst)
+            return [], [], f"{missing} has no {index} table to merge on"
+        # Validate every shared table before writing any of it, so a mismatch
+        # cannot leave half a merge behind.
+        shared = [t for t in tables if t in here and t in there]
+        for t in shared:
+            if here[t] != there[t]:
+                return [], [], (f"table {t} has different columns in the two "
+                                f"files ({', '.join(there[t])} vs "
+                                f"{', '.join(here[t])})")
+        mine = {r[0] for r in con.execute(
+            f"SELECT DISTINCT {key} FROM {index}").fetchall()}
+        theirs = [r[0] for r in con.execute(
+            f"SELECT DISTINCT {key} FROM m.{index} ORDER BY 1").fetchall()]
+        add = [k for k in theirs if k not in mine]
+        skip = [k for k in theirs if k in mine]
+        if not add:
+            return [], skip, None
+        holes = ",".join("?" * len(add))
+        for t in shared:
+            cols = ", ".join(here[t])
+            con.execute(f"INSERT INTO {t} ({cols}) SELECT {cols} FROM m.{t} "
+                        f"WHERE {key} IN ({holes})", add)
+        return add, skip, None
+    except Exception as e:                                  # noqa: BLE001
+        return [], [], str(e).splitlines()[0][:120]
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:                               # noqa: BLE001
+                pass
 
 
 def identify_db(path):
@@ -651,14 +807,17 @@ def doctor_databases(r, adopt):
         dst = db_path(real)
         if not adopt:
             r.warned(f"{os.path.basename(p)} is not being used",
-                     f"re-run with --adopt to install it as {real}.duckdb")
+                     f"re-run with --adopt to load it as {real}.duckdb")
             continue
-        if os.path.exists(dst):
-            shutil.move(dst, dst + ".bak")
-            print(f"         kept previous {real}.duckdb as {real}.duckdb.bak")
-        shutil.copy2(p, dst)
-        r.ok(f"adopted {os.path.basename(p)} as {real}.duckdb", f"{rows:,} rows")
-        seen[real] = rows
+        # Merge when there is already data to merge into, so adopting a second
+        # database adds to the library instead of replacing it.
+        action = "merge" if real in MERGEABLE and real in seen else "install"
+        if apply_prebuilt(p, dst, real, action):
+            r.ok(f"adopted {os.path.basename(p)} as {real}.duckdb",
+                 f"{rows:,} rows")
+            seen[real] = max(seen.get(real, 0), rows)
+        else:
+            r.failed(f"could not adopt {os.path.basename(p)}")
     return seen
 
 
@@ -871,16 +1030,19 @@ def choose_dataset(names):
     name = names[pick]
     entry = data[name]
     sample = entry.get("sample", 3)
+    # A dataset may name extra fetch.py flags it needs, e.g. --allow-host for a
+    # record whose files are served from somewhere unexpected.
+    flags = [str(f) for f in entry.get("flags", [])]
 
     # These records run to hundreds of gigabytes. Default to a slice small
     # enough that trying it out costs megabytes.
-    sizes = [(f"Just a sample: the {sample} smallest files (a few MB)",
-              ns(target=name, fetch_args=["--first", str(sample)]))]
+    sizes = [(f"Just a sample: the {sample} smallest captures (a few MB)",
+              ns(target=name, fetch_args=["--first", str(sample)] + flags))]
     if entry.get("filter"):
         sizes.append((f"The usual slice (--filter {entry['filter']})",
-                      ns(target=name)))
+                      ns(target=name, fetch_args=list(flags))))
     sizes.append(("Everything in the record (this may be very large)",
-                  ns(target=name, filter="")))
+                  ns(target=name, filter="", fetch_args=list(flags))))
     print("\nHow much of it?")
     for i, (label, _) in enumerate(sizes, 1):
         print(f"  {i}) {label}" + ("      <- recommended" if i == 1 else ""))
@@ -1060,6 +1222,10 @@ def cmd_get(args):
         target = entry["record"]
         if entry.get("filter") and args.filter is None:
             args.filter = entry["filter"]
+        # Any fetch flags the dataset needs, unless the caller already passed
+        # them (the menu supplies them itself, so this must not double them up).
+        args.fetch_args = list(args.fetch_args) + [
+            str(f) for f in entry.get("flags", []) if str(f) not in args.fetch_args]
 
     # Already on disk? Then there is nothing to download.
     if os.path.exists(target):
@@ -1076,7 +1242,7 @@ def cmd_get(args):
                 os.path.normpath(fetch.urllib.parse.urlsplit(val).path)) or "download"
         except Exception:                                   # noqa: BLE001
             name = os.path.basename(target.rstrip("/")) or "download"
-        root = os.path.abspath(args.dest or os.path.join(HERE, "downloads", name))
+        root = os.path.abspath(args.dest or os.path.join(download_dir(), name))
         argv = script("fetch.py", fetch.clean_source(target), "--dest", root)
         if args.filter:
             argv += ["--filter", args.filter]
@@ -1107,9 +1273,13 @@ def cmd_get(args):
         return 1
 
     print(f"\nplan for {root}:")
-    for src, dst in prebuilt:
-        print(f"  - install prebuilt {os.path.basename(dst)} "
-              f"(no ingest needed)")
+    for src, dst, kind, action in prebuilt:
+        what = {"install": f"install prebuilt {os.path.basename(dst)}",
+                "merge": f"merge {os.path.basename(src)} into "
+                         f"{os.path.basename(dst)}",
+                "skip": f"skip {os.path.basename(src)} (see below)"}[action]
+        print(f"  - {what}" + (" (no ingest needed)"
+                               if action != "skip" else ""))
     for label, _ in steps:
         print(f"  - {label}")
     if found["other"]:
@@ -1127,17 +1297,13 @@ def cmd_get(args):
             print("\nno terminal to ask on; re-run without --ask")
             return 1
 
-    for src, dst in prebuilt:
+    failures = []
+    for src, dst, kind, action in prebuilt:
         if args.dry_run:
             continue
-        if os.path.exists(dst):
-            shutil.move(dst, dst + ".bak")
-            print(f"  kept the previous {os.path.basename(dst)} as "
-                  f"{os.path.basename(dst)}.bak")
-        shutil.copy2(src, dst)
-        print(f"  installed {os.path.basename(dst)}")
+        if not apply_prebuilt(src, dst, kind, action) and action != "skip":
+            failures.append(f"loading {os.path.basename(src)}")
 
-    failures = []
     for label, argv in steps:
         if run(argv, args.dry_run) != 0:
             failures.append(label)
