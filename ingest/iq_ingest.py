@@ -25,7 +25,8 @@ import sigmf_io
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
-IQ_DB = os.environ.get("IQ_DB", os.path.join(ROOT, "iq.duckdb"))
+DB_DIR = os.environ.get("ATLAS_DB_DIR") or ROOT
+IQ_DB = os.environ.get("IQ_DB") or os.path.join(DB_DIR, "iq.duckdb")
 
 NFFT = 1024
 CHUNK_COLS = 512          # columns per stored blob (nfft x 512 = 0.5 MB)

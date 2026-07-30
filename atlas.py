@@ -76,10 +76,14 @@ except Exception:
     pass
 
 
+DB_ENV = {"spectrum": "SPECTRUM_DB", "psd": "PSD_DB",
+          "pfp": "PFP_DB", "iq": "IQ_DB"}
+
+
 def db_path(name):
-    env = {"spectrum": "SPECTRUM_DB", "psd": "PSD_DB",
-           "pfp": "PFP_DB", "iq": "IQ_DB"}[name]
-    return os.environ.get(env, os.path.join(HERE, f"{name}.duckdb"))
+    """Where one database lives: its own variable first, then ATLAS_DB_DIR."""
+    return os.environ.get(DB_ENV[name]) or os.path.join(
+        db_dir(), f"{name}.duckdb")
 
 
 def download_dir():
@@ -93,9 +97,34 @@ def download_dir():
 
 def db_dir():
     """Where the databases live. Overridable so a test, or a second dataset,
-    can keep its files somewhere other than beside serve.py."""
-    return os.environ.get(
-        "ATLAS_DB_DIR", os.path.dirname(os.path.abspath(db_path("psd"))))
+    can keep its files somewhere other than beside serve.py.
+
+    serve.py and every ingest script read ATLAS_DB_DIR the same way, so setting
+    it is enough on its own; the per-database variables override it one at a
+    time when only one file needs to move.
+    """
+    return os.path.abspath(os.environ.get("ATLAS_DB_DIR") or HERE)
+
+
+def db_dir_problem():
+    """None if the database directory can be written to, else why not.
+
+    Checked before anything is built, because the alternative is one DuckDB
+    IOException traceback per ingest script and no statement of the cause.
+    """
+    where = db_dir()
+    if not os.path.isdir(where):
+        parent = os.path.dirname(where.rstrip(os.sep))
+        why = ("its parent does not exist either"
+               if parent and not os.path.isdir(parent) else "it does not exist")
+        return (f"the database directory {where} cannot be used: {why}.\n"
+                "  Create it, or unset ATLAS_DB_DIR to use the repository "
+                "folder.")
+    if not os.access(where, os.W_OK):
+        return (f"the database directory {where} is not writable "
+                "(read-only filesystem, or owned by another user).\n"
+                "  Point ATLAS_DB_DIR somewhere you can write.")
+    return None
 
 
 def short(p):
@@ -105,6 +134,17 @@ def short(p):
     except ValueError:              # different drive on Windows
         return p
     return rel if not rel.startswith("..") else p
+
+
+def last_line(text, width=140):
+    """The last line of a captured child's output that says anything.
+
+    A traceback's last line is the exception, which is the one line worth
+    surfacing when the rest has been captured. Without this, a child that died
+    was reported as having failed with nothing to go on.
+    """
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    return lines[-1][:width] if lines else "(no output)"
 
 
 def run(argv, dry=False):
@@ -182,18 +222,22 @@ def kind_of(dirpath, name):
 def walk_limited(root, max_files=200000, max_depth=12):
     """Yield (dirpath, name) under root, skipping system and toolchain noise.
 
-    Sets truncated[0] when the file budget runs out, so a search over a whole
-    drive says so instead of quietly reporting a partial answer.
+    Returns (generator, limits) where limits records which budget ran out:
+    'files' for the file cap, 'depth' for the directory-depth cap. Both are
+    reported, because a search that quietly stopped early and then said "found
+    nothing" sent people looking for a naming problem they did not have.
     """
     root = os.path.abspath(root)
     base = root.rstrip(os.sep).count(os.sep)
-    truncated = [False]
+    limits = {"files": False, "depth": 0}
     n = 0
 
     def gen():
         nonlocal n
         for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
             if dirpath.count(os.sep) - base >= max_depth:
+                if dirnames:
+                    limits["depth"] += len(dirnames)
                 dirnames[:] = []
             dirnames[:] = [d for d in dirnames
                            if d not in SKIP_DIRS and not d.startswith(".")]
@@ -201,9 +245,9 @@ def walk_limited(root, max_files=200000, max_depth=12):
                 yield dirpath, name
                 n += 1
                 if n >= max_files:
-                    truncated[0] = True
+                    limits["files"] = True
                     return
-    return gen(), truncated
+    return gen(), limits
 
 
 def classify(root):
@@ -248,14 +292,21 @@ def prebuilt_plan(found):
     usable data of that kind, or a second database of the same kind turns up in
     the same folder. 'skip' is for the one case neither works: more than one
     database of a kind that cannot be merged.
+
+    Also returns the database-shaped files that could NOT be read as one of
+    ours, with the reason. They are reported rather than dropped, because
+    "nothing recognisable here" is a lie when a corrupt .duckdb is sitting right
+    there.
     """
-    by_kind, out = {}, []
+    by_kind, out, rejected = {}, [], []
     for p in found["duckdb"]:
         # Identify by the tables inside, so spectrum_viewer.db or any other
         # name is recognised for what it holds.
-        real, _label, rows = identify_db(p)
+        real, why, rows = identify_db(p)
         if real:
             by_kind.setdefault(real, []).append((p, rows))
+        else:
+            rejected.append((p, why))
     for kind, entries in sorted(by_kind.items()):
         # Biggest first, so the base is the one that needs the fewest inserts.
         entries.sort(key=lambda e: (-e[1], e[0]))
@@ -271,7 +322,7 @@ def prebuilt_plan(found):
                 out.append((p, dst, kind, "install"))
             else:
                 out.append((p, dst, kind, "skip"))
-    return out
+    return out, rejected
 
 
 def apply_prebuilt(src, dst, kind, action):
@@ -304,11 +355,36 @@ def apply_prebuilt(src, dst, kind, action):
     return True
 
 
+def ingest_targets(found):
+    """Which databases the planned ingests are about to write into."""
+    return {"iq": "iq", "psd": "psd", "pfp": "pfp", "csv": "spectrum"}
+
+
+def unusable_targets(found):
+    """-> [(path, why)] for databases an ingest would write but cannot read.
+
+    DuckDB opens the destination read-write, so pointing an ingest at a corrupt
+    or foreign file used to mean one raw IOException traceback per ingest script
+    and no statement of the cause.
+    """
+    bad = []
+    for key, kind in ingest_targets(found).items():
+        if not found.get(key):
+            continue
+        p = db_path(kind)
+        if not os.path.exists(p):
+            continue
+        real, why, _rows = identify_db(p)
+        if real != kind:
+            bad.append((p, why))
+    return bad
+
+
 def plan_for(root, found, compact):
-    """-> (list of (label, argv), list of prebuilt database actions)."""
+    """-> (list of (label, argv), prebuilt actions, unreadable databases)."""
     import psd_ingest
     import pfp_ingest
-    steps, prebuilt = [], prebuilt_plan(found)
+    steps, (prebuilt, rejected) = [], prebuilt_plan(found)
 
     for d in sorted(found["iq"]):
         named = d if os.path.isdir(d) else os.path.dirname(d)
@@ -329,7 +405,7 @@ def plan_for(root, found, compact):
                       script("build_db.py", "--csv-dir", d)))
     if compact and any(k for k in ("psd", "pfp") if found[k]):
         steps.append(("compact the CBRS databases", script("compact_db.py")))
-    return steps, prebuilt
+    return steps, prebuilt, rejected
 
 
 # ---- identifying databases whatever they are called --------------------
@@ -343,6 +419,20 @@ DB_SIGNATURES = [
     ("spectrum", {"raw"}),
 ]
 DB_EXT = (".duckdb", ".db")
+
+# The columns each of those tables must actually have. Matching on the table
+# name alone meant a file holding an iq_stft of unrelated columns was reported
+# as a healthy STFT pyramid -- "ready, start the viewer" -- and only failed at
+# render time, by which point nothing said why. A superset is fine, so a later
+# schema that adds a column still identifies.
+TABLE_COLS = {
+    "iq_stft": {"id", "level", "col0", "ncols", "chunk"},
+    "psd": {"sensor", "t", "spec"},
+    "psd_chunk": {"sensor", "t0", "t1", "n", "times", "specs"},
+    "pfp": {"sensor", "freq", "t", "frame"},
+    "pfp_chunk": {"sensor", "freq", "t0", "t1", "n", "times", "frames"},
+    "raw": {"sensor", "freq", "t", "mx", "md", "mn"},
+}
 
 
 # What it takes to fold one database into another of the same kind: the column
@@ -444,17 +534,30 @@ def identify_db(path):
         c = duckdb.connect(path, read_only=True)
     except Exception as e:                                  # noqa: BLE001
         why = str(e).splitlines()[0].replace(path, os.path.basename(path))
-        return None, f"not readable as a database ({why[:70]})", 0
+        # Long enough for DuckDB's own sentence, which names the cause;
+        # cutting at 70 chopped it mid-word.
+        return None, f"not readable as a database ({why[:120]})", 0
     try:
-        tables = {r[0] for r in c.execute(
-            "SELECT table_name FROM information_schema.tables").fetchall()}
+        cols = table_cols(c, c.execute("SELECT current_database()").fetchone()[0])
+        tables = set(cols)
+        wrong = []
         for name, need in DB_SIGNATURES:
-            if need <= tables:
-                label = next((lbl for t, lbl in SCHEMAS[name] if t in tables),
-                             "unknown")
-                rows = c.execute(
-                    f"SELECT count(*) FROM {sorted(need)[0]}").fetchone()[0]
-                return name, label, rows
+            if not need <= tables:
+                continue
+            table = sorted(need)[0]
+            want = TABLE_COLS.get(table, set())
+            have = set(cols.get(table, []))
+            if not want <= have:
+                wrong.append(f"{table} is missing "
+                             + ", ".join(sorted(want - have)))
+                continue
+            label = next((lbl for t, lbl in SCHEMAS[name] if t in tables),
+                         "unknown")
+            rows = c.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            return name, label, rows
+        if wrong:
+            # The tables are named like ours but do not hold what we read.
+            return None, f"wrong schema for an ATLAS database ({wrong[0]})", 0
         listed = ", ".join(sorted(tables)[:4]) or "no tables"
         return None, f"not an ATLAS database (contains: {listed})", 0
     except Exception as e:                                  # noqa: BLE001
@@ -514,6 +617,50 @@ def env_kind():
     return "system", sys.prefix
 
 
+# The four packages nothing works without, in one place. This used to be spelled
+# out separately in doctor, in the no-argument path and in setup, and the other
+# three subcommands checked nothing at all -- so `status`, `scan`, `get` and
+# `serve` each died on a raw ModuleNotFoundError from whichever module happened
+# to import duckdb first, naming a Python module instead of the thing to run.
+CORE_DEPS = (("duckdb", "duckdb"), ("numpy", "numpy"),
+             ("flask", "Flask"), ("PIL", "Pillow"))
+MIN_PY = (3, 10)
+
+
+def missing_deps():
+    out = []
+    for mod, pkg in CORE_DEPS:
+        try:
+            __import__(mod)
+        except Exception:                                   # noqa: BLE001
+            out.append(pkg)
+    return out
+
+
+def require_python():
+    """None if this interpreter is new enough, else why it is not."""
+    if sys.version_info >= MIN_PY:
+        return None
+    v = sys.version_info
+    return (f"Python {v.major}.{v.minor}.{v.micro} is too old: ATLAS needs "
+            f"{MIN_PY[0]}.{MIN_PY[1]} or newer (duckdb has no wheels below "
+            f"that).\n  Installing dependencies will not help. Use a newer "
+            f"interpreter:\n    py -3.12 atlas.py ...        # Windows\n"
+            f"    python3.12 atlas.py ...      # macOS / Linux\n"
+            f"  This one is {sys.executable}")
+
+
+def require_deps():
+    """None when everything imports, else one actionable message."""
+    bad = require_python()
+    if bad:
+        return bad
+    missing = missing_deps()
+    if not missing:
+        return None
+    return f"Missing dependencies: {', '.join(missing)}\n\n{install_hint()}"
+
+
 def install_hint():
     """The exact install command for the environment actually in use."""
     kind, label = env_kind()
@@ -566,14 +713,15 @@ def deep_roots():
     return out
 
 
-def survey(root, max_files):
+def survey(root, max_files, max_depth=12):
     """Inventory one directory: what is recognised, and what is not."""
     import collections
     found = {"iq": 0, "psd": 0, "pfp": 0, "summaries": 0, "duckdb": []}
     sensors, days, unknown = set(), set(), collections.Counter()
     psd_re, pfp_re = name_res()
     files = 0
-    gen, truncated = walk_limited(root, max_files=max_files)
+    gen, limits = walk_limited(root, max_files=max_files,
+                               max_depth=max_depth)
     for dirpath, name in gen:
         files += 1
         kind = kind_of(dirpath, name)
@@ -590,7 +738,7 @@ def survey(root, max_files):
             unknown[os.path.splitext(name)[1].lower() or "(no extension)"] += 1
     return {"root": root, "found": found, "sensors": sorted(sensors),
             "days": sorted(days), "unknown": unknown, "files": files,
-            "truncated": truncated[0]}
+            "limits": limits, "max_depth": max_depth}
 
 
 def report(s):
@@ -623,10 +771,28 @@ def report(s):
         print(f"      {unknown:>7} file(s) not recognised  ({top})")
     if not any_hit and not unknown:
         print("           nothing here")
-    if s["truncated"]:
+    if s["limits"]["files"]:
         print("      NOTE: hit the file limit; re-run with a bigger --max-files "
               "or point --root at a narrower folder")
+    if s["limits"]["depth"]:
+        print(f"      NOTE: stopped at {s['max_depth']} directory levels below "
+              f"this folder; {s['limits']['depth']} deeper folder(s) were NOT "
+              "searched.")
+        print("            Re-run with --max-depth N, or name the deeper "
+              "folder directly.")
     return any_hit
+
+
+def scan_depth(args):
+    """How many directory levels to search.
+
+    --deep widens this as well as adding roots. It used to add roots only, so
+    "search wider" still stopped at 12 levels and missed anything below that
+    without saying so.
+    """
+    if getattr(args, "max_depth", None) is not None:
+        return args.max_depth
+    return 24 if getattr(args, "deep", False) else 12
 
 
 def cmd_scan(args):
@@ -651,14 +817,15 @@ def cmd_scan(args):
         print("\nNone of those folders exist.", file=sys.stderr)
         return 1
 
-    hits, empty, csv_missed = [], [], 0
+    hits, empty, csv_missed, stopped_deep = [], [], 0, 0
     for r in roots:
-        s = survey(r, args.max_files)
+        s = survey(r, args.max_files, scan_depth(args))
         if report(s):
             hits.append(s)
         else:
             empty.append(r)
         csv_missed += s["unknown"].get(".csv", 0)
+        stopped_deep += s["limits"]["depth"]
 
     print()
     if csv_missed:
@@ -672,6 +839,14 @@ def cmd_scan(args):
         print("  If yours look different, rename them to match or say so and "
               "the pattern can be widened.\n")
     if not hits:
+        if stopped_deep:
+            # Say this first: it is a concrete, fixable reason the search came
+            # up empty, unlike the generic advice below.
+            print(f"The search stopped at {scan_depth(args)} directory levels "
+                  f"and did not look inside {stopped_deep} deeper folder(s).")
+            print("  Re-run with --max-depth 40, or name the folder that holds "
+                  "the data directly.")
+            return 1
         print("Found nothing to ingest. Either the data is somewhere not "
               "searched (pass the folder directly, or use --deep), or it is "
               "named differently than the patterns above.")
@@ -832,7 +1007,7 @@ def doctor_data(r, args):
         return []
     hits = []
     for root in roots:
-        s = survey(root, args.max_files)
+        s = survey(root, args.max_files, scan_depth(args))
         f = s["found"]
         total = f["iq"] + f["psd"] + f["pfp"] + f["summaries"]
         if total:
@@ -856,14 +1031,26 @@ def doctor_verify(r):
                          os.path.join(HERE, "examples", "verify.py")],
                         cwd=HERE, capture_output=True, text=True)
     out = rc.stdout + rc.stderr
+    shown = 0
     for line in out.splitlines():
         if line.strip().startswith(("[PASS]", "[FAIL]", "RESULT:")):
             print(f"  {line.strip()}")
+            shown += 1
     if rc.returncode == 0:
         r.ok("every endpoint the viewer needs responded")
+        return True
+    # A crash produces none of those lines, so claiming "the output above names
+    # the check" was sometimes false. Surface the exception itself instead.
+    if any("[FAIL]" in l for l in out.splitlines()):
+        r.failed("verification failed; the check that failed is named above")
     else:
-        r.failed("verification failed; the output above names the check")
-    return rc.returncode == 0
+        r.failed("verification crashed before it could finish",
+                 last_line(out))
+        if not shown:
+            print("         re-run it directly for the whole traceback:")
+            print(f"           {short(sys.executable)} "
+                  f"{short(os.path.join(HERE, 'examples', 'verify.py'))}")
+    return False
 
 
 def cmd_doctor(args):
@@ -883,8 +1070,17 @@ def cmd_doctor(args):
     hits = doctor_data(r, args)
 
     print("\n6. Demo data")
+    iq = db_path("iq")
     if built.get("iq"):
         r.ok("an IQ database already exists; leaving it alone")
+    elif os.path.exists(iq):
+        # There is a file at iq.duckdb but section 4 could not read it as one
+        # of ours. Building the demo would write new tables straight into
+        # whatever it actually is -- someone else's database, or a corrupt
+        # download -- with no backup and no mention. Never do that.
+        r.failed(f"not building the demo: {os.path.basename(iq)} already "
+                 "exists and is not a usable ATLAS database",
+                 "move or delete that file first, then run this again")
     elif args.dry_run:
         print("  [ -- ] would build the synthetic demo")
     else:
@@ -896,8 +1092,7 @@ def cmd_doctor(args):
             r.ok("demo capture built")
             built["iq"] = 1
         else:
-            r.failed("could not build the demo",
-                     (rc.stdout + rc.stderr).strip().splitlines()[-1][:100])
+            r.failed("could not build the demo", last_line(rc.stdout + rc.stderr))
 
     verified = doctor_verify(r) if not args.dry_run else True
 
@@ -929,13 +1124,8 @@ def assess(max_files=60000):
     Deliberately quiet: this runs before the user has asked for anything, so
     it reports nothing and just returns what it learned.
     """
-    state = {"missing": [], "built": {}, "strays": [], "data": [], "free": None}
-    for mod, pkg in [("duckdb", "duckdb"), ("numpy", "numpy"),
-                     ("flask", "Flask"), ("PIL", "Pillow")]:
-        try:
-            __import__(mod)
-        except Exception:                                   # noqa: BLE001
-            state["missing"].append(pkg)
+    state = {"missing": missing_deps(), "built": {}, "strays": [], "data": [],
+             "free": None}
     if state["missing"]:
         return state                        # nothing else can be trusted yet
 
@@ -984,6 +1174,7 @@ def describe(state):
 def ns(**kw):
     """An argparse-shaped object, for calling the subcommands directly."""
     base = dict(dry_run=False, adopt=False, deep=False, max_files=200000,
+                max_depth=None,
                 roots=None, compact=False, ask=False, filter=None, dest=None,
                 fetch_args=[], target=None)
     base.update(kw)
@@ -1079,7 +1270,9 @@ def prompt(n):
     while True:
         try:
             raw = input(f"\nChoose 1-{n} (or q to quit): ").strip().lower()
-        except EOFError:
+        except (EOFError, RuntimeError, OSError):
+            # Redirected from empty, closed outright, or unreadable: all three
+            # mean there is nothing to read, which is not the same as quitting.
             return NO_INPUT
         except KeyboardInterrupt:
             print()
@@ -1095,15 +1288,18 @@ def cmd_auto(args):
     """`python atlas.py` with no arguments: figure it out and offer the fix."""
     print("ATLAS")
     print("checking this machine ...")
-    state = assess()
-
-    if state["missing"]:
-        print(f"\nMissing: {', '.join(state['missing'])}\n")
-        print(f"To fix: {install_hint()}")
+    bad = require_deps()
+    if bad:
+        print(f"\n{bad}")
         return 1
+    state = assess()
 
     print()
     describe(state)
+    problem = db_dir_problem()
+    if problem:
+        print(f"\n{problem}")
+        return 1
 
     items = build_menu(state)
 
@@ -1132,22 +1328,47 @@ def cmd_auto(args):
 
 # ---- subcommands ------------------------------------------------------
 
+def db_size(path):
+    """On-disk size of a database, counting an uncheckpointed write-ahead log.
+
+    An ingest killed mid-transaction leaves its work in <name>.duckdb.wal, and
+    atlas.py only ever opens read-only so it never gets checkpointed away.
+    Reporting the main file alone showed "0.0 MB" for a database with megabytes
+    of real data sitting beside it.
+    """
+    total = os.path.getsize(path)
+    wal = path + ".wal"
+    extra = os.path.getsize(wal) if os.path.exists(wal) else 0
+    return f"{total / 1e6:.1f} MB" + (f" +{extra / 1e6:.1f} wal" if extra else "")
+
+
 def cmd_status(args):
     import duckdb
-    print(f"ATLAS in {HERE}\n")
-    rows, present = [], set()
+    print(f"ATLAS in {HERE}")
+    if os.path.abspath(db_dir()) != os.path.abspath(HERE):
+        print(f"databases in {db_dir()}  (ATLAS_DB_DIR)")
+    print()
+    rows, present, broken = [], set(), []
     for name in DBS:
         p = db_path(name)
         if not os.path.exists(p):
             rows.append((name, "absent", "", "", ""))
+            continue
+        # identify_db is the single judge of what a file is -- it validates the
+        # columns, not just the table names. Deciding that again here meant
+        # status called a database with an iq_stft of unrelated columns a
+        # healthy "stft pyramid, 1 rows" and told the user to start the viewer.
+        real, why, n = identify_db(p)
+        if real != name:
+            broken.append((p, why if real is None else
+                           f"holds {real} data, not {name} data"))
+            rows.append((name, "UNUSABLE (see below)", "", "", db_size(p)))
             continue
         try:
             c = duckdb.connect(p, read_only=True)
             tables = {r[0] for r in c.execute(
                 "SELECT table_name FROM information_schema.tables").fetchall()}
             kind = next((lbl for t, lbl in SCHEMAS[name] if t in tables), "unknown")
-            tbl = next((t for t, _ in SCHEMAS[name] if t in tables), None)
-            n = c.execute(f"SELECT count(*) FROM {tbl}").fetchone()[0] if tbl else 0
             span = ""
             if name in ("psd", "pfp") and f"{name}_meta" in tables:
                 r = c.execute(f"SELECT min(t_min), max(t_max) FROM {name}_meta").fetchone()
@@ -1160,16 +1381,29 @@ def cmd_status(args):
             c.close()
             if n:
                 present.add(name)
-            rows.append((name, kind, f"{n:,} rows", span,
-                         f"{os.path.getsize(p)/1e6:.1f} MB"))
+            rows.append((name, kind, f"{n:,} rows", span, db_size(p)))
         except Exception as e:                              # noqa: BLE001
-            rows.append((name, f"unreadable: {e}", "", "", ""))
+            # A DuckDB error runs to several hundred characters. Putting it in
+            # the table padded every other column out to its width; it belongs
+            # under the table, once.
+            broken.append((p, str(e).splitlines()[0]))
+            rows.append((name, "UNREADABLE (see below)", "", "", db_size(p)))
+        # A file at a canonical path that is not what it claims is a problem,
+        # not an absence: report it rather than leaving the row blank.
 
-    w = max(len(r[1]) for r in rows) + 2
+    w = min(34, max(len(r[1]) for r in rows) + 2)
     for name, kind, n, span, size in rows:
         print(f"  {name + '.duckdb':18} {kind:{w}} {n:>14}  {span:>14}  {size:>10}")
 
+    for p, why in broken:
+        print(f"\n  {os.path.basename(p)} is not usable:\n    {why[:220]}")
+        print(f"    Move or delete {short(p)} and rebuild it.")
+
     print()
+    if broken and not present:
+        print("Nothing usable is built. Deal with the unreadable file(s) above "
+              "first.")
+        return 1
     if not present:
         print("Nothing is built yet. Start with:\n"
               "    python atlas.py doctor           # check everything, fix what it can\n"
@@ -1178,6 +1412,9 @@ def cmd_status(args):
               "    python atlas.py get <folder>     # ingest a folder you have\n"
               "    python atlas.py get mds2-3177    # data from NIST PDR")
     else:
+        if broken:
+            print("Some layers are readable and some are not (see above); the "
+                  "viewer will show only what works.")
         print("Ready. Start the viewer with:\n    python atlas.py serve")
         if {"psd", "pfp"} & present and not any(
                 os.path.exists(db_path(n) + ".bak") for n in ("psd", "pfp")):
@@ -1187,19 +1424,12 @@ def cmd_status(args):
 
 
 def cmd_setup(args):
-    missing = []
-    for mod, pkg in [("duckdb", "duckdb"), ("numpy", "numpy"),
-                     ("flask", "flask"), ("PIL", "Pillow")]:
-        try:
-            __import__(mod)
-        except ImportError:
-            missing.append(pkg)
-    if missing:
-        print(f"Missing dependencies: {', '.join(missing)}\n\n"
-              "    python -m pip install -r requirements.txt\n\n"
-              "On macOS or Linux, make a virtual environment first:\n"
-              "    python -m venv .venv && source .venv/bin/activate\n"
-              "(Windows PowerShell: .venv\\Scripts\\activate)", file=sys.stderr)
+    # install_hint() reads the environment actually in use, so it does not tell
+    # someone already inside a virtualenv to make one, and it names
+    # externally-managed-environment on the systems that raise it.
+    bad = require_deps()
+    if bad:
+        print(bad, file=sys.stderr)
         return 1
     rc = run([sys.executable, os.path.join(HERE, "examples", "verify.py")],
              args.dry_run)
@@ -1260,8 +1490,19 @@ def cmd_get(args):
             return 0
 
     found = classify(root)
-    steps, prebuilt = plan_for(root, found, args.compact)
+    steps, prebuilt, rejected = plan_for(root, found, args.compact)
     if not steps and not prebuilt:
+        if rejected:
+            # There ARE databases here; they just cannot be read. Saying
+            # "nothing recognisable" would send the user looking for the wrong
+            # problem -- most often a download that finished corrupt.
+            print(f"\n{len(rejected)} database file(s) under {root} could not "
+                  "be read:", file=sys.stderr)
+            for p, why in rejected[:5]:
+                print(f"    {short(p)}\n      {why}", file=sys.stderr)
+            print("  If one of these was downloaded, it may be corrupt: delete "
+                  "it and re-run.", file=sys.stderr)
+            return 1
         print(f"\nNothing recognisable under {root}.\n"
               "  Expected IQ captures (.sigmf-meta/.tdms/.npy), CBRS PSD or PFP\n"
               "  CSV exports, Summaries CSVs, or prebuilt .duckdb files.",
@@ -1274,7 +1515,23 @@ def cmd_get(args):
                 print(f"    {short(f)}", file=sys.stderr)
         return 1
 
+    # An ingest opens its destination read-write, so check now rather than
+    # letting each script die on its own DuckDB traceback.
+    blocked = unusable_targets(found)
+    if blocked and steps:
+        print(f"\nCannot ingest: {len(blocked)} destination database(s) exist "
+              "but are not usable ATLAS databases:", file=sys.stderr)
+        for p, why in blocked:
+            print(f"    {short(p)}\n      {why}", file=sys.stderr)
+        print("  Move or delete them (or point ATLAS_DB_DIR elsewhere), then "
+              "run this again.", file=sys.stderr)
+        return 1
+
     print(f"\nplan for {root}:")
+    if rejected:
+        for p, why in rejected:
+            print(f"  ! not loading {os.path.basename(p)}: {why}")
+            print(f"      {short(p)}")
     for src, dst, kind, action in prebuilt:
         what = {"install": f"install prebuilt {os.path.basename(dst)}",
                 "merge": f"merge {os.path.basename(src)} into "
@@ -1295,7 +1552,10 @@ def cmd_get(args):
             if input("\nproceed? [y/N] ").strip().lower() not in ("y", "yes"):
                 print("nothing done")
                 return 0
-        except EOFError:
+        # EOFError is stdin redirected from empty; RuntimeError is stdin closed
+        # outright ("lost sys.stdin"); OSError is a descriptor that cannot be
+        # read. All three mean the same thing: there is nobody to ask.
+        except (EOFError, RuntimeError, OSError):
             print("\nno terminal to ask on; re-run without --ask")
             return 1
 
@@ -1338,6 +1598,9 @@ def main():
                         "the like) where serve.py looks for them")
     p.add_argument("--max-files", type=int, default=200000,
                    help="file budget per folder searched (default 200000)")
+    p.add_argument("--max-depth", type=int, default=None,
+                   help="how many directory levels deep to search "
+                        "(default 12, or 24 with --deep)")
     p.set_defaults(fn=cmd_doctor)
 
     p = sub.add_parser("setup", help="check the install and build the demo")
@@ -1353,6 +1616,10 @@ def main():
                    help="also search your home folder and every other drive")
     p.add_argument("--max-files", type=int, default=200000,
                    help="file budget per folder (default 200000)")
+    p.add_argument("--max-depth", type=int, default=None,
+                   help="how many directory levels deep to search (default 12, "
+                        "or 24 with --deep). Deeper folders are reported, never "
+                        "skipped silently")
     p.set_defaults(fn=cmd_scan)
 
     p = sub.add_parser("serve", help="start the viewer")
@@ -1377,6 +1644,19 @@ def main():
                        help="print the plan and change nothing")
 
     args, extra = ap.parse_known_args()
+
+    # One preflight for every command. doctor is exempt: diagnosing a broken
+    # environment is its whole job, and it reports the same facts in context.
+    if getattr(args, "cmd", None) not in (None, "doctor"):
+        bad = require_deps()
+        if bad:
+            print(bad, file=sys.stderr)
+            return 1
+        bad = db_dir_problem()
+        if bad and args.cmd in ("get", "setup", "serve"):
+            print(bad, file=sys.stderr)
+            return 1
+
     if not getattr(args, "cmd", None):
         # No subcommand: work out the situation and offer the fix. This is the
         # path a first-time user should ever need.
@@ -1396,3 +1676,14 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(130)
+    except BrokenPipeError:
+        # `atlas.py status | head` closes the pipe under us. That is the
+        # reader's choice, not an error, but line buffering makes it land
+        # mid-print and Python would otherwise report it as a crash. Redirect
+        # the remaining flush to devnull so the interpreter cannot complain
+        # about it during shutdown either.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:                                   # noqa: BLE001
+            pass
+        sys.exit(0)

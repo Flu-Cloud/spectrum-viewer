@@ -34,7 +34,10 @@ from flask import Flask, Response, jsonify, make_response, request, send_file
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Each database path is overridable, like IQ_DB below, so a test run or a
 # second dataset can point somewhere else without moving files around.
-DB_PATH = os.environ.get("SPECTRUM_DB", os.path.join(HERE, "spectrum.duckdb"))
+# ATLAS_DB_DIR moves all four databases at once; the per-database variables
+# override it one at a time. atlas.py and every ingest script agree on this.
+DB_DIR = os.environ.get("ATLAS_DB_DIR") or HERE
+DB_PATH = os.environ.get("SPECTRUM_DB") or os.path.join(DB_DIR, "spectrum.duckdb")
 
 # (table, bucket_seconds), finest first. 0 == raw native cadence.
 LEVELS = [
@@ -229,7 +232,7 @@ def heatmap():
 
 
 # ---- PSD continuous layer (chunked int8 spectra, zlib) -----------------
-PSD_DB = os.environ.get("PSD_DB", os.path.join(HERE, "psd.duckdb"))
+PSD_DB = os.environ.get("PSD_DB") or os.path.join(DB_DIR, "psd.duckdb")
 F0 = 3530040000.0     # first PSD bin (Hz)
 DF = 80000.0          # bin spacing (Hz)
 NF = 2250             # bins  (full band 3530.04 .. 3709.96 MHz)
@@ -412,7 +415,7 @@ def psd_layer():
 
 
 # ---- PFP layer (periodic-frame-power, ~18 us within a 10 ms frame) ----
-PFP_DB = os.environ.get("PFP_DB", os.path.join(HERE, "pfp.duckdb"))
+PFP_DB = os.environ.get("PFP_DB") or os.path.join(DB_DIR, "pfp.duckdb")
 _pfp_con = None
 _pfp_lock = threading.Lock()
 _pfp_freqs_cache = {}
@@ -514,7 +517,7 @@ def pfp_frame():
 # ---- IQ capture mode (independent SigMF/TDMS captures; own axes) ------
 # Per-request read-only connections on purpose: iq_ingest.py may be appending
 # new captures between requests, and a held handle would block its write lock.
-IQ_DB = os.environ.get("IQ_DB", os.path.join(HERE, "iq.duckdb"))
+IQ_DB = os.environ.get("IQ_DB") or os.path.join(DB_DIR, "iq.duckdb")
 
 
 def iq_conn():

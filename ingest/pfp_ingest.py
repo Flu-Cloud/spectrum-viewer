@@ -38,7 +38,8 @@ ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 # --root; defaults to ./SEA-DATA in the repo so a fresh clone never points at
 # someone else's disk.
 DATA_ROOT = os.environ.get("SEA_DATA_ROOT", os.path.join(ROOT, "SEA-DATA"))
-PFP_DB = os.environ.get("PFP_DB", os.path.join(ROOT, "pfp.duckdb"))
+DB_DIR = os.environ.get("ATLAS_DB_DIR") or ROOT
+PFP_DB = os.environ.get("PFP_DB") or os.path.join(DB_DIR, "pfp.duckdb")
 
 NPOS = 560
 FRAME_MS = 10.0

@@ -33,9 +33,16 @@ def check(name, ok, detail=""):
 print("Spectrum Viewer install check")
 print(f"  python {sys.version.split()[0]} at {sys.executable}\n")
 
-# 1. Python version (duckdb needs >= 3.10)
-check("Python >= 3.10", sys.version_info >= (3, 10),
-      f"found {sys.version_info.major}.{sys.version_info.minor}")
+# 1. Python version (duckdb needs >= 3.10). Reported on its own, and fatal on
+# its own: no amount of pip install fixes an interpreter that is too old, and
+# saying "install dependencies first" here sends people the wrong way.
+v = sys.version_info
+check("Python >= 3.10", v >= (3, 10), f"found {v.major}.{v.minor}.{v.micro}")
+if failed:
+    print(f"\nRESULT: FAIL - Python {v.major}.{v.minor} is too old; ATLAS "
+          "needs 3.10 or newer. Re-run with a newer interpreter "
+          "(py -3.12 / python3.12).")
+    sys.exit(1)
 
 # 2. Dependencies importable
 for mod, pkg in [("duckdb", "duckdb"), ("numpy", "numpy"),
@@ -54,7 +61,10 @@ if failed:
 # 3. Demo database: build it if the user hasn't yet
 # Same resolution serve.py uses, so redirecting the databases to
 # another drive cannot make this check the wrong file.
-iq_db = os.environ.get("IQ_DB", os.path.join(ROOT, "iq.duckdb"))
+# Resolved exactly as serve.py and atlas.py resolve it, so redirecting the
+# databases cannot make this check look at a different file than the server.
+iq_db = os.environ.get("IQ_DB") or os.path.join(
+    os.environ.get("ATLAS_DB_DIR") or ROOT, "iq.duckdb")
 if not os.path.exists(iq_db):
     print("\n  iq.duckdb missing - running examples/make_sample.py ...")
     r = subprocess.run([sys.executable, os.path.join(HERE, "make_sample.py")],

@@ -178,6 +178,168 @@ def main():
         check("--dest and --filter are accepted for a local folder",
               rc == 0 and "Traceback" not in out)
 
+        # ---- 1b. a broken environment must say so, not traceback ----
+        # Every one of these used to die on a raw ModuleNotFoundError from
+        # whichever module imported duckdb first, or worse, quietly succeed.
+        bare = os.path.join(tmp, "bare-venv")
+        rc = subprocess.run([sys.executable, "-m", "venv", bare],
+                            capture_output=True).returncode
+        if rc == 0 and os.path.exists(os.path.join(bare, "bin", "python")):
+            nodeps = os.path.join(bare, "bin", "python")
+            bad = []
+            for cmd in (["status"], ["scan", empty], ["get", data],
+                        ["serve", "--dry-run"], ["setup"], []):
+                p = subprocess.run([nodeps, ATLAS] + cmd, env=env_for(dbs),
+                                   cwd=ROOT, stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, timeout=300)
+                out = p.stdout + p.stderr
+                name = " ".join(cmd) or "(no arguments)"
+                if "Traceback" in out:
+                    bad.append(f"{name}: traceback")
+                elif p.returncode == 0:
+                    bad.append(f"{name}: exited 0 with no dependencies")
+                elif "Missing dependencies" not in out:
+                    bad.append(f"{name}: {out.strip().splitlines()[-1][:60]}")
+            check("with no dependencies every command says so and exits non-zero",
+                  not bad, "; ".join(bad))
+        else:
+            print("  [ -- ] could not build a bare venv here, skipped")
+
+        # A database directory that cannot be used must be named before any
+        # ingest runs, not produce one DuckDB traceback per ingest script.
+        for where, why in ((os.path.join(tmp, "nope"), "does not exist"),
+                           (os.path.join(tmp, "nope", "deeper"),
+                            "parent does not exist")):
+            p = subprocess.run([sys.executable, ATLAS, "get", data],
+                               env={**os.environ, "ATLAS_DB_DIR": where},
+                               cwd=ROOT, stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=300)
+            out = p.stdout + p.stderr
+            check(f"a database directory that {why} is reported, not crashed on",
+                  p.returncode != 0 and "Traceback" not in out
+                  and "database directory" in out,
+                  out.strip().splitlines()[-1][:80] if out.strip() else "")
+
+        # ATLAS_DB_DIR on its own has to actually move the databases: it is
+        # documented to, and silently writing into the repository instead is
+        # how someone loses track of where their data went.
+        moved = os.path.join(tmp, "moved")
+        os.makedirs(moved)
+        p = subprocess.run([sys.executable, ATLAS, "get",
+                            os.path.join(data, "mds2-test")],
+                           env={**os.environ, "ATLAS_DB_DIR": moved}, cwd=ROOT,
+                           stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=1800)
+        here = sorted(f for f in os.listdir(moved) if f.endswith(".duckdb"))
+        check("ATLAS_DB_DIR alone puts the databases where it says",
+              p.returncode == 0 and here and "ATLAS_DB_DIR" in (p.stdout + p.stderr),
+              str(here))
+
+        # `atlas.py status | head` closes the pipe mid-write.
+        p = subprocess.run(f"{sys.executable} {ATLAS} status | head -2",
+                           shell=True, env=env_for(moved), cwd=ROOT,
+                           capture_output=True, text=True, timeout=300)
+        check("a closed pipe (status | head) is not an error",
+              p.returncode == 0 and "BrokenPipeError" not in p.stderr,
+              p.stderr.strip().splitlines()[-1][:70] if p.stderr.strip() else "")
+
+        # --ask with stdin closed outright raises RuntimeError, not EOFError.
+        askdbs = os.path.join(tmp, "askdbs")
+        os.makedirs(askdbs, exist_ok=True)
+        for how, shell in (("closed", "0<&-"), ("redirected", "</dev/null")):
+            p = subprocess.run(
+                f"{sys.executable} {ATLAS} get {data} --ask {shell}",
+                shell=True, env=env_for(askdbs), cwd=ROOT,
+                capture_output=True, text=True, timeout=600)
+            out = p.stdout + p.stderr
+            check(f"--ask with stdin {how} refuses instead of crashing",
+                  p.returncode != 0 and "Traceback" not in out
+                  and "no terminal" in out,
+                  out.strip().splitlines()[-1][:70] if out.strip() else "")
+
+        # A database that is not usable must never be reported as healthy, and
+        # nothing may be written into it. Every shape a bad file comes in.
+        import duckdb as _dd
+        cases = {}
+        for label in ("zero", "text", "dir", "wrongcols", "foreign"):
+            d = os.path.join(tmp, "bad-" + label)
+            os.makedirs(d)
+            iq = os.path.join(d, "iq.duckdb")
+            if label == "zero":
+                open(iq, "wb").close()
+            elif label == "text":
+                open(iq, "w").write("not a database at all")
+            elif label == "dir":
+                os.makedirs(iq)
+            else:
+                c2 = _dd.connect(iq)
+                c2.execute("CREATE TABLE iq_stft (wrong_col INT, another VARCHAR)"
+                           if label == "wrongcols"
+                           else "CREATE TABLE customers (id INT, name VARCHAR)")
+                c2.close()
+            cases[label] = d
+        bad = []
+        for label, d in cases.items():
+            e = {**os.environ, "ATLAS_DB_DIR": d}
+            for cmd in (["status"], []):
+                p = subprocess.run([sys.executable, ATLAS] + cmd, env=e,
+                                   cwd=ROOT, stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, timeout=300)
+                out = p.stdout + p.stderr
+                name = f"{label}/{' '.join(cmd) or 'menu'}"
+                if "Traceback" in out:
+                    bad.append(f"{name}: traceback")
+                # The exact failure mode this guards: claiming a broken file is
+                # a working pyramid and telling the user to start the viewer.
+                elif "stft pyramid" in out or "Ready. Start the viewer" in out:
+                    bad.append(f"{name}: reported as healthy")
+        check(f"a broken iq.duckdb is never called healthy ({len(cases)} shapes)",
+              not bad, "; ".join(bad))
+
+        bad = []
+        for label, d in cases.items():
+            p = subprocess.run([sys.executable, ATLAS, "doctor"],
+                               env={**os.environ, "ATLAS_DB_DIR": d}, cwd=ROOT,
+                               stdin=subprocess.DEVNULL, capture_output=True,
+                               text=True, timeout=600)
+            after = os.path.join(d, "iq.duckdb")
+            if label == "dir":
+                continue
+            if label in ("wrongcols", "foreign"):
+                # doctor used to build the demo straight into these, adding
+                # tables to someone else's database with no backup.
+                try:
+                    c2 = _dd.connect(after, read_only=True)
+                    tables = {r[0] for r in c2.execute(
+                        "SELECT table_name FROM information_schema.tables"
+                    ).fetchall()}
+                    c2.close()
+                except Exception:                             # noqa: BLE001
+                    tables = set()
+                if "iq_meta" in tables:
+                    bad.append(f"{label}: doctor wrote into it ({sorted(tables)})")
+            if "Traceback" in (p.stdout + p.stderr):
+                bad.append(f"{label}: traceback")
+        check("doctor never writes into a database it called unusable",
+              not bad, "; ".join(bad))
+
+        # A search that stops early has to say so. Silently missing data and
+        # then blaming the file naming sends people the wrong way entirely.
+        deep = os.path.join(tmp, "deep", *[f"lvl{i}" for i in range(19)])
+        TI.make_data(deep)
+        root_deep = os.path.join(tmp, "deep")
+        rc, out = cli(["scan", root_deep], dbs)
+        check("a scan that hit the depth limit says so instead of blaming names",
+              rc != 0 and "directory levels" in out
+              and "--max-depth" in out and "named differently" not in out,
+              next((l.strip() for l in out.splitlines()
+                    if "directory levels" in l), ""))
+        rc, out = cli(["scan", root_deep, "--max-depth", "40"], dbs)
+        check("--max-depth finds data the default depth misses",
+              rc == 0 and "CBRS PSD export(s)" in out,
+              next((l.strip() for l in out.splitlines()
+                    if "PSD export" in l), ""))
+
         # ---- 2. prompt(): every kind of thing a person can type ----
         import atlas                                          # noqa: E402
         import builtins

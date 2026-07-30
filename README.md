@@ -93,6 +93,10 @@ That is the whole install. Everything below is optional.
 | Browser shows "No spectrum data found" | Run `python atlas.py doctor`. It reports what is built and what to do next. |
 | Anything else | Run `python atlas.py doctor`. |
 | Server prints "spectrum.duckdb not found" | Expected. That's the optional multi-GB CBRS data; IQ mode still works. |
+| A download fails with `HTTP 403` | The host refused the request, not the file. See [the 403 note](#python-atlaspy-get--one-command-for-any-data); downloading in a browser and running `atlas.py get <folder>` always works. |
+| `<name>.duckdb is not usable` | That file is corrupt, or is not one of ours. Move or delete it and rebuild; `python atlas.py status` names it and why. |
+| `the database directory ... cannot be used` | `ATLAS_DB_DIR` points somewhere missing or read-only. Create it, or unset it to use the repo folder. |
+| `scan` finds nothing but the data is there | It stops 12 directory levels down and says so. Re-run with `--max-depth 40`, or name the folder directly. |
 
 # For AI agents (Claude Code, Cowork, etc.)
 
@@ -271,7 +275,7 @@ If you already know what you want, every choice above is also a direct command:
 |---|---|
 | `python atlas.py` | the menu above |
 | `python atlas.py doctor` | full report: environment, dependencies, disk, databases, data |
-| `python atlas.py scan` | find spectrum data on this machine, change nothing |
+| `python atlas.py scan` | find spectrum data on this machine, change nothing (`--deep` to look wider, `--max-depth N` to look further down) |
 | `python atlas.py get <thing>` | a folder, a file, a dataset name, a record id, a DOI, or any URL |
 | `python atlas.py status` | what is built |
 | `python atlas.py serve` | start the viewer |
@@ -289,7 +293,7 @@ needs. Keep the list somewhere else with `ATLAS_DATASETS=/path/to/my.json`.
 | Variable | Effect |
 |---|---|
 | `ATLAS_DOWNLOAD_DIR` | where `get` downloads to (default `./downloads`) — point it at a bigger disk |
-| `ATLAS_DB_DIR` | where the `.duckdb` files live |
+| `ATLAS_DB_DIR` | where all four `.duckdb` files live (`atlas.py`, `serve.py` and every ingest read it) |
 | `SPECTRUM_DB` / `PSD_DB` / `PFP_DB` / `IQ_DB` | the path of one database |
 | `ATLAS_DATASETS` | your own dataset list instead of `datasets.json` |
 | `ATLAS_USER_AGENT` | User-Agent for downloads, if a host or proxy wants a specific one |

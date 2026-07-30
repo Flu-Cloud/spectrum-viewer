@@ -526,8 +526,14 @@ def main():
         fc.execute("CREATE TABLE customers (id INT, name VARCHAR)")
         fc.close()
         rc, out = run(["get", foreign], dbs7)
-        check("a foreign database is refused even when named like ours",
-              rc != 0 and "Nothing recognisable" in out)
+        # Refused, and said which file and why -- "nothing recognisable here" is
+        # misleading when the thing it will not load is sitting right there.
+        check("a foreign database is refused, and named, when it looks like ours",
+              rc != 0 and "could not be read" in out
+              and "psd.duckdb" in out and "customers" in out
+              and "Traceback" not in out,
+              next((l.strip() for l in out.splitlines()
+                    if "customers" in l), out.strip()[-120:]))
 
         # ---- download a record and ingest it, in one command ----
         # Everything above hands `get` bytes that were already on disk. This is

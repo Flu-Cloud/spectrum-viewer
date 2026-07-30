@@ -28,7 +28,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 # Where the .duckdb files live; override to compact a copy elsewhere.
-DB_DIR = os.environ.get("ATLAS_DB_DIR", ROOT)
+DB_DIR = os.environ.get("ATLAS_DB_DIR") or ROOT
 Z = 6                # zlib level (PFP 3.1x, PSD 1.7x at z6; measured on live data)
 PSD_CHUNK = 256      # spectra per chunk  (256*2250 = 576 KB raw)
 PFP_CHUNK = 1024     # frames per chunk   (1024*560 = 573 KB raw)

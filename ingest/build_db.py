@@ -28,7 +28,8 @@ import cbrs_files                                    # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 CSV_DIR = os.path.join(HERE, "csv")
-DB_PATH = os.environ.get("SPECTRUM_DB", os.path.join(ROOT, "spectrum.duckdb"))
+DB_DIR = os.environ.get("ATLAS_DB_DIR") or ROOT
+DB_PATH = os.environ.get("SPECTRUM_DB") or os.path.join(DB_DIR, "spectrum.duckdb")
 
 # Summaries CSVs carry these columns; anything else in the folder is skipped
 # with a reason rather than aborting the whole run.
