@@ -79,6 +79,47 @@ CMAP_ANCHORS = np.array([
 ], dtype=np.float64)
 
 
+class BadRequest(Exception):
+    """A request that cannot be honoured as asked. Answered with 400."""
+
+
+@app.errorhandler(BadRequest)
+def _bad_request(e):
+    return jsonify({"error": str(e)}), 400
+
+
+def _num(name, default=None, cast=float, required=False):
+    """One numeric query parameter, parsed.
+
+    Every axis value arrives as text in a URL, so a missing or non-numeric one
+    is the caller's mistake and deserves a 400 naming the parameter. Calling
+    float() on it directly meant an unhandled exception and a 500 -- the one
+    answer the viewer can do nothing with, and indistinguishable from the
+    server being broken.
+    """
+    raw = request.args.get(name)
+    if raw is None or raw == "":
+        if required:
+            raise BadRequest(f"missing required parameter '{name}'")
+        return default
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        raise BadRequest(f"parameter '{name}' must be a number, got {raw!r}")
+
+
+def _window(default_h=600):
+    """The (t0, t1, H) every layer endpoint starts from."""
+    return (_num("t0", required=True), _num("t1", required=True),
+            max(1, _num("h", 600, int)))
+
+
+def _locked_scale():
+    """The colour lock, when the viewer sent both halves of it, else None."""
+    lo, hi = _num("vmin"), _num("vmax")
+    return None if lo is None or hi is None else (lo, hi)
+
+
 def _build_lut(anchors):
     seg = len(anchors) - 1
     xs = np.linspace(0, seg, 256)
@@ -160,9 +201,9 @@ def heatmap():
         return _gz(jsonify({"level": None, "bucket": 0, "count": 0,
                             "freq": [], "t": [], "max": [], "median": [], "mean": []}))
     sensor = request.args.get("sensor")
-    t0 = float(request.args.get("t0"))
-    t1 = float(request.args.get("t1"))
-    width = int(request.args.get("width", 1600))
+    t0 = _num("t0", required=True)
+    t1 = _num("t1", required=True)
+    width = max(1, _num("width", 1600, int))
     span = max(t1 - t0, 1.0)
 
     tbl, bucket = pick_level(span, width)
@@ -330,9 +371,8 @@ def psd_meta():
 @app.route("/api/psd_layer")
 def psd_layer():
     sensor = request.args.get("sensor")
-    t0 = float(request.args.get("t0")); t1 = float(request.args.get("t1"))
-    H = max(1, int(request.args.get("h", 600)))
-    f0 = float(request.args.get("f0", 0)); f1 = float(request.args.get("f1", 0))
+    t0, t1, H = _window()
+    f0 = _num("f0", 0.0); f1 = _num("f1", 0.0)
     fi0 = int(round((f0 - F0) / DF)) if f0 > 0 else 0
     fi1 = int(round((f1 - F0) / DF)) if f1 > 0 else NF - 1
     fi0 = max(0, min(NF - 1, fi0)); fi1 = max(0, min(NF - 1, fi1))
@@ -357,9 +397,9 @@ def psd_layer():
     nF = band.shape[1] // fb
     binned = band.reshape(ncap, nF, fb).max(axis=2)
     img = qmin + (binned.T / 255.0) * (qmax - qmin) + PSD_DBM_OFFSET  # (nF, ncap); row 0 = low f
-    qv0 = request.args.get("vmin"); qv1 = request.args.get("vmax")
-    if qv0 is not None and qv1 is not None:
-        vmin, vmax = float(qv0), float(qv1)
+    locked = _locked_scale()
+    if locked:
+        vmin, vmax = locked
     else:
         with _psd_lock:
             vmin, vmax = _psd_scale(c, sensor, qmin, qmax)   # full-range: no drift on zoom
@@ -425,9 +465,8 @@ def pfp_meta():
 def pfp_frame():
     """Frame heatmap for one channel: X = capture time, Y = frame position."""
     sensor = request.args.get("sensor")
-    freq = float(request.args.get("freq"))
-    t0 = float(request.args.get("t0")); t1 = float(request.args.get("t1"))
-    H = max(1, int(request.args.get("h", 600)))
+    freq = _num("freq", required=True)
+    t0, t1, H = _window()
     c = pfp_conn()
     if c is None or _pfp_kind is None:
         return jsonify({"error": "pfp not ready"}), 503
@@ -460,9 +499,9 @@ def pfp_frame():
         m2 = np.pad(mat, ((0, pad), (0, 0))) if pad else mat
         mat = m2.reshape(m2.shape[0] // fb, fb, ncap).max(axis=1)
     img = qmin + (mat / 255.0) * (qmax - qmin)        # (nrows, ncap); row 0 = frame start
-    qv0 = request.args.get("vmin"); qv1 = request.args.get("vmax")
-    if qv0 is not None and qv1 is not None:
-        vmin, vmax = float(qv0), float(qv1)
+    locked = _locked_scale()
+    if locked:
+        vmin, vmax = locked
     else:
         vmin = float(np.percentile(img, 2)); vmax = float(np.percentile(img, 98))
     return _tile(_colorize(img, vmin, vmax, request.args.get("cmap", "inferno")), {
@@ -530,13 +569,13 @@ def iq_layer():
         c.close()
         return jsonify({"error": "unknown capture"}), 404
     fc, fs, dur, nfft, hop, nlevels, qmin, qmax, dvmin, dvmax = m
-    t0 = max(0.0, float(request.args.get("t0", 0)))
-    t1 = min(dur, float(request.args.get("t1", dur)))
-    W = max(1, int(request.args.get("w", 1200)))
-    H = max(1, int(request.args.get("h", 600)))
+    t0 = max(0.0, _num("t0", 0.0))
+    t1 = min(dur, _num("t1", dur))
+    W = max(1, _num("w", 1200, int))
+    H = max(1, _num("h", 600, int))
     fmin_full, fmax_full = fc - fs / 2, fc + fs / 2
-    f0 = max(fmin_full, float(request.args.get("f0", fmin_full)))
-    f1 = min(fmax_full, float(request.args.get("f1", fmax_full)))
+    f0 = max(fmin_full, _num("f0", fmin_full))
+    f1 = min(fmax_full, _num("f1", fmax_full))
     if t1 <= t0 or f1 <= f0:
         c.close()
         return jsonify({"error": "empty window"}), 400
@@ -570,9 +609,9 @@ def iq_layer():
         band = np.pad(band, ((0, pad), (0, 0)))
     img = band.reshape(band.shape[0] // fb, fb, -1).max(axis=1)
     img = qmin + (img / 255.0) * (qmax - qmin)        # uint8 -> dBm
-    qv0, qv1 = request.args.get("vmin"), request.args.get("vmax")
-    vmin = float(qv0) if qv0 is not None else dvmin   # locked scale: no drift on zoom
-    vmax = float(qv1) if qv1 is not None else dvmax
+    # locked scale: no drift on zoom
+    vmin = _num("vmin", dvmin)
+    vmax = _num("vmax", dvmax)
     return _tile(_colorize(img, vmin, vmax, request.args.get("cmap", "inferno")), {
         "t0": c0 * colw, "t1": c1 * colw,
         "fmin": fmin_full + fi0 * df, "fmax": fmin_full + fi1 * df,

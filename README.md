@@ -114,6 +114,26 @@ this work": it checks the Python version, the imports, the demo database and
 every API endpoint in-process (no browser or free port required), and exits 0
 on success. `python atlas.py status` answers "what is built" at any point.
 
+# Tests
+
+```bash
+python examples/test_all.py          # everything; exits 0 = all good
+python examples/test_all.py -q       # just the per-suite verdicts
+```
+
+No network and no browser: each suite builds its own fixtures in a temporary
+folder, and the download tests run against a fake NIST repository on localhost.
+Nothing touches the databases beside `serve.py`.
+
+| Suite | Covers |
+|---|---|
+| `examples/verify.py` | the install: version, imports, demo database, endpoints |
+| `examples/test_fetch.py` | downloading: every source form, host policy, resume, checksums, and the HTTP 403 that bot protection causes |
+| `examples/test_ingest.py` | the CBRS path end to end, compacted and uncompacted |
+| `examples/test_atlas.py` | `atlas.py get` on every kind of data, and a record taken from id to rendered tile |
+| `examples/test_cli.py` | every subcommand, flag and prompt input, and the menu in each of its states with every choice pressed |
+| `examples/test_serve.py` | every endpoint, and every control the viewer drives through them |
+
 # What the two modes show
 
 ## CBRS monitoring mode
@@ -139,6 +159,76 @@ continuous zoom and locked colours. Below is a NIST high-SNR FDD-LTE uplink
 capture showing the burst / resource-block structure.
 
 ![IQ capture spectrogram](docs/iq_capture.jpg)
+
+# `python atlas.py get` — one command for any data
+
+This is the workhorse. Point it at anything and it works out the rest: whether
+the thing needs downloading, what format each file is, which of the five ingest
+scripts matches, and how to run them. You never name a script.
+
+```bash
+python atlas.py get lte-uplink                  # a NIST dataset, by name
+python atlas.py get mds2-3177                   # a NIST PDR record id
+python atlas.py get ~/Downloads/mds2-3177       # a folder you already have
+python atlas.py get capture.sigmf-meta          # one capture file
+python atlas.py get ~/my_captures.duckdb        # a database you built earlier
+python atlas.py get https://doi.org/10.18434/mds2-3177
+```
+
+**Downloading a NIST record.** The first run of a big record should cost
+megabytes, not gigabytes, so start with a sample:
+
+```bash
+# what is in the record, by folder, without downloading anything
+python ingest/fetch.py mds2-3177 --list
+
+# the 3 smallest captures, downloaded and ingested, ready to view
+python atlas.py get mds2-3177 --first 3
+python atlas.py serve
+```
+
+`--first N` counts **captures**, not files: a `.sigmf-meta` and its
+`.sigmf-data` are one capture and are never split, so a sample is always
+something you can actually look at. Narrow further with
+`--filter 1.4MHz/config_0`, or pass `--filter ''` for the whole record.
+
+Downloads resume. Ctrl+C any time and re-run the same command: complete files
+are skipped, a partial file continues over HTTP Range, and anything with a
+`.sha256` sidecar in the record is verified against it.
+
+**Databases you already have.** Prebuilt `.duckdb` files are recognised by the
+tables inside them rather than their filename, so `spectrum_viewer.db` or
+`my_captures.duckdb` is identified for what it holds and installed where
+`serve.py` looks. Point `get` at a folder of them and they are **merged**, by
+capture id for IQ and by sensor for CBRS — loading a second database adds to
+your library instead of replacing it, and re-running adds nothing twice.
+
+**Useful flags.**
+
+| Flag | What it does |
+|---|---|
+| `--dry-run` | print the plan and change nothing |
+| `--ask` | show the plan and wait for confirmation |
+| `--first N` | only the N smallest captures |
+| `--filter SUB` | only paths containing SUB (case-insensitive) |
+| `--dest DIR` | where to download to |
+| `--compact` | shrink the CBRS databases afterwards |
+
+Anything else is passed straight through to `ingest/fetch.py`, so
+`--nist-only`, `--allow-host HOST` and `--user-agent STRING` work here too.
+
+**If a download is refused with HTTP 403.** `data.nist.gov` sits behind bot
+protection that rejects clients it does not recognise. ATLAS sends a browser's
+header set and escalates through several more if the first is refused, which is
+normally enough. If a host still refuses everything, the failure says so and
+names the way round it — and that way always works:
+
+```bash
+# download the files in your browser from the record's page, then:
+python atlas.py get "C:\Users\you\Downloads\mds2-3177"
+```
+
+The ingest is identical either way.
 
 # Bring your own dataset
 
@@ -181,12 +271,25 @@ If you already know what you want, every choice above is also a direct command:
 | `python atlas.py status` | what is built |
 | `python atlas.py serve` | start the viewer |
 
-`get` accepts anything: a local folder or file, a friendly name from
-`datasets.json`, a NIST PDR record id or `ark:`, a DOI or landing URL, or a
-direct file URL to any https host. It downloads only when the target is not
-already local, classifies every file it finds, and runs the ingest each one
-needs. Add `--dry-run` to see the plan, `--ask` to confirm it first, or
-`--compact` to shrink the databases afterwards.
+Menu choice 3 is the same thing as
+[`atlas.py get`](#python-atlaspy-get--one-command-for-any-data): it asks which
+dataset and how much of it, then downloads and ingests that slice.
+
+Add your own entries to `datasets.json` — any record id, `ark:`, DOI or landing
+URL works, plus an optional default `filter` and any extra `flags` that record
+needs. Keep the list somewhere else with `ATLAS_DATASETS=/path/to/my.json`.
+
+**Environment variables.** All optional.
+
+| Variable | Effect |
+|---|---|
+| `ATLAS_DOWNLOAD_DIR` | where `get` downloads to (default `./downloads`) — point it at a bigger disk |
+| `ATLAS_DB_DIR` | where the `.duckdb` files live |
+| `SPECTRUM_DB` / `PSD_DB` / `PFP_DB` / `IQ_DB` | the path of one database |
+| `ATLAS_DATASETS` | your own dataset list instead of `datasets.json` |
+| `ATLAS_USER_AGENT` | User-Agent for downloads, if a host or proxy wants a specific one |
+| `SEA_DATA_ROOT` | default source folder for the CBRS ingests |
+| `SEA_PORT` | port for `serve` (default 8090) |
 
 <details>
 <summary>Driving the ingest scripts directly</summary>
@@ -245,7 +348,7 @@ serve.py            Flask backend (app entry point)
 viewer.html         single-file canvas frontend
 datasets.json       friendly names -> PDR records
 requirements.txt    dependencies, with tested versions
-examples/           demo data, the install check, and the offline tests
+examples/           demo data, the install check, and the offline test suites
 docs/               screenshots + IQ dataset notes
 ingest/             fetch + database-build tooling, all resumable
 ```
