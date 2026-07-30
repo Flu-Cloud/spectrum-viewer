@@ -133,6 +133,11 @@ Nothing touches the databases beside `serve.py`.
 | `examples/test_atlas.py` | `atlas.py get` on every kind of data, and a record taken from id to rendered tile |
 | `examples/test_cli.py` | every subcommand, flag and prompt input, and the menu in each of its states with every choice pressed |
 | `examples/test_serve.py` | every endpoint, and every control the viewer drives through them |
+| `examples/test_viewer.py` | `viewer.html` in a real browser: the source dropdown, both zoom sliders, scroll/ctrl-scroll/drag, colormap, reset, export, and a clean console |
+
+`test_viewer.py` is the only one that needs anything extra (`pip install
+playwright && playwright install chromium`). Without it, it reports SKIP and the
+run still passes.
 
 # What the two modes show
 

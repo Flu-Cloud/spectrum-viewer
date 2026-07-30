@@ -633,8 +633,10 @@ def cmd_scan(args):
     """Find spectrum data anywhere on this machine and say what it is."""
     roots = args.roots or (deep_roots() if args.deep else default_roots())
     if not roots:
+        example = ("C:\\Users\\you\\Downloads" if os.name == "nt"
+                   else "~/Downloads")
         print("No obvious place to look. Pass a folder: "
-              "python atlas.py scan C:\\path\\to\\data", file=sys.stderr)
+              f"python atlas.py scan {example}", file=sys.stderr)
         return 1
     print(f"searching {len(roots)} place(s), up to {args.max_files:,} files each."
           + ("" if args.deep else "  Add --deep to search wider, or name a "

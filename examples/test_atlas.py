@@ -259,14 +259,17 @@ def main():
               rc == 0 and "--nist-only" in out and "--allow-host example.org" in out,
               next((l.strip() for l in out.splitlines() if "fetch.py" in l), ""))
 
+        # A download folder of its own, so the assertion below does not depend
+        # on where downloads happen to go on the machine running the test.
+        dl = os.path.join(tmp, "dlhome")
         rc, out = run(["get", "<https://data.nist.gov/od/id/mds2-3177>",
-                       "--dry-run"], dbs)
+                       "--dry-run"], dbs, {"ATLAS_DOWNLOAD_DIR": dl})
         # normalise the separator: the folder name is what is being checked,
         # and Windows spells the same path with backslashes
         flat = out.replace("\\", "/")
+        want = (dl + "/mds2-3177").replace("\\", "/")
         check("a URL pasted with angle brackets still names the folder cleanly",
-              rc == 0 and "--dest downloads/mds2-3177" in flat
-              and ">" not in out,
+              rc == 0 and f"--dest {want}" in flat and ">" not in out,
               next((l.strip() for l in out.splitlines() if "fetch.py" in l), ""))
 
         dbs5 = os.path.join(tmp, "dbs5")

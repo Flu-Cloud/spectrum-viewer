@@ -18,6 +18,8 @@ What each one covers:
                     downloaded and ingested through to a rendered tile
     test_cli.py     every command, flag, prompt input and menu choice
     test_serve.py   every endpoint, and every control the viewer drives
+    test_viewer.py  viewer.html in a real browser, pressing every control.
+                    Optional: skips cleanly without playwright + a Chromium
 """
 
 import os
@@ -38,6 +40,9 @@ SUITES = [
     ("test_atlas.py", "atlas.py get, on data and on records"),
     ("test_cli.py", "every command, flag and menu choice"),
     ("test_serve.py", "every endpoint and viewer control"),
+    # Last because it is the only one that needs anything the project does not
+    # already require. It reports SKIP, and exits 0, when it cannot run.
+    ("test_viewer.py", "the viewer in a real browser (optional)"),
 ]
 
 
@@ -63,7 +68,10 @@ def main():
             out = (p.stdout or "") + (p.stderr or "")
             verdict = next((l for l in reversed(out.splitlines())
                             if l.startswith("RESULT:")), "")
-            print(f"     {'PASS' if ok else 'FAIL'}  {dt:5.1f}s  {verdict}")
+            word = "PASS" if ok else "FAIL"
+            if ok and verdict.startswith("RESULT: SKIP"):
+                word = "SKIP"
+            print(f"     {word}  {dt:5.1f}s  {verdict}")
             if not ok:
                 for line in out.splitlines():
                     if "[FAIL]" in line:
