@@ -17,6 +17,9 @@ import os
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _require  # noqa: F401  -- deps message instead of a traceback
+
 import duckdb
 import numpy as np
 

@@ -35,7 +35,7 @@
   [hidden] { display: none !important; }   /* `hidden` beats any display rule */
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
                font: 13px/1.45 ui-sans-serif, system-ui, "Segoe UI", sans-serif; }
-  #app { display: flex; flex-direction: column; min-height: 100%; }
+  #app { display: flex; flex-direction: column; height: 100%; }
 
   /* ---- Header toolbar ---- */
   header { display: flex; gap: 16px; align-items: center; padding: 8px 16px;
@@ -76,13 +76,7 @@
         border-radius: 4px; padding: 0 5px; font: 11px ui-monospace, monospace; color: var(--text-mut); }
 
   /* ---- Plot stage ---- */
-  /* The plot takes what the toolbar and footer leave over, and both of those
-     wrap onto extra rows in a narrow or zoomed-in window. Without a floor the
-     plot is simply squeezed to whatever remains -- at 200% zoom in a 400px
-     window that is 122px, in which one 10 MHz channel already fills the
-     height, so zooming appears to do nothing at all and every layer looks
-     broken. Keep a usable plot and let the page scroll instead. */
-  #stage { position: relative; flex: 1 1 auto; overflow: hidden; min-height: 320px; }
+  #stage { position: relative; flex: 1; overflow: hidden; }
   canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; }
   canvas.drag { cursor: grabbing; }
 
@@ -169,6 +163,7 @@
     <div><span class="k">Window</span><b id="winRange">-</b></div>
     <div><span class="k">Span</span><b id="winSpan">-</b></div>
     <div><span class="k">Detail</span><b id="level">-</b></div>
+    <div><button id="gopfp" hidden title="Jump to a one-hour window on the nearest channel, where the ~18 µs frame layer is drawn">Show frame detail</button></div>
     <div><span class="k">Cursor</span><b id="cursor">-</b></div>
   </footer>
 </div>
@@ -228,9 +223,61 @@ let pfpAvail = false, pfpImg = null, pfpView = null, pfpFrameMs = 10;
 const ONE_CHANNEL = 12e6;               // freq window <= this -> focused on one channel
 const PFP_TIME_THRESHOLD = 6 * 3600;    // and time span <= this -> show the frame layer
 const DEEP_TIME = 30 * 60;              // zoom time below this -> auto-drop into PFP (PSD can't go finer)
+let pfpFreqs = [];                      // channel centres (Hz) the server actually holds
+let pfpRange = null;                    // {t_min,t_max} the PFP layer actually covers
+let pfpNote = '';                       // why the frame layer is not on screen
+function jumpToPfp(){
+  // Take the view to somewhere the frame layer actually exists, in one click.
+  // The thresholds are reachable by hand but only just: from the opening view
+  // it is roughly 2000x in time and 15x in frequency, and until you arrive
+  // nothing is drawn, so a working layer is indistinguishable from a broken
+  // one. Landing on a window chosen from the data -- inside pfp_meta's real
+  // range, centred on a channel that exists -- cannot miss, which is the
+  // difference between "the layer is there" and "the layer is reachable".
+  if (!pfpAvail || !pfpFreqs.length) return;
+  const r = pfpRange || {t0: view.t0, t1: view.t1};
+  const span = 3600;                                   // one hour of frames
+  const end = Math.min(view.t1, r.t1);                 // stay where the user was, if it has data
+  const lo = Math.max(r.t0, Math.min(end - span, r.t1 - span));
+  view = {t0: lo, t1: lo + span};
+  const c = (viewF.f0 + viewF.f1) / 2;
+  const ch = pfpFreqs.reduce((a, b) => Math.abs(b - c) < Math.abs(a - c) ? b : a);
+  viewF = {f0: ch - ONE_CHANNEL / 2, f1: ch + ONE_CHANNEL / 2};
+  onFreqChange();                                      // snaps, clamps, redraws
+  layoutTimeSlider();
+}
+
+function pfpHint(){
+  // Say what the frame layer is still waiting for. Reaching it means zooming
+  // from a 500-day, 180 MHz view down to 6 hours and 12 MHz -- a factor of
+  // roughly 2000 in time -- and nothing on screen said so, so the layer read
+  // as broken rather than as not-yet-requested. The thresholds are the same
+  // ones buildReq() gates on, quoted against where the view actually is.
+  const btn = document.getElementById('gopfp');
+  const reachable = (mode==='cbrs' && pfpAvail && pfpFreqs.length && layerMode!=='pfp');
+  if (btn) btn.hidden = !reachable;
+  if (mode!=='cbrs' || !pfpAvail || layerMode==='pfp') return '';
+  if (pfpNote) return ` · ⚠ PFP: ${pfpNote}`;
+  const t=view.t1-view.t0, f=viewF.f1-viewF.f0;
+  if (t<=PFP_TIME_THRESHOLD && f<=ONE_CHANNEL) return '';
+  const need=[];
+  if (t>PFP_TIME_THRESHOLD) need.push(`time to ≤6 h (now ${fmtSpan(t)})`);
+  if (f>ONE_CHANNEL) need.push(`frequency to ≤12 MHz (now ${(f/1e6).toFixed(0)} MHz)`);
+  return ` · PFP frame layer: zoom ${need.join(' and ')}`;
+}
+
 function nearestChannelHz(){            // channel centre nearest the freq-window centre
-  const cMHz = (viewF.f0 + viewF.f1) / 2 / 1e6;
-  return (Math.round((cMHz - 3535) / 10) * 10 + 3535) * 1e6;
+  // Snap to a channel that exists rather than to an assumed grid. This used to
+  // round to 3535 + 10k MHz, but the captures sit on 3550 + 10k (3560, 3640),
+  // so every request landed half a step off (centre 3560 -> asked for 3565),
+  // pfp_frame answered 404, and the PFP layer silently fell back to PSD --
+  // i.e. the deepest layer could never draw. /api/pfp_meta already returns the
+  // real list; use it. Return 0 when the nearest channel is outside the visible
+  // window so we never draw one channel under another channel's axis labels.
+  const c = (viewF.f0 + viewF.f1) / 2;
+  if (!pfpFreqs.length) return 0;
+  const ch = pfpFreqs.reduce((a, b) => Math.abs(b - c) < Math.abs(a - c) ? b : a);
+  return (ch >= viewF.f0 && ch <= viewF.f1) ? ch : 0;
 }
 
 // ---- Colormaps (selectable via the Colors dropdown) --------------------
@@ -317,14 +364,6 @@ function resize(){
 }
 
 function drawCrisp(){
-  // Drop any preview queued for the next frame. requestData() schedules the
-  // stretch preview through requestAnimationFrame and then, on a tile-cache
-  // hit, draws the real thing synchronously -- so the preview lands a frame
-  // *later* and paints the stale, stretched bitmap back over the correct
-  // image. Frequency zoom on the summary layer hits that path every time,
-  // because sumUrl carries no f0/f1 and so never misses the cache: the view
-  // appears to stretch the first tile forever and never switch layer.
-  if (previewRAF){ cancelAnimationFrame(previewRAF); previewRAF = null; }
   if (!meta) return;
   if (!syncCanvasSize()) return;   // size the canvas to the stage before drawing
   ctx.setTransform(DPR,0,0,DPR,0,0);
@@ -504,7 +543,7 @@ function applySummary(j){ data=j; layerMode='summary'; autoScale(); setLegendUni
 function applyPsd(j, im){ psdImg=im; psdView=j; layerMode='psd'; if(!psdScale) psdScale={vmin:j.vmin,vmax:j.vmax};
   document.getElementById('lo').textContent=psdScale.vmin.toFixed(0); document.getElementById('hi').textContent=psdScale.vmax.toFixed(0);
   setLegendUnit('dBm'); updateStatButtons(); drawCrisp(); updateReadout(); }
-function applyPfp(j, im, ch){ pfpImg=im; pfpView=j; pfpFrameMs=j.frame_ms; layerMode='pfp'; if(!pfpScale[ch]) pfpScale[ch]={vmin:j.vmin,vmax:j.vmax};
+function applyPfp(j, im, ch){ pfpImg=im; pfpView=j; pfpFrameMs=j.frame_ms; layerMode='pfp'; pfpNote=''; if(!pfpScale[ch]) pfpScale[ch]={vmin:j.vmin,vmax:j.vmax};
   const sc=pfpScale[ch]; document.getElementById('lo').textContent=sc.vmin.toFixed(0); document.getElementById('hi').textContent=sc.vmax.toFixed(0);
   setLegendUnit('dBm'); updateStatButtons(); drawCrisp(); updateReadout(); }
 
@@ -512,7 +551,8 @@ function applyPfp(j, im, ch){ pfpImg=im; pfpView=j; pfpFrameMs=j.frame_ms; layer
 function buildReq(){
   const span=view.t1-view.t0, freqSpan=viewF.f1-viewF.f0, w=Math.round(plotW()), h=Math.round(plotH());
   if (mode==='iq' && iqCap) return {kind:'iq', url:iqUrl(w,h)};
-  if (pfpAvail && freqSpan<=ONE_CHANNEL && span<=PFP_TIME_THRESHOLD){ const ch=nearestChannelHz(); return {kind:'pfp', url:pfpUrl(ch,h), ch}; }
+  const pch = pfpAvail ? nearestChannelHz() : 0;   // 0 = no real channel in this window
+  if (pch && freqSpan<=ONE_CHANNEL && span<=PFP_TIME_THRESHOLD) return {kind:'pfp', url:pfpUrl(pch,h), ch:pch};
   if (psdAvail && span<=PSD_THRESHOLD) return {kind:'psd', url:psdUrl(w,h)};
   return {kind:'summary', url:sumUrl(w)};
 }
@@ -547,13 +587,24 @@ async function doFetch(){
       const url=iqUrl(w,h), {j,img}=await fetchTile(url);
       if (seq!==fetchSeq) return;
       applyIq(j,img); cacheSet(url,{img,j}); setLoading(false);
-    } else if (pfpAvail && freqSpan<=ONE_CHANNEL && span<=PFP_TIME_THRESHOLD){
+    } else if (pfpAvail && nearestChannelHz() && freqSpan<=ONE_CHANNEL && span<=PFP_TIME_THRESHOLD){
       const ch=nearestChannelHz(), url=pfpUrl(ch,h);
       try{
         const {j,img}=await fetchTile(url);
         if (seq!==fetchSeq) return;
         applyPfp(j,img,ch); cacheSet(url,{img,j}); setLoading(false);
-      }catch(e){ await fetchPsdOrSummary(seq,span,w,h); }   // no PFP here -> PSD
+      }catch(e){
+        // No frame data in this window. The layer is not broken -- the PFP
+        // export usually stops months before the summary and PSD layers do,
+        // so any view near the recent end has nothing to draw. Falling back
+        // to PSD without saying so makes a data-coverage limit look exactly
+        // like a dead feature, which is why "PFP never loads" is the first
+        // thing people conclude. Say which range does have it.
+        pfpNote = (pfpRange && (view.t1 < pfpRange.t0 || view.t0 > pfpRange.t1))
+          ? `no frame data here — PFP covers ${fmtTs(pfpRange.t0)} → ${fmtTs(pfpRange.t1)}`
+          : 'no frame data in this window';
+        await fetchPsdOrSummary(seq,span,w,h);
+      }
     } else {
       await fetchPsdOrSummary(seq,span,w,h);
     }
@@ -599,8 +650,8 @@ function updateReadout(){
   document.getElementById('level').textContent =
     (layerMode==='iq' && iqView) ? `IQ STFT · pyramid level ${iqView.level} · ${iqView.cols} cols × ${iqView.nf} bins (${(iqCap.fs/iqCap.nfft/1e3).toFixed(1)} kHz)`
     : (layerMode==='pfp' && pfpView) ? `PFP frame · ${(pfpView.freq/1e6).toFixed(0)} MHz · ${pfpView.ncap} captures × ${pfpView.npos} pts (≈${(pfpFrameMs*1000/pfpView.npos).toFixed(1)} µs)`
-    : (layerMode==='psd' && psdView) ? (psdView.gap ? `PSD detail · ⚠ data gap, holding last capture` : `PSD detail · ${psdView.ncap} captures × 2250 bins @ 80 kHz`)
-    : (data ? `${data.level} (${data.count.toLocaleString()} cells)` : '-');
+    : (layerMode==='psd' && psdView) ? ((psdView.gap ? `PSD detail · ⚠ data gap, holding last capture` : `PSD detail · ${psdView.ncap} captures × 2250 bins @ 80 kHz`) + pfpHint())
+    : (data ? `${data.level} (${data.count.toLocaleString()} cells)` + pfpHint() : '-');
 }
 
 // Invert the colormap at a canvas pixel -> approximate power (IQ readout).
@@ -793,7 +844,7 @@ async function enterIqMode(id){
   if (mode==='cbrs') savedCbrs = { tmin:meta.tmin, tmax:meta.tmax, view:{...view}, viewF:{...viewF} };
   mode='iq'; iqCap=j; iqScale={vmin:j.vmin, vmax:j.vmax};
   clearLayers(); layerMode='iq';
-  psdAvail=false; pfpAvail=false;                     // CBRS drill layers are off in IQ mode
+  psdAvail=false; pfpAvail=false; pfpFreqs=[];        // CBRS drill layers are off in IQ mode
   BAND_F0=j.fc-j.fs/2; BAND_F1=j.fc+j.fs/2;
   meta.tmin=0; meta.tmax=j.duration;
   view={t0:0, t1:j.duration}; viewF={f0:BAND_F0, f1:BAND_F1};
@@ -905,6 +956,7 @@ function exportPNG(){
   return c;
 }
 document.getElementById('exportBtn').addEventListener('click', exportPNG);
+document.getElementById('gopfp').addEventListener('click', e=>{ e.preventDefault(); jumpToPfp(); });
 document.getElementById('cmap').addEventListener('change', e=>{
   cmapName = e.target.value;
   try { localStorage.setItem('cmap', cmapName); } catch(_){}
@@ -1003,10 +1055,12 @@ async function checkPsd(){
   if (mode==='cbrs' && psdAvail && (view.t1-view.t0)<=PSD_THRESHOLD) requestData();   // upgrade if already zoomed in
 }
 async function checkPfp(){
-  pfpAvail = false;
-  try { const j = await (await fetch('/api/pfp_meta?sensor='+enc(sensor))).json(); if (mode==='cbrs'){ pfpAvail = !!j.has; if (j.frame_ms) pfpFrameMs=j.frame_ms; } }
+  pfpAvail = false; pfpFreqs = [];
+  pfpRange = null; pfpNote = '';
+  try { const j = await (await fetch('/api/pfp_meta?sensor='+enc(sensor))).json(); if (mode==='cbrs'){ pfpAvail = !!j.has; pfpFreqs = j.freqs || []; if (j.frame_ms) pfpFrameMs=j.frame_ms;
+        if (j.has && j.t_min!=null && j.t_max!=null) pfpRange={t0:j.t_min, t1:j.t_max}; } }
   catch(e){}
-  if (mode==='cbrs' && pfpAvail && (viewF.f1-viewF.f0)<=ONE_CHANNEL && (view.t1-view.t0)<=PFP_TIME_THRESHOLD) requestData();
+  if (mode==='cbrs' && pfpAvail && nearestChannelHz() && (view.t1-view.t0)<=PFP_TIME_THRESHOLD) requestData();
 }
 boot();
 // IQ capture mode: header "Source" dropdown switches between CBRS monitoring

@@ -28,6 +28,9 @@ import re
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _require  # noqa: F401  -- deps message instead of a traceback
+
 import duckdb
 import numpy as np
 
@@ -80,6 +83,14 @@ def read_specs(path, rcon):
     ts = d[cols[0]].astype("datetime64[us]").astype("int64") / 1e6   # epoch sec
     P = np.stack([np.asarray(d[c], dtype=np.float64) for c in cols[1:]], axis=1)
     Q = np.clip(np.round((P - QMIN) / (QMAX - QMIN) * 255.0), 0, 255).astype(np.uint8)
+    # Values outside the quantization range clip to a flat 0 or 255 instead of
+    # failing, so a file in the wrong units (dBm rather than dBm/Hz, say)
+    # ingests as a featureless band and looks like a rendering bug later. Name
+    # the file now, while it is still obvious which one it was.
+    out = int(np.count_nonzero((P < QMIN) | (P > QMAX)))
+    if out > P.size // 100:
+        print(f"  WARN {os.path.basename(path)}: {100.0 * out / P.size:.0f}% of "
+              f"values are outside [{QMIN}, {QMAX}] dBm/Hz and were clipped flat")
     return ts, Q
 
 
@@ -124,8 +135,6 @@ def main():
 
     by_day = found[sensor]
     days = sorted(by_day)
-    if args.limit:
-        days = days[:args.limit]
     print(f"{sensor}: {len(days)} day(s) on disk (compact int8 BLOB)")
 
     con = duckdb.connect(PSD_DB)
@@ -133,21 +142,36 @@ def main():
     con.execute("""CREATE TABLE IF NOT EXISTS psd_meta (
         sensor VARCHAR, f0 DOUBLE, df DOUBLE, nf INT, qmin DOUBLE, qmax DOUBLE,
         t_min DOUBLE, t_max DOUBLE, captures BIGINT)""")
-    # resumable: skip days already ingested
+    # Resumable: skip days already ingested. t is the epoch second of a UTC
+    # capture and the filename's day is that same UTC day, but to_timestamp()
+    # renders in the machine's local zone -- west of Greenwich a 00:30 UTC
+    # capture buckets to the previous date. A day whose captures are all early
+    # UTC morning then never matches its own filename, so it is re-read and
+    # inserted again on every resume (duplicate rows), while a day that does
+    # match can be reported skipped without ever being compared. Bucket by UTC
+    # on the DB side so both sides of this comparison mean the same thing.
     existing = set(str(r[0]) for r in con.execute(
-        "SELECT DISTINCT CAST(to_timestamp(t) AS DATE) FROM psd WHERE sensor=?",
-        [sensor]).fetchall())
-    if existing:
-        print(f"  resuming: {len(existing)} day(s) already ingested, skipping those")
+        "SELECT DISTINCT CAST(to_timestamp(t) AT TIME ZONE 'UTC' AS DATE) "
+        "FROM psd WHERE sensor=?", [sensor]).fetchall())
+    todo = [d for d in days if d not in existing]
+    # Count the days this run is actually skipping, not every day the sensor
+    # has in the DB: `existing` spans the whole table, including days that are
+    # not under this --root at all. Reporting len(existing) is how "1 day on
+    # disk / 2 day(s) already ingested" -- more skipped than found -- happened.
+    if len(todo) < len(days):
+        print(f"  resuming: {len(days) - len(todo)} of {len(days)} day(s) "
+              f"already ingested, skipping those")
+    # --limit caps the days this run reads, applied after the resume filter.
+    # Capping `days` first re-selects the same already-ingested days on every
+    # run, so a limited resume can never advance past the first N days.
+    if args.limit:
+        todo = todo[:args.limit]
     rcon = duckdb.connect()   # separate handle for CSV reads
 
     t0 = time.time()
     done = err = caps = 0
     errors = []
-    for i, day in enumerate(days, 1):
-        if day in existing:
-            done += 1
-            continue
+    for i, day in enumerate(todo, 1):
         path = by_day[day]
         try:
             ts, Q = read_specs(path, rcon)
@@ -159,9 +183,9 @@ def main():
             err += 1
             errors.append(f"{os.path.basename(path)}: {e}")
             print(f"  ERR {os.path.basename(path)}: {e}")
-        if i % 25 == 0 or i == len(days):
+        if i % 25 == 0 or i == len(todo):
             rate = i / max(time.time() - t0, 1e-6)
-            print(f"  [{i}/{len(days)}] caps={caps:,} done={done} err={err} "
+            print(f"  [{i}/{len(todo)}] caps={caps:,} done={done} err={err} "
                   f"{rate:.1f} days/s")
 
     rng = con.execute("SELECT min(t), max(t), count(*) FROM psd WHERE sensor=?",
@@ -172,7 +196,7 @@ def main():
         # server would advertise the layer and then have nothing to draw.
         con.execute("DELETE FROM psd_meta WHERE sensor=?", [sensor])
         con.close()
-        print(f"\nNothing ingested for {sensor}: every one of the {len(days)} "
+        print(f"\nNothing ingested for {sensor}: every one of the {len(todo)} "
               f"file(s) failed to read.", file=sys.stderr)
         for e in errors[:5]:
             print(f"  {e}", file=sys.stderr)
@@ -189,7 +213,11 @@ def main():
               file=sys.stderr)
     print("next: python serve.py     (optional: python ingest/compact_db.py "
           "first, to shrink the file)")
-    return 1 if err and caps == 0 else 0
+    # Any unread file means this sensor is missing days, so exit non-zero even
+    # when other files succeeded. `err and caps == 0` reported success for a
+    # run that dropped half its input, and atlas.py and make_sample.py branch
+    # on this to decide whether the step is done.
+    return 1 if err else 0
 
 
 if __name__ == "__main__":

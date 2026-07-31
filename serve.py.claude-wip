@@ -23,13 +23,30 @@ import io
 import json
 import math
 import os
+import sys
 import threading
 import zlib
 
-import duckdb
-import numpy as np
-from PIL import Image
-from flask import Flask, Response, jsonify, make_response, request, send_file
+# atlas.py already turns a half-installed environment into an actionable
+# message ("Missing dependencies: duckdb, numpy ... install into it with:").
+# serve.py is what the README and every 'next:' line tell people to run, and
+# without this it answered the same situation with a raw ModuleNotFoundError
+# traceback -- the one thing a reader who did not write this cannot act on.
+# An empty .venv that has been activated is the common way to land here.
+try:
+    import duckdb
+    import numpy as np
+    from PIL import Image
+    from flask import Flask, Response, jsonify, make_response, request, send_file
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        from atlas import require_deps
+    except Exception:                                       # noqa: BLE001
+        raise SystemExit(
+            "ATLAS cannot start: its dependencies are not installed.\n"
+            "    python -m pip install -r requirements.txt")
+    raise SystemExit(f"ATLAS cannot start: {require_deps()}")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Each database path is overridable, like IQ_DB below, so a test run or a
@@ -38,6 +55,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # override it one at a time. atlas.py and every ingest script agree on this.
 DB_DIR = os.environ.get("ATLAS_DB_DIR") or HERE
 DB_PATH = os.environ.get("SPECTRUM_DB") or os.path.join(DB_DIR, "spectrum.duckdb")
+
+# DuckDB will use ~80% of system RAM per connection if left alone. serve.py
+# holds four open at once against files that reach tens of GB, so on a laptop
+# the server gets OOM-killed part-way through a request -- which looks exactly
+# like the viewer freezing, with nothing in any log to say why. build_db.py
+# already caps itself the same way. Spilling to disk is slower than dying is
+# mysterious.
+DB_MEM_LIMIT = os.environ.get("ATLAS_DB_MEM_LIMIT", "512MB")
+
+
+def _connect_ro(path):
+    """Read-only connection with the memory ceiling applied."""
+    c = duckdb.connect(path, read_only=True)
+    c.execute(f"PRAGMA memory_limit='{DB_MEM_LIMIT}'")
+    return c
 
 # (table, bucket_seconds), finest first. 0 == raw native cadence.
 LEVELS = [
@@ -51,27 +83,31 @@ LEVELS = [
 app = Flask(__name__)
 _con_lock = threading.Lock()
 
-# The CBRS monitoring databases (spectrum/psd/pfp .duckdb) are OPTIONAL: they are
-# multi-GB and not shipped with the repo. When spectrum.duckdb is absent -- e.g. a
-# fresh clone running only the IQ demo (examples/make_sample.py) -- the server
-# still starts and serves IQ captures; the CBRS endpoints simply report no data.
+# This connect runs at import, which is before preflight() can say anything.
+# An unreadable spectrum.duckdb -- corrupt, or carrying a stale .wal DuckDB
+# refuses to replay -- therefore used to kill the process with a raw
+# DuckDB traceback pointing at this line, which tells someone who did not
+# write this nothing they can act on. Swallow it here and let preflight()
+# report it in plain language alongside every other layer, so there is one
+# place that decides whether the viewer can run and one voice explaining
+# why not.
+con = None
+_META = {"sensors": [], "freqs": []}
 if os.path.exists(DB_PATH):
-    con = duckdb.connect(DB_PATH, read_only=True)
-    # Static per-boot metadata (sensor list + channel freqs): computed once so
-    # /api/meta never rescans the 47M-row raw table per page load.
-    _META = {
-        "sensors": [{"sensor": r[0], "t_min": r[1], "t_max": r[2], "n": r[3]}
-                    for r in con.execute(
-                        "SELECT sensor, t_min, t_max, n FROM meta ORDER BY sensor").fetchall()],
-        "freqs": [r[0] for r in con.execute(
-            "SELECT DISTINCT freq FROM raw ORDER BY freq").fetchall()],
-    }
-else:
-    con = None
-    _META = {"sensors": [], "freqs": []}
-    print(f"[serve] {os.path.basename(DB_PATH)} not found -- CBRS monitoring "
-          "disabled; IQ capture mode still works. Run examples/make_sample.py "
-          "for a zero-download demo.")
+    try:
+        con = _connect_ro(DB_PATH)
+        # Static per-boot metadata (sensor list + channel freqs): computed once
+        # so /api/meta never rescans the 47M-row raw table per page load.
+        _META = {
+            "sensors": [{"sensor": r[0], "t_min": r[1], "t_max": r[2], "n": r[3]}
+                        for r in con.execute(
+                            "SELECT sensor, t_min, t_max, n FROM meta ORDER BY sensor").fetchall()],
+            "freqs": [r[0] for r in con.execute(
+                "SELECT DISTINCT freq FROM raw ORDER BY freq").fetchall()],
+        }
+    except Exception:
+        con = None
+        _META = {"sensors": [], "freqs": []}
 
 
 # ---- Colormaps + tile encoding (mirrored in viewer.html) ---------------
@@ -236,6 +272,17 @@ PSD_DB = os.environ.get("PSD_DB") or os.path.join(DB_DIR, "psd.duckdb")
 F0 = 3530040000.0     # first PSD bin (Hz)
 DF = 80000.0          # bin spacing (Hz)
 NF = 2250             # bins  (full band 3530.04 .. 3709.96 MHz)
+# Column budget for one tile, and the per-layer chunk caps that follow from
+# it. The caps have to be expressed in columns rather than chunks because the
+# two layers pack different amounts into one: 256 spectra for PSD, 1024 frames
+# for PFP (compact_db.PSD_CHUNK / PFP_CHUNK). Thirty-two PFP chunks is 32768
+# columns, which is both far more than any screen shows and past WebP's hard
+# 16383-pixel limit -- so the tile failed to encode at all on a zoomed-out
+# view. 4096 stays well inside that ceiling and bounds how much compressed
+# data a single request pulls through memory.
+MAX_COLS = 4096
+MAX_PSD_CHUNKS = max(1, MAX_COLS // 256)
+MAX_PFP_CHUNKS = max(1, MAX_COLS // 1024)
 # PSD is dBm/Hz; summaries are channel power (dBm). +10*log10(10 MHz) puts the
 # PSD layer on the SAME dBm scale so colours line up across the zoom boundary.
 PSD_DBM_OFFSET = 70.0
@@ -265,7 +312,7 @@ def psd_conn():
         if _psd_con is not None:
             return _psd_con
         try:
-            _psd_con = duckdb.connect(PSD_DB, read_only=True)
+            _psd_con = _connect_ro(PSD_DB)
         except Exception:
             return None
         # Two on-disk shapes are valid: the compact chunk schema written by
@@ -301,22 +348,23 @@ def _psd_scale(c, sensor, qmin, qmax):
     if sc is not None:
         return sc
     if _psd_kind == "chunk":
-        # Four chunks spread across the sensor, picked by timestamp.
-        # USING SAMPLE applies to the table before WHERE does, so sampling 4
-        # rows out of every chunk in the file and *then* keeping this sensor's
-        # returns nothing at all once there is more than a handful of sensors.
-        # The empty result fell through to (qmin, qmax) below -- the full 90 dB
-        # quantization range against a signal spanning about 50 -- so every
-        # tile came out nearly one flat colour and the layer looked frozen.
-        span = c.execute("SELECT min(t0), max(t0) FROM psd_chunk WHERE sensor=?",
-                         [sensor]).fetchone()
+        # Four chunks spread across the sensor's history. reservoir sampling
+        # reads the whole table to draw them, and on a real psd.duckdb that is
+        # gigabytes of compressed spectra pulled through memory to compute two
+        # percentiles -- enough to run the server out of memory before it drew
+        # anything. Seeking to four points instead lets the t0 predicate prune,
+        # and keeps the sample spread out in time rather than clustered at the
+        # start, which a bare LIMIT would do.
+        span = c.execute("SELECT min(t0), max(t0) FROM psd_meta m JOIN psd_chunk d "
+                         "ON d.sensor=m.sensor WHERE m.sensor=?", [sensor]).fetchone()
         rows = []
         if span and span[0] is not None:
             lo, hi = span
             for k in range(4):
-                r = c.execute("SELECT n, times, specs FROM psd_chunk "
-                              "WHERE sensor=? AND t0>=? ORDER BY t0 LIMIT 1",
-                              [sensor, lo + (hi - lo) * k / 4.0]).fetchone()
+                r = c.execute(
+                    "SELECT n, times, specs FROM psd_chunk WHERE sensor=? AND t0>=? "
+                    "ORDER BY t0 LIMIT 1",
+                    [sensor, lo + (hi - lo) * k / 4.0]).fetchone()
                 if r:
                     rows.append(r)
         specs = _unpack(rows, NF)[1] if rows else None
@@ -338,8 +386,37 @@ def _psd_window(c, sensor, t0, t1):
     """Spectra in [t0,t1). Data gap -> hold the nearest capture (matches the
     summary layer's gap-fill so zooming keeps showing last-known data)."""
     if _psd_kind == "chunk":
-        rows = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? "
-                         "AND t1>=? AND t0<? ORDER BY t0", [sensor, t0, t1]).fetchall()
+        # Read at most MAX_CHUNKS of them, spread evenly across the window.
+        # Each chunk is 256 spectra x 2250 bins, so a zoomed-out view over a
+        # real sensor matches thousands of them -- GMM's full 672-day span is
+        # 1,679 chunks, about a gigabyte once decompressed, and fetchall() on
+        # that killed the process outright. The tile it feeds is at most a
+        # couple of thousand pixels wide, so all but a few of those spectra
+        # were being decompressed only to be averaged away. Striding in SQL
+        # keeps the blobs from ever being materialised.
+        # Pick the chunks by timestamp first. Selecting t0 alone touches none
+        # of the blob columns, so the wide read is limited to the handful of
+        # chunks actually wanted. Doing the striding with a window function
+        # over the full row instead makes DuckDB materialise every matching
+        # chunk's blobs before it can filter, which is the whole cost being
+        # avoided here.
+        t0s = [r[0] for r in c.execute(
+            "SELECT t0 FROM psd_chunk WHERE sensor=? AND t1>=? AND t0<? "
+            "ORDER BY t0", [sensor, t0, t1]).fetchall()]
+        if not t0s:
+            rows = []
+        else:
+            if len(t0s) > MAX_PSD_CHUNKS:
+                t0s = t0s[::-(-len(t0s) // MAX_PSD_CHUNKS)]  # ceil stride
+            # One chunk per query. A single IN(...) over the whole table makes
+            # the scan buffer blob row groups from across a multi-GB file and
+            # exhausts the connection's memory pool before returning; fetching
+            # each wanted chunk by its exact t0 keeps peak memory to one chunk
+            # regardless of how wide the window is.
+            rows = [r for r in (
+                c.execute("SELECT n, times, specs FROM psd_chunk "
+                          "WHERE sensor=? AND t0=? LIMIT 1", [sensor, k]).fetchone()
+                for k in t0s) if r]
         if rows:
             ts, specs = _unpack(rows, NF)
             m = (ts >= t0) & (ts < t1)
@@ -375,12 +452,35 @@ def psd_meta():
     c = psd_conn()
     if c is None or _psd_kind is None:
         return jsonify({"has": False})
+    sensor = request.args.get("sensor")
+    src = "psd_chunk" if _psd_kind == "chunk" else "psd"
     with _psd_lock:
         row = c.execute("SELECT f0, df, nf, t_min, t_max FROM psd_meta WHERE sensor=?",
-                        [request.args.get("sensor")]).fetchone()
+                        [sensor]).fetchone()
+        # psd_meta and psd are written in the same transaction by psd_ingest,
+        # but they do not stay in step forever: compact_db copies psd_meta
+        # wholesale while only chunking the sensors actually present in psd,
+        # and a database rebuilt or swapped underneath its metadata keeps the
+        # old meta rows. Either way you get a meta row describing captures
+        # that no longer exist -- with a perfectly valid t_min/t_max, so the
+        # null-range check below never fires.
+        #
+        # The symptom is the layer silently never drawing: /api/psd_meta says
+        # has=true, the viewer enables the PSD layer and asks for a window,
+        # and every request comes back empty. Trusting the row count in
+        # psd_meta.captures would repeat the same mistake, so probe the data
+        # table itself. LIMIT 1 stops at the first hit, so this costs an index
+        # seek rather than a scan of millions of rows.
+        has_rows = c.execute(
+            f"SELECT 1 FROM {src} WHERE sensor=? LIMIT 1", [sensor]).fetchone()
     # An ingest that read no files leaves a meta row with a null time range.
     # Never advertise a layer whose backing rows are not actually there.
     if not row or row[3] is None or row[4] is None:
+        return jsonify({"has": False})
+    if not has_rows:
+        print(f"[serve] psd_meta describes {sensor!r} but {src} holds no rows "
+              f"for it; reporting the layer as unavailable. Re-run "
+              f"ingest/psd_ingest.py for this sensor to restore it.")
         return jsonify({"has": False})
     f0, df, nf, tmin, tmax = row
     return jsonify({"has": True, "fmin": f0, "fmax": f0 + (nf - 1) * df,
@@ -447,7 +547,7 @@ def pfp_conn():
         if _pfp_con is not None:
             return _pfp_con
         try:
-            _pfp_con = duckdb.connect(PFP_DB, read_only=True)
+            _pfp_con = _connect_ro(PFP_DB)
         except Exception:
             return None
         t = table_names(_pfp_con)       # same dual-schema rule as PSD above
@@ -476,6 +576,16 @@ def pfp_meta():
                 f"SELECT DISTINCT freq FROM {src} WHERE sensor=? ORDER BY 1",
                 [sensor]).fetchall()]
             _pfp_freqs_cache[sensor] = freqs
+    # No channels means pfp_meta is describing frames that are not in the
+    # table -- a rebuild or a compaction that carried the metadata forward
+    # without the rows behind it. Answering has=true with an empty channel
+    # list is the worst of both worlds: the viewer enables the PFP layer,
+    # finds nothing to select, and draws nothing without ever saying why.
+    if not freqs:
+        print(f"[serve] pfp_meta describes {sensor!r} but {src} holds no "
+              f"frames for it; reporting the layer as unavailable. Re-run "
+              f"ingest/pfp_ingest.py for this sensor to restore it.")
+        return jsonify({"has": False})
     return jsonify({"has": True, "npos": m[0], "frame_ms": m[1],
                     "t_min": m[2], "t_max": m[3], "stat": m[4], "freqs": freqs})
 
@@ -491,9 +601,24 @@ def pfp_frame():
         return jsonify({"error": "pfp not ready"}), 503
     with _pfp_lock:
         if _pfp_kind == "chunk":
-            rows = c.execute(
-                "SELECT n, times, frames FROM pfp_chunk WHERE sensor=? AND freq=? "
-                "AND t1>=? AND t0<? ORDER BY t0", [sensor, freq, t0, t1]).fetchall()
+            # Same ceiling as the PSD layer, for the same reason: a chunk here
+            # is 1024 frames, and a zoomed-out channel matches thousands of
+            # them, which is far more than the tile can show and enough to
+            # exhaust memory before anything is drawn.
+            t0s = [r[0] for r in c.execute(
+                "SELECT t0 FROM pfp_chunk WHERE sensor=? AND freq=? "
+                "AND t1>=? AND t0<? ORDER BY t0",
+                [sensor, freq, t0, t1]).fetchall()]
+            if not t0s:
+                rows = []
+            else:
+                if len(t0s) > MAX_PFP_CHUNKS:
+                    t0s = t0s[::-(-len(t0s) // MAX_PFP_CHUNKS)]  # ceil stride
+                marks = ",".join("?" * len(t0s))
+                rows = c.execute(
+                    f"SELECT n, times, frames FROM pfp_chunk WHERE sensor=? "
+                    f"AND freq=? AND t0 IN ({marks}) ORDER BY t0",
+                    [sensor, freq, *t0s]).fetchall()
         else:
             rows = c.execute(
                 "SELECT t, frame FROM pfp WHERE sensor=? AND freq=? "
@@ -540,7 +665,7 @@ def iq_conn():
     if not os.path.exists(IQ_DB):
         return None
     try:
-        return duckdb.connect(IQ_DB, read_only=True)
+        return _connect_ro(IQ_DB)
     except Exception:
         return None
 
@@ -639,7 +764,130 @@ def iq_layer():
     })
 
 
+# The four layers, as (name, path, metadata table, row tables, fix command).
+# The CBRS three are one unit: the viewer zooms summary -> PSD -> PFP, so any
+# one of them missing breaks the drill-down. IQ capture mode is independent
+# of all three and is useful on its own.
+_CBRS_LAYERS = (
+    ("spectrum.duckdb", DB_PATH, "meta", None,
+     "python ingest/build_db.py"),
+    ("psd.duckdb", PSD_DB, "psd_meta", ("psd", "psd_chunk"),
+     "python ingest/psd_ingest.py <sensor>"),
+    ("pfp.duckdb", PFP_DB, "pfp_meta", ("pfp", "pfp_chunk"),
+     "python ingest/pfp_ingest.py <sensor>"),
+)
+_IQ_LAYER = ("iq.duckdb", IQ_DB, "iq_meta", None,
+             "python ingest/iq_ingest.py <folder>")
+
+
+def check_layer(name, path, meta_tbl, row_tbls, fix):
+    """-> (problem, fix) if this layer is not usable, else None.
+
+    Checks rows, not just the file. A database can exist, open cleanly and
+    still hold nothing, and its metadata can describe sensors whose data is
+    gone -- a rebuild or a compaction that carried the metadata forward
+    without the rows behind it. Both of those look perfectly healthy from
+    the outside and produce a layer that silently never draws.
+    """
+    if not os.path.exists(path):
+        # Name the full path, not just the file. These paths are redirectable
+        # by ATLAS_DB_DIR / SPECTRUM_DB / PSD_DB / PFP_DB / IQ_DB, and a stale
+        # one left in the shell sends the server looking somewhere the file
+        # has since been moved away from. Reporting "psd.duckdb is missing"
+        # while the file sits in plain sight in the repo is maddening and
+        # sends people re-ingesting data they already have.
+        env = {"spectrum.duckdb": "SPECTRUM_DB", "psd.duckdb": "PSD_DB",
+               "pfp.duckdb": "PFP_DB", "iq.duckdb": "IQ_DB"}.get(name)
+        why = ""
+        if os.environ.get(env):
+            why = (f"\n      (looked there because {env} is set; unset it to "
+                   f"use this folder)")
+        elif os.environ.get("ATLAS_DB_DIR"):
+            why = ("\n      (looked there because ATLAS_DB_DIR is set; unset "
+                   "it to use this folder)")
+        return (f"{name} is missing from {os.path.abspath(path)}{why}", fix)
+    try:
+        c = _connect_ro(path)
+    except Exception as e:
+        first = str(e).strip().splitlines()[0]
+        if "WAL" in str(e):
+            # Recoverable without a rebuild: the .duckdb is usually intact and
+            # only the sibling .wal is poison, so say that rather than send
+            # someone off to re-ingest for hours.
+            fix = f"delete {os.path.basename(path)}.wal, then re-run"
+        return (f"{name} will not open ({first})", fix)
+    try:
+        have = {r[0] for r in c.execute("SHOW TABLES").fetchall()}
+        if meta_tbl not in have:
+            return (f"{name} has no {meta_tbl} table", fix)
+        if not c.execute(f"SELECT count(*) FROM {meta_tbl}").fetchone()[0]:
+            return (f"{name} is empty", fix)
+        if row_tbls:
+            src = next((t for t in row_tbls if t in have), None)
+            if src is None:
+                return (f"{name} has no {row_tbls[0]} table", fix)
+            orphans = c.execute(
+                f"SELECT count(*) FROM {meta_tbl} m WHERE NOT EXISTS "
+                f"(SELECT 1 FROM {src} d WHERE d.sensor = m.sensor)"
+            ).fetchone()[0]
+            if orphans:
+                return (f"{name} lists {orphans} sensor(s) whose data is not "
+                        f"in the file", fix)
+    except Exception as e:
+        return (f"{name} could not be read ({e})", fix)
+    finally:
+        c.close()
+    return None
+
+
+def preflight():
+    """-> (mode, problems). Two whole configurations, nothing in between.
+
+        "full"    all four layers: summary -> PSD -> PFP drill-down, plus IQ
+        "iq-only" IQ capture mode alone, no CBRS databases installed at all
+
+    A half-built install is the failure this exists to catch, because it
+    does not announce itself: the page loads, the summary layer draws, and
+    zooming in simply never reveals anything underneath. Someone who did not
+    build this cannot tell that apart from "the zoom is broken".
+
+    So the mode is decided by whether *any* CBRS database is present, not by
+    how many are. None present is a deliberate IQ-only install and runs.
+    Some present means a CBRS install that did not finish, and refuses --
+    otherwise a broken build would quietly demote itself to IQ-only, which
+    is exactly the silent partial state this is meant to prevent.
+    """
+    iq = check_layer(*_IQ_LAYER)
+    if not any(os.path.exists(path) for _n, path, _m, _r, _f in _CBRS_LAYERS):
+        return "iq-only", ([iq] if iq else [])
+    problems = [p for p in (check_layer(*l) for l in _CBRS_LAYERS) if p]
+    if iq:
+        problems.append(iq)
+    return "full", problems
+
+
 if __name__ == "__main__":
+    mode, bad = preflight()
+    if bad:
+        what_for = ("the IQ capture viewer" if mode == "iq-only"
+                    else "the viewer")
+        print(f"ATLAS cannot start: {what_for} needs "
+              f"{'this layer' if len(bad) == 1 else 'these layers'} and "
+              f"{'it is' if len(bad) == 1 else 'they are'} not ready.\n")
+        for what, fix in bad:
+            print(f"  - {what}\n      fix: {fix}")
+        print("\nTo build everything at once with no downloads, run:"
+              "\n      python examples/make_sample.py"
+              "\nThen start the viewer again with:"
+              "\n      python serve.py")
+        raise SystemExit(1)
+    if mode == "iq-only":
+        # Say so plainly. Otherwise the CBRS controls are simply absent and
+        # someone who expected them cannot tell whether that is the install
+        # or a bug.
+        print("[serve] IQ capture mode only -- no CBRS databases installed. "
+              "Run examples/make_sample.py for the full four-layer demo.")
+
     port = int(os.environ.get("SEA_PORT", "8090"))
     try:
         from waitress import serve           # production WSGI: keep-alive, faster

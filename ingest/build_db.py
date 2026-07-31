@@ -20,6 +20,9 @@ import os
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _require  # noqa: F401  -- deps message instead of a traceback
+
 import duckdb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -81,6 +84,16 @@ def main():
 
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
+    # A WAL left behind by a previous run that crashed or was killed mid-build
+    # survives the os.remove above (it's a separate file) and DuckDB replays it
+    # automatically on connect -- against the brand-new, empty database this
+    # run just created. That replay re-issues the old run's CREATE TABLE raw
+    # and collides with the one below ("Table with name \"raw\" already
+    # exists!"), leaving spectrum.duckdb unreadable. Deleting the stale WAL
+    # alongside the database file is what actually starts clean.
+    wal_path = DB_PATH + ".wal"
+    if os.path.exists(wal_path):
+        os.remove(wal_path)
     con = duckdb.connect(DB_PATH)
     # Be polite with RAM on a laptop; DuckDB will spill to disk if needed.
     con.execute("PRAGMA memory_limit='3GB'")

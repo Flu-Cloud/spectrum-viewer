@@ -56,7 +56,11 @@ class SigMFCapture(IQCapture):
     """SigMF: .sigmf-meta JSON sidecar + memory-mapped .sigmf-data binary."""
 
     def __init__(self, meta_path):
-        with open(meta_path) as f:
+        # SigMF metadata is UTF-8 by spec. open() without an explicit encoding
+        # uses the locale codec, which is still cp1252 on Windows, so a
+        # sidecar containing "us" or a degree sign dies with a
+        # UnicodeDecodeError there while working fine on Linux.
+        with open(meta_path, encoding="utf-8") as f:
             meta = json.load(f)
         g = meta.get("global", {})
         dt = g.get("core:datatype")
@@ -79,6 +83,24 @@ class SigMFCapture(IQCapture):
             raise ValueError(f"{data_path}: size {fsize} not a multiple of "
                              f"sample size {itemsize} ({dt})")
         n = fsize // itemsize
+        # An interrupted download leaves a .sigmf-data that is simply shorter,
+        # and nothing above notices: n is derived from the file's own size, so
+        # duration, column count and the time axis are all recomputed from the
+        # short length and the capture ingests looking perfectly healthy. The
+        # sidecar is the only record of how long it should have been --
+        # annotations mark spans of real samples, so one running past the end
+        # of the file means samples are missing. Cheap, and it turns a silent
+        # 90%-complete capture into a plain "re-download this" instead.
+        declared = 0
+        for a in (meta.get("annotations") or []):
+            s, c = a.get("core:sample_start"), a.get("core:sample_count")
+            if isinstance(s, (int, float)) and isinstance(c, (int, float)):
+                declared = max(declared, int(s + c))
+        if declared > n:
+            raise ValueError(
+                f"{data_path}: truncated -- the metadata describes {declared} "
+                f"samples but the file holds {n} ({100.0 * n / declared:.1f}%). "
+                "Re-download this capture.")
         self._mm = np.memmap(data_path, dtype=self._np_dtype, mode="r")
         super().__init__(meta_path, os.path.basename(meta_path)[:-len(".sigmf-meta")],
                          g.get("core:sample_rate"), fc, dt, n,

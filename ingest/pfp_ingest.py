@@ -26,6 +26,9 @@ import re
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _require  # noqa: F401  -- deps message instead of a traceback
+
 import duckdb
 import numpy as np
 
@@ -79,6 +82,14 @@ def read_frames(path, rcon):
     pos_cols = cols[2:]
     P = np.stack([np.asarray(d[c], dtype=np.float64) for c in pos_cols], axis=1)   # (n,560)
     Q = np.clip(np.round((P - QMIN) / (QMAX - QMIN) * 255.0), 0, 255).astype(np.uint8)
+    # Values outside the quantization range clip to a flat 0 or 255 instead of
+    # failing, so a file in the wrong units ingests as a featureless band and
+    # looks like a rendering bug later. Name the file now, while it is still
+    # obvious which one it was.
+    out = int(np.count_nonzero((P < QMIN) | (P > QMAX)))
+    if out > P.size // 100:
+        print(f"  WARN {os.path.basename(path)}: {100.0 * out / P.size:.0f}% of "
+              f"values are outside [{QMIN}, {QMAX}] dBm and were clipped flat")
     return ts, freq, Q
 
 
@@ -123,8 +134,6 @@ def main():
 
     by_day = found[sensor]
     days = sorted(by_day)
-    if args.limit:
-        days = days[:args.limit]
     print(f"{sensor} PFP ({args.stat}): {len(days)} day(s) on disk")
 
     con = duckdb.connect(PFP_DB)
@@ -132,12 +141,22 @@ def main():
     con.execute("""CREATE TABLE IF NOT EXISTS pfp_meta (
         sensor VARCHAR, stat VARCHAR, npos INT, frame_ms DOUBLE, qmin DOUBLE, qmax DOUBLE,
         t_min DOUBLE, t_max DOUBLE, rows BIGINT)""")
-    # resumable: skip days already ingested, so a long pull can restart
+    # Resumable: skip days already ingested. Same two corrections as
+    # psd_ingest.py, for the same reasons. to_timestamp() renders in the
+    # machine's local zone while the filename's day is UTC, so west of
+    # Greenwich an early-UTC-morning day never matches its own filename and is
+    # re-read and re-inserted on every resume; bucket by UTC so both sides of
+    # the comparison mean the same thing. And count the days this run is
+    # actually skipping rather than every day the sensor has in the table --
+    # `existing` spans days that are not under this --root at all, which is
+    # how "1 day(s) on disk / 2 day(s) already ingested" came about.
     existing = set(str(r[0]) for r in con.execute(
-        "SELECT DISTINCT CAST(to_timestamp(t) AS DATE) FROM pfp WHERE sensor=?",
-        [sensor]).fetchall())
-    if existing:
-        print(f"  resuming: {len(existing)} day(s) already ingested, skipping those")
+        "SELECT DISTINCT CAST(to_timestamp(t) AT TIME ZONE 'UTC' AS DATE) "
+        "FROM pfp WHERE sensor=?", [sensor]).fetchall())
+    skipping = sum(1 for d in days if d in existing)
+    if skipping:
+        print(f"  resuming: {skipping} of {len(days)} day(s) already "
+              f"ingested, skipping those")
     rcon = duckdb.connect()
 
     t0 = time.time()
