@@ -2,7 +2,8 @@
 pfp_ingest.py: ingest PFP (periodic-frame-power) numbers into a compact store.
 
 PFP = power across a 10 ms frame (560 positions, ~17.86 us each) per 10 MHz
-channel, one trace per ~4-min capture. We store one int8-quantized BLOB per
+channel, one trace per sweep (the SEA schedule sweeps every ~90 s, dwelling 4 s
+on each of the 18 channels). We store one int8-quantized BLOB per
 (channel, capture): (sensor, freq, t, frame). Re-render any channel/time window
 crisply, like the PSD layer.
 

@@ -36,7 +36,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # second dataset can point somewhere else without moving files around.
 # ATLAS_DB_DIR moves all four databases at once; the per-database variables
 # override it one at a time. atlas.py and every ingest script agree on this.
-DB_DIR = os.environ.get("ATLAS_DB_DIR") or HERE
+# abspath: atlas.py's doctor resolves this the same way, and without it a
+# relative ATLAS_DB_DIR meant the doctor inspected <cwd>/dir while the server
+# read <repo>/dir -- a clean bill of health for a database nobody is serving.
+DB_DIR = os.path.abspath(os.environ.get("ATLAS_DB_DIR") or HERE)
 DB_PATH = os.environ.get("SPECTRUM_DB") or os.path.join(DB_DIR, "spectrum.duckdb")
 
 # (table, bucket_seconds), finest first. 0 == raw native cadence.
@@ -49,29 +52,77 @@ LEVELS = [
 ]
 
 app = Flask(__name__)
-_con_lock = threading.Lock()
 
-# The CBRS monitoring databases (spectrum/psd/pfp .duckdb) are OPTIONAL: they are
-# multi-GB and not shipped with the repo. When spectrum.duckdb is absent -- e.g. a
-# fresh clone running only the IQ demo (examples/make_sample.py) -- the server
-# still starts and serves IQ captures; the CBRS endpoints simply report no data.
+# Each request gets its own DuckDB cursor off the shared connection rather than
+# taking a lock around the shared one. A single lock meant a cheap request --
+# /api/psd_meta, or the small tile the user is actually waiting for -- queued
+# behind whatever multi-second scan was already running. Measured on a 180-day
+# database: /api/psd_meta answered in 3.0 s while PSD tiles were in flight, and
+# eight concurrent tiles completed in perfect single file. Cursors are DuckDB's
+# supported way to use one database from several threads.
+
+# The CBRS monitoring databases (spectrum/psd/pfp .duckdb) are OPTIONAL and
+# INDEPENDENT: they are multi-GB, not shipped with the repo, and a real download
+# does not necessarily contain all three. The published SEA data has days of PSD
+# and PFP with no Summaries export at all, so spectrum.duckdb simply cannot be
+# built from it -- and the sensor list used to come from that one file, so those
+# installs advertised no sensors, the viewer dropped CBRS mode entirely, and
+# gigabytes of ingested PSD were unreachable behind "CBRS monitoring disabled".
+# Every layer knows its own sensors and time range; ask all three.
+def _sensor_rows(path, table, count_col):
+    if not os.path.exists(path):
+        return []
+    try:
+        c = duckdb.connect(path, read_only=True)
+        try:
+            return c.execute(f"SELECT sensor, t_min, t_max, {count_col} FROM {table} "
+                             "WHERE t_min IS NOT NULL AND t_max IS NOT NULL "
+                             "ORDER BY sensor").fetchall()
+        finally:
+            c.close()
+    except Exception as e:
+        print(f"[serve] cannot read {table} from {os.path.basename(path)}: {e}")
+        return []
+
+
+def _cbrs_sensors():
+    """Every sensor any CBRS layer can draw, widest time range across them."""
+    merged = {}
+    for path, table, col in (
+            (DB_PATH, "meta", "n"),
+            (os.environ.get("PSD_DB") or os.path.join(DB_DIR, "psd.duckdb"),
+             "psd_meta", "captures"),
+            (os.environ.get("PFP_DB") or os.path.join(DB_DIR, "pfp.duckdb"),
+             "pfp_meta", "rows")):
+        for name, t0, t1, n in _sensor_rows(path, table, col):
+            s = merged.setdefault(name, {"sensor": name, "t_min": t0,
+                                         "t_max": t1, "n": 0})
+            s["t_min"] = min(s["t_min"], t0)
+            s["t_max"] = max(s["t_max"], t1)
+            s["n"] += int(n or 0)
+    return [merged[k] for k in sorted(merged)]
+
+
 if os.path.exists(DB_PATH):
     con = duckdb.connect(DB_PATH, read_only=True)
     # Static per-boot metadata (sensor list + channel freqs): computed once so
     # /api/meta never rescans the 47M-row raw table per page load.
-    _META = {
-        "sensors": [{"sensor": r[0], "t_min": r[1], "t_max": r[2], "n": r[3]}
-                    for r in con.execute(
-                        "SELECT sensor, t_min, t_max, n FROM meta ORDER BY sensor").fetchall()],
-        "freqs": [r[0] for r in con.execute(
-            "SELECT DISTINCT freq FROM raw ORDER BY freq").fetchall()],
-    }
+    freqs = [r[0] for r in con.execute(
+        "SELECT DISTINCT freq FROM raw ORDER BY freq").fetchall()]
 else:
     con = None
-    _META = {"sensors": [], "freqs": []}
-    print(f"[serve] {os.path.basename(DB_PATH)} not found -- CBRS monitoring "
-          "disabled; IQ capture mode still works. Run examples/make_sample.py "
-          "for a zero-download demo.")
+    freqs = []          # no channel summaries; the PSD layer carries its own axis
+# `summary` tells the viewer whether the top layer exists at all. Without it,
+# PSD is the zoomed-out view rather than something to fall back FROM.
+_META = {"sensors": _cbrs_sensors(), "freqs": freqs, "summary": con is not None}
+if con is None:
+    what = (f"{len(_META['sensors'])} sensor(s) from the PSD/PFP databases"
+            if _META["sensors"] else "no CBRS data")
+    print(f"[serve] {os.path.basename(DB_PATH)} not found -- no channel summary "
+          f"layer; serving {what}.")
+    if not _META["sensors"]:
+        print("[serve]   IQ capture mode still works. Run examples/make_sample.py "
+              "for a zero-download demo.")
 
 
 # ---- Colormaps + tile encoding (mirrored in viewer.html) ---------------
@@ -186,6 +237,94 @@ def pick_level(span_seconds, target_cols):
     return LEVELS[-1]
 
 
+# ---- Time binning, shared by the PSD and PFP layers --------------------
+# Both layers used to return one image column per stored capture, which made
+# the cost of a tile scale with the window rather than with the screen, and put
+# captures at index positions rather than at their real times (so a gap slid
+# everything after it sideways). Both now bin onto a uniform grid over the
+# requested window: bounded work, and X is honestly time.
+COLS_PER_PX = 2           # tile columns per screen pixel (matches iq_layer)
+MAX_TILE_COLS = 4096
+# Safety valve: at most this many stored captures are read per output column.
+# A column is one screen pixel's worth of time, and its value is a max, so the
+# tenth-widest capture in a column changes nothing you can see -- but reading
+# all 72 captures behind a column of a six-month window costs seconds. Beyond
+# this the source is strided, which is what keeps a year of a multi-GB database
+# as cheap to draw as a day of it. Zoom in and the stride falls back to 1, so
+# the fidelity is only ever traded away at zoom levels that cannot show it.
+CAPTURES_PER_COL = 10
+READ_BATCH = 16           # chunk rows pulled from DuckDB at a time
+# Captures per batch on the uncompacted schema (READ_BATCH * this). Measured on
+# 172,800 captures: 1024 takes 0.85 s, 16384 takes 2.8 s -- the cost is the
+# reduceat over each batch, so a batch far bigger than a screenful of columns
+# is pure waste. Bigger is NOT better here.
+PSD_ROWS_PER_BATCH = 64
+# Colour-scale sampling: this many short reads spread across a sensor's range.
+SCALE_PROBES, SCALE_PER_PROBE = 16, 16
+
+
+def _grid_cols(w):
+    """Tile columns for a window drawn `w` screen pixels wide."""
+    return max(1, min(int(w) * COLS_PER_PX, MAX_TILE_COLS))
+
+
+def _stride_for(n_captures, cols):
+    """Take every Nth source row when a window holds more than we will read."""
+    budget = max(1, cols) * CAPTURES_PER_COL
+    if n_captures <= budget:
+        return 1
+    return int(math.ceil(n_captures / budget))
+
+
+class _Grid:
+    """Max-pool captures onto `cols` uniform time bins across [t0,t1).
+
+    Fed one batch at a time so peak memory is one batch, not one window: a
+    six-month PSD window costs the same resident bytes as a six-hour one.
+    Bins that no capture landed in stay empty and are rendered as background,
+    the same way the summary layer leaves real gaps visible.
+    """
+
+    def __init__(self, t0, t1, cols, nbins):
+        self.t0, self.span, self.cols = t0, max(t1 - t0, 1e-9), cols
+        self.buf = np.zeros((cols, nbins), np.uint8)
+        self.filled = np.zeros(cols, bool)
+        self.ncap = 0
+
+    def add(self, ts, mat):
+        """ts: capture times (ascending). mat: (len(ts), nbins) uint8."""
+        if not len(ts):
+            return
+        self.ncap += len(ts)
+        idx = np.clip(((ts - self.t0) / self.span * self.cols).astype(np.int64),
+                      0, self.cols - 1)
+        # ts is ascending, so equal indices are contiguous: reduceat gives the
+        # per-bin max in one pass without a Python loop over captures.
+        starts = np.flatnonzero(np.r_[True, idx[1:] != idx[:-1]])
+        red = np.maximum.reduceat(mat, starts, axis=0)
+        col = idx[starts]                       # unique within this batch
+        self.buf[col] = np.maximum(self.buf[col], red)
+        self.filled[col] = True
+
+    def image(self, qmin, qmax, h, offset=0.0):
+        """(rows, cols) float32 in dBm, row 0 = low f, empty columns NaN.
+
+        The second axis is pooled down to at most `h` rows first, so a tile is
+        never taller than the plot it is drawn into.
+        """
+        b = self.buf                                   # (cols, nbins)
+        nb = b.shape[1]
+        fb = max(1, math.ceil(nb / max(1, h)))         # bins per pixel row
+        if fb > 1:
+            pad = (-nb) % fb
+            if pad:                                    # pad < fb, so no group
+                b = np.pad(b, ((0, 0), (0, pad)))      # is padding-only
+            b = b.reshape(b.shape[0], b.shape[1] // fb, fb).max(axis=2)
+        img = qmin + (b.T.astype(np.float32) / 255.0) * (qmax - qmin) + offset
+        img[:, ~self.filled] = np.nan                  # gaps -> plot background
+        return img
+
+
 @app.route("/")
 def index():
     resp = make_response(send_file(os.path.join(HERE, "viewer.html")))
@@ -210,13 +349,12 @@ def heatmap():
     span = max(t1 - t0, 1.0)
 
     tbl, bucket = pick_level(span, width)
-    with _con_lock:
-        rows = con.execute(f"""
-            SELECT freq, t, mx, md, mn
-            FROM {tbl}
-            WHERE sensor = ? AND t >= ? AND t < ?
-            ORDER BY t
-        """, [sensor, t0, t1]).fetchall()
+    rows = con.cursor().execute(f"""
+        SELECT freq, t, mx, md, mn
+        FROM {tbl}
+        WHERE sensor = ? AND t >= ? AND t < ?
+        ORDER BY t
+    """, [sensor, t0, t1]).fetchall()
 
     # Columnar payload; dBm stored as SMALLINT dBm*10 -> /10 restores 0.1 dBm.
     freq, t, mx, md, mn = [], [], [], [], []
@@ -241,7 +379,6 @@ NF = 2250             # bins  (full band 3530.04 .. 3709.96 MHz)
 PSD_DBM_OFFSET = 70.0
 
 _psd_con = None
-_psd_lock = threading.Lock()
 _psd_scale_cache = {}   # sensor -> (vmin, vmax) sampled across the whole range
 _psd_kind = None        # 'chunk' | 'rows' | None
 _psd_init = threading.Lock()
@@ -266,7 +403,14 @@ def psd_conn():
             return _psd_con
         try:
             _psd_con = duckdb.connect(PSD_DB, read_only=True)
-        except Exception:
+        except Exception as e:
+            # Silence here meant the layer simply was not there: /api/psd_meta
+            # answers {"has": false}, the viewer switches the layer off, and
+            # nothing anywhere says why. The usual causes are an ingest or
+            # compact_db still holding the write lock, and a file that is not a
+            # DuckDB database -- both worth naming.
+            print(f"[serve] cannot open {os.path.basename(PSD_DB)}: {e}")
+            print("[serve]   -- the PSD layer will not be available.")
             return None
         # Two on-disk shapes are valid: the compact chunk schema written by
         # compact_db.py, and the row-per-capture schema psd_ingest.py writes.
@@ -321,9 +465,24 @@ def _psd_scale(c, sensor, qmin, qmax):
                     rows.append(r)
         specs = _unpack(rows, NF)[1] if rows else None
     else:
-        rows = c.execute("SELECT t, spec FROM psd WHERE sensor=? "
-                         "USING SAMPLE reservoir(400 ROWS)", [sensor]).fetchall()
-        specs = _unpack_rows(rows, NF)[1] if rows else None
+        # A reservoir sample over the row schema reads every row in the table:
+        # 12 s on a 400 MB test database, minutes on the multi-GB real one, and
+        # it is paid by the FIRST zoom into this layer -- which reads as the
+        # layer being broken. Short reads spread across the sensor's time range
+        # cost milliseconds and give the same 2nd/98th percentiles.
+        rng = c.execute("SELECT t_min, t_max FROM psd_meta WHERE sensor=?",
+                        [sensor]).fetchone()
+        blobs = []
+        if rng and rng[0] is not None and rng[1] is not None:
+            step = max((rng[1] - rng[0]) / SCALE_PROBES, 1.0)
+            for k in range(SCALE_PROBES):
+                a = rng[0] + k * step
+                blobs += [r[0] for r in c.execute(
+                    "SELECT spec FROM psd WHERE sensor=? AND t>=? AND t<? "
+                    "ORDER BY t LIMIT ?", [sensor, a, a + step, SCALE_PER_PROBE]
+                ).fetchall()]
+        specs = (np.frombuffer(b"".join(blobs), np.uint8).reshape(len(blobs), NF)
+                 if blobs else None)
     if specs is None or not len(specs):
         sc = (qmin, qmax)
     else:
@@ -334,40 +493,108 @@ def _psd_scale(c, sensor, qmin, qmax):
     return sc
 
 
-def _psd_window(c, sensor, t0, t1):
-    """Spectra in [t0,t1). Data gap -> hold the nearest capture (matches the
-    summary layer's gap-fill so zooming keeps showing last-known data)."""
+def _psd_count(c, sensor, t0, t1):
+    """Captures stored in [t0,t1) -- only used to decide whether to stride, so
+    the chunk estimate (whole chunks that overlap) is close enough."""
     if _psd_kind == "chunk":
-        rows = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? "
-                         "AND t1>=? AND t0<? ORDER BY t0", [sensor, t0, t1]).fetchall()
-        if rows:
-            ts, specs = _unpack(rows, NF)
-            m = (ts >= t0) & (ts < t1)
-            if m.any():
-                return specs[m], False
+        r = c.execute("SELECT coalesce(sum(n),0) FROM psd_chunk WHERE sensor=? "
+                      "AND t1>=? AND t0<?", [sensor, t0, t1]).fetchone()
+    else:
+        r = c.execute("SELECT count(*) FROM psd WHERE sensor=? AND t>=? AND t<?",
+                      [sensor, t0, t1]).fetchone()
+    return int(r[0] or 0)
+
+
+def _psd_nearest(c, sensor, t1):
+    """The one capture to hold when the window itself is empty."""
+    if _psd_kind == "chunk":
         row = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? AND t0<? "
                         "ORDER BY t0 DESC LIMIT 1", [sensor, t1]).fetchone()
         if row is None:
             row = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? "
                             "ORDER BY t0 LIMIT 1", [sensor]).fetchone()
         if row is None:
-            return None, False
+            return None
         ts, specs = _unpack([row], NF)
         i = max(0, int(np.searchsorted(ts, t1)) - 1)
-        return specs[i:i + 1], True
-
-    rows = c.execute("SELECT t, spec FROM psd WHERE sensor=? AND t>=? AND t<? "
-                     "ORDER BY t", [sensor, t0, t1]).fetchall()
-    if rows:
-        return _unpack_rows(rows, NF)[1], False
+        return specs[i:i + 1]
     row = c.execute("SELECT t, spec FROM psd WHERE sensor=? AND t<? "
                     "ORDER BY t DESC LIMIT 1", [sensor, t1]).fetchone()
     if row is None:
         row = c.execute("SELECT t, spec FROM psd WHERE sensor=? ORDER BY t LIMIT 1",
                         [sensor]).fetchone()
     if row is None:
+        return None
+    return _unpack_rows([row], NF)[1]
+
+
+def _psd_window(c, sensor, t0, t1, cols, fi0, fi1):
+    """Spectra in [t0,t1), max-pooled onto `cols` uniform time bins.
+
+    Streamed in batches: peak memory is one batch, not one window, so a
+    six-month window costs the same resident bytes as a six-hour one. The
+    frequency band is sliced before pooling, so a zoomed-in view also carries
+    only the bins it will actually draw.
+
+    Data gap -> hold the nearest capture (matches the summary layer's gap-fill,
+    so zooming into a quiet stretch keeps showing last-known data).
+    """
+    nb = fi1 - fi0 + 1
+    grid = _Grid(t0, t1, cols, nb)
+    stride = _stride_for(_psd_count(c, sensor, t0, t1), cols)
+
+    if _psd_kind == "chunk":
+        cur = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? "
+                        "AND t1>=? AND t0<? ORDER BY t0", [sensor, t0, t1])
+        while True:
+            rows = cur.fetchmany(READ_BATCH)
+            if not rows:
+                break
+            for n, tblob, sblob in rows:
+                ts = np.frombuffer(zlib.decompress(tblob), np.float64)
+                mat = np.frombuffer(zlib.decompress(sblob), np.uint8).reshape(n, NF)
+                keep = (ts >= t0) & (ts < t1)
+                if stride > 1:                      # thin inside the chunk too
+                    every = np.zeros(len(ts), bool)
+                    every[::stride] = True
+                    keep &= every
+                if keep.any():
+                    grid.add(ts[keep], mat[:, fi0:fi1 + 1][keep])
+    else:
+        # Stride on rowid, not row_number(): a window function has to
+        # materialise every row of the partition -- BLOBs included -- before it
+        # can number them, which measured 3.8x slower and used over twice the
+        # memory here, and would be several GB on the real database. rowid is a
+        # plain streaming filter. Rows go in ordered by time, so every Nth rowid
+        # is also an even spread in time.
+        sql = "SELECT t, spec FROM psd WHERE sensor=? AND t>=? AND t<? ORDER BY t"
+        args = [sensor, t0, t1]
+        if stride > 1:
+            sql = ("SELECT t, spec FROM psd WHERE sensor=? AND t>=? AND t<? "
+                   "AND rowid % ? = 0 ORDER BY t")
+            args.append(stride)
+        try:
+            cur = c.execute(sql, args)
+        except duckdb.Error:            # no rowid on this build: correct, slower
+            cur = c.execute("SELECT t, spec FROM psd WHERE sensor=? AND t>=? "
+                            "AND t<? ORDER BY t", [sensor, t0, t1])
+        while True:
+            rows = cur.fetchmany(READ_BATCH * PSD_ROWS_PER_BATCH)
+            if not rows:
+                break
+            ts = np.array([r[0] for r in rows], np.float64)
+            mat = np.frombuffer(b"".join(r[1] for r in rows),
+                                np.uint8).reshape(len(rows), NF)
+            grid.add(ts, mat[:, fi0:fi1 + 1])
+
+    if grid.filled.any():
+        return grid, False
+    specs = _psd_nearest(c, sensor, t1)
+    if specs is None:
         return None, False
-    return _unpack_rows([row], NF)[1], True
+    hold = _Grid(t0, t1, 1, nb)
+    hold.add(np.array([t0], np.float64), specs[:, fi0:fi1 + 1])
+    return hold, True
 
 
 @app.route("/api/psd_meta")
@@ -375,9 +602,8 @@ def psd_meta():
     c = psd_conn()
     if c is None or _psd_kind is None:
         return jsonify({"has": False})
-    with _psd_lock:
-        row = c.execute("SELECT f0, df, nf, t_min, t_max FROM psd_meta WHERE sensor=?",
-                        [request.args.get("sensor")]).fetchone()
+    row = c.cursor().execute("SELECT f0, df, nf, t_min, t_max FROM psd_meta WHERE sensor=?",
+                             [request.args.get("sensor")]).fetchone()
     # An ingest that read no files leaves a meta row with a null time range.
     # Never advertise a layer whose backing rows are not actually there.
     if not row or row[3] is None or row[4] is None:
@@ -400,32 +626,23 @@ def psd_layer():
     c = psd_conn()
     if c is None or _psd_kind is None:
         return jsonify({"error": "psd layer not ready"}), 503
-    with _psd_lock:
-        specs, gap = _psd_window(c, sensor, t0, t1)
-        mrow = c.execute("SELECT qmin, qmax FROM psd_meta WHERE sensor=?", [sensor]).fetchone()
-    if specs is None:
+    W = max(1, _num("w", 1200, int))
+    cur = c.cursor()
+    grid, gap = _psd_window(cur, sensor, t0, t1, _grid_cols(W), fi0, fi1)
+    mrow = cur.execute("SELECT qmin, qmax FROM psd_meta WHERE sensor=?", [sensor]).fetchone()
+    if grid is None:
         return jsonify({"error": "no psd data for this sensor"}), 404
     qmin, qmax = mrow or (-180.0, -90.0)
-    ncap = len(specs)
-    band = specs[:, fi0:fi1 + 1].astype(np.float32)   # (ncap, nbins)
-    nbins = band.shape[1]
-    fb = max(1, math.ceil(nbins / H))                 # freq bins per pixel row
-    pad = (-nbins) % fb
-    if pad:
-        band = np.pad(band, ((0, 0), (0, pad)))
-    nF = band.shape[1] // fb
-    binned = band.reshape(ncap, nF, fb).max(axis=2)
-    img = qmin + (binned.T / 255.0) * (qmax - qmin) + PSD_DBM_OFFSET  # (nF, ncap); row 0 = low f
+    img = grid.image(qmin, qmax, H, PSD_DBM_OFFSET)   # (nF, cols); row 0 = low f
     locked = _locked_scale()
     if locked:
         vmin, vmax = locked
     else:
-        with _psd_lock:
-            vmin, vmax = _psd_scale(c, sensor, qmin, qmax)   # full-range: no drift on zoom
+        vmin, vmax = _psd_scale(cur, sensor, qmin, qmax)     # full-range: no drift on zoom
     return _tile(_colorize(img, vmin, vmax, request.args.get("cmap", "inferno")), {
         "t0": t0, "t1": t1,
         "fmin": F0 + fi0 * DF, "fmax": F0 + fi1 * DF,
-        "ncap": int(ncap), "cols": int(ncap), "nf": int(nF),
+        "ncap": int(grid.ncap), "cols": int(img.shape[1]), "nf": int(img.shape[0]),
         "vmin": round(vmin, 1), "vmax": round(vmax, 1), "gap": gap,
     })
 
@@ -433,8 +650,8 @@ def psd_layer():
 # ---- PFP layer (periodic-frame-power, ~18 us within a 10 ms frame) ----
 PFP_DB = os.environ.get("PFP_DB") or os.path.join(DB_DIR, "pfp.duckdb")
 _pfp_con = None
-_pfp_lock = threading.Lock()
 _pfp_freqs_cache = {}
+PFP_SNAP_HZ = 10e6      # how far a requested channel may be off and still resolve
 _pfp_kind = None        # 'chunk' | 'rows' | None
 _pfp_init = threading.Lock()
 
@@ -448,7 +665,14 @@ def pfp_conn():
             return _pfp_con
         try:
             _pfp_con = duckdb.connect(PFP_DB, read_only=True)
-        except Exception:
+        except Exception as e:
+            # Silence here meant the layer simply was not there: /api/pfp_meta
+            # answers {"has": false}, the viewer switches the layer off, and
+            # nothing anywhere says why. The usual causes are an ingest or
+            # compact_db still holding the write lock, and a file that is not a
+            # DuckDB database -- both worth naming.
+            print(f"[serve] cannot open {os.path.basename(PFP_DB)}: {e}")
+            print("[serve]   -- the PFP layer will not be available.")
             return None
         t = table_names(_pfp_con)       # same dual-schema rule as PSD above
         _pfp_kind = "chunk" if "pfp_chunk" in t else ("rows" if "pfp" in t else None)
@@ -464,20 +688,46 @@ def pfp_meta():
     c = pfp_conn()
     if c is None or _pfp_kind is None:
         return jsonify({"has": False})
-    with _pfp_lock:
-        m = c.execute("SELECT npos, frame_ms, t_min, t_max, stat FROM pfp_meta WHERE sensor=?",
-                      [sensor]).fetchone()
-        if not m or m[2] is None or m[3] is None:
-            return jsonify({"has": False})
-        freqs = _pfp_freqs_cache.get(sensor)
-        if freqs is None:
-            src = "pfp_chunk" if _pfp_kind == "chunk" else "pfp"
-            freqs = [r[0] for r in c.execute(
-                f"SELECT DISTINCT freq FROM {src} WHERE sensor=? ORDER BY 1",
-                [sensor]).fetchall()]
-            _pfp_freqs_cache[sensor] = freqs
+    cur = c.cursor()
+    m = cur.execute("SELECT npos, frame_ms, t_min, t_max, stat FROM pfp_meta WHERE sensor=?",
+                    [sensor]).fetchone()
+    if not m or m[2] is None or m[3] is None:
+        return jsonify({"has": False})
+    freqs = _pfp_freqs(cur, sensor)
     return jsonify({"has": True, "npos": m[0], "frame_ms": m[1],
                     "t_min": m[2], "t_max": m[3], "stat": m[4], "freqs": freqs})
+
+
+def _pfp_freqs(c, sensor):
+    """The channel centres this sensor actually has PFP for (cached)."""
+    freqs = _pfp_freqs_cache.get(sensor)
+    if freqs is None:
+        src = "pfp_chunk" if _pfp_kind == "chunk" else "pfp"
+        freqs = [r[0] for r in c.execute(
+            f"SELECT DISTINCT freq FROM {src} WHERE sensor=? ORDER BY 1",
+            [sensor]).fetchall()]
+        _pfp_freqs_cache[sensor] = freqs
+    return freqs
+
+
+def _pfp_snap(c, sensor, freq):
+    """Snap a requested channel onto one this sensor really has.
+
+    `WHERE freq = ?` is an exact match on a DOUBLE, so a caller whose channel
+    grid is a hair off -- or off by a whole channel -- got an empty result and
+    a 404, which the viewer could only read as "no frame layer here". Snapping
+    to the nearest stored centre means the deepest layer still appears, and the
+    tile reports which channel it actually is.
+
+    Bounded to one channel spacing: a request that is merely on the wrong grid
+    is worth rescuing, but answering one 3.5 GHz away with a real channel's
+    data would be a confident lie about what is on screen.
+    """
+    freqs = _pfp_freqs(c, sensor)
+    if not freqs:
+        return None
+    ch = min(freqs, key=lambda f: abs(f - freq))
+    return ch if abs(ch - freq) <= PFP_SNAP_HZ else None
 
 
 @app.route("/api/pfp_frame")
@@ -486,46 +736,59 @@ def pfp_frame():
     sensor = request.args.get("sensor")
     freq = _num("freq", required=True)
     t0, t1, H = _window()
+    W = max(1, _num("w", 1200, int))
     c = pfp_conn()
     if c is None or _pfp_kind is None:
         return jsonify({"error": "pfp not ready"}), 503
-    with _pfp_lock:
-        if _pfp_kind == "chunk":
-            rows = c.execute(
-                "SELECT n, times, frames FROM pfp_chunk WHERE sensor=? AND freq=? "
-                "AND t1>=? AND t0<? ORDER BY t0", [sensor, freq, t0, t1]).fetchall()
-        else:
-            rows = c.execute(
-                "SELECT t, frame FROM pfp WHERE sensor=? AND freq=? "
-                "AND t>=? AND t<? ORDER BY t", [sensor, freq, t0, t1]).fetchall()
-        m = c.execute("SELECT npos, frame_ms, qmin, qmax FROM pfp_meta WHERE sensor=?",
-                      [sensor]).fetchone()
-    if not rows or not m:
-        return jsonify({"error": "no pfp in window"}), 404
+    q = c.cursor()
+    m = q.execute("SELECT npos, frame_ms, qmin, qmax FROM pfp_meta WHERE sensor=?",
+                  [sensor]).fetchone()
+    if not m:
+        return jsonify({"error": "no pfp for this sensor"}), 404
     npos, frame_ms, qmin, qmax = m
-    ts, frames = (_unpack(rows, npos) if _pfp_kind == "chunk"
-                  else _unpack_rows(rows, npos))
-    keep = (ts >= t0) & (ts < t1)
-    if not keep.any():
+    ch = _pfp_snap(q, sensor, freq)
+    if ch is None:
+        return jsonify({"error": f"no pfp channel near {freq/1e6:.1f} MHz"}), 404
+    grid = _Grid(t0, t1, _grid_cols(W), npos)
+    if _pfp_kind == "chunk":
+        cur = q.execute(
+            "SELECT n, times, frames FROM pfp_chunk WHERE sensor=? AND freq=? "
+            "AND t1>=? AND t0<? ORDER BY t0", [sensor, ch, t0, t1])
+        while True:
+            rows = cur.fetchmany(READ_BATCH)
+            if not rows:
+                break
+            for n, tblob, fblob in rows:
+                ts = np.frombuffer(zlib.decompress(tblob), np.float64)
+                mat = np.frombuffer(zlib.decompress(fblob), np.uint8).reshape(n, npos)
+                keep = (ts >= t0) & (ts < t1)
+                if keep.any():
+                    grid.add(ts[keep], mat[keep])
+    else:
+        cur = q.execute(
+            "SELECT t, frame FROM pfp WHERE sensor=? AND freq=? "
+            "AND t>=? AND t<? ORDER BY t", [sensor, ch, t0, t1])
+        while True:
+            rows = cur.fetchmany(READ_BATCH * PSD_ROWS_PER_BATCH)
+            if not rows:
+                break
+            ts = np.array([r[0] for r in rows], np.float64)
+            mat = np.frombuffer(b"".join(r[1] for r in rows),
+                                np.uint8).reshape(len(rows), npos)
+            grid.add(ts, mat)
+    if not grid.filled.any():
         return jsonify({"error": "no pfp in window"}), 404
-    ts = ts[keep]; frames = frames[keep]
-    ncap = len(frames)
-    mat = frames.T.astype(np.float32)                 # (npos, ncap)
-    nrows = min(H, npos)
-    if npos > nrows:
-        fb = math.ceil(npos / nrows)
-        pad = (-npos) % fb
-        m2 = np.pad(mat, ((0, pad), (0, 0))) if pad else mat
-        mat = m2.reshape(m2.shape[0] // fb, fb, ncap).max(axis=1)
-    img = qmin + (mat / 255.0) * (qmax - qmin)        # (nrows, ncap); row 0 = frame start
+    img = grid.image(qmin, qmax, H)        # (nrows, cols); row 0 = frame start
     locked = _locked_scale()
     if locked:
         vmin, vmax = locked
     else:
-        vmin = float(np.percentile(img, 2)); vmax = float(np.percentile(img, 98))
+        seen = img[np.isfinite(img)]       # ignore the empty (gap) columns
+        vmin = float(np.percentile(seen, 2)); vmax = float(np.percentile(seen, 98))
     return _tile(_colorize(img, vmin, vmax, request.args.get("cmap", "inferno")), {
-        "t0": float(ts[0]), "t1": float(ts[-1]), "ncap": ncap,
-        "npos": npos, "nrows": int(img.shape[0]), "frame_ms": frame_ms, "freq": freq,
+        "t0": t0, "t1": t1, "ncap": int(grid.ncap),
+        "npos": npos, "nrows": int(img.shape[0]), "cols": int(img.shape[1]),
+        "frame_ms": frame_ms, "freq": ch,
         "vmin": round(vmin, 1), "vmax": round(vmax, 1),
     })
 

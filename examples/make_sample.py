@@ -46,7 +46,13 @@ DUR = 0.5             # seconds  -> 1e6 complex samples (~8 MB cf32)
 # quieter than the other so switching visibly changes the picture.
 SENSORS = ("DEMO-Directional", "DEMO-Omni")
 DAYS = ("2024-03-04", "2024-03-05", "2024-03-06")
-CHANNELS = [3550.0 + 10.0 * i for i in range(15)]   # 3550..3690 MHz, 10 MHz each
+# The real NASCTN SEA channel grid: 18 x 10 MHz centred on 3535 + 10k MHz.
+# This used to be 3550 + 10k, half a channel off the real thing -- which put the
+# demo's PFP channels on centres the viewer never asks for, so the frame layer
+# 404'd on every request and a fresh clone could not reach the deepest layer at
+# all. It also disagreed with PSD_F0/PSD_DF/PSD_NF three lines below, which have
+# always described the 3535-grid band.
+CHANNELS = [3535.0 + 10.0 * i for i in range(18)]   # 3535..3705 MHz, 10 MHz each
 SUMMARY_STEP = 300      # seconds between Summaries rows
 PSD_PER_DAY = 12        # PSD captures per sensor per day
 PFP_PER_DAY = 8         # PFP frames per sensor per channel per day
@@ -213,7 +219,7 @@ def write_pfp(dirpath):
             for k in range(PFP_PER_DAY):
                 sec = k * step
                 hh, mm = sec // 3600, (sec % 3600) // 60
-                for ch in (3560.0, 3640.0):     # one quiet channel, one busy
+                for ch in (3565.0, 3645.0):     # one quiet channel, one busy
                     occ = max(_load(sensor, ch, (sec / 3600.0) % 24.0),
                               _radar(di, sec, ch))
                     # TDD duty cycle: downlink for the first ~65% of the frame.

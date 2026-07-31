@@ -174,14 +174,24 @@ run still passes.
 One continuous interface where X is always time. As you zoom in, the viewer swaps
 between three stored-resolution layers automatically:
 
+Either axis can trigger the swap: zooming **time** in far enough drops a layer,
+and so does zooming **frequency** in far enough. That matters because the
+summary layer only knows 10 MHz channels, so once the frequency window is down
+to a few channels it has nothing left to draw — no matter how wide the time
+window still is.
+
 | Layer | Source | Resolution | Shown when |
 |-------|--------|------------|------------|
-| **Summary** | `spectrum.duckdb` | ~90 s sweeps, 18 channels | zoomed out (months → days) |
-| **PSD** | `psd.duckdb` | 2250 freq bins @ 80 kHz, ~4-min captures | time span ≤ 3 days |
-| **PFP** | `pfp.duckdb` | 560 pts across a 10 ms frame (~18 µs/pt) | freq narrowed to ~1 channel, or span ≤ 30 min |
+| **Summary** | `spectrum.duckdb` | ~90 s sweeps, 18 channels | zoomed out on both axes |
+| **PSD** | `psd.duckdb` | 2250 freq bins @ 80 kHz, ~90 s captures | time span ≤ 3 days **or** freq window ≤ 40 MHz |
+| **PFP** | `pfp.duckdb` | 560 pts across a 10 ms frame (~18 µs/pt) | freq window ≤ 12 MHz (one channel) **and** time span ≤ 6 h |
 
 Frequency zoom is the vertical slider on the left (drag up = zoom in); drag the
-screen vertically to pan frequency.
+screen vertically to pan frequency. The slider marks where each deeper layer
+takes over: a blue zone for PSD, an amber one at the top for PFP. The amber zone
+is dimmed while the time window is still too wide for the frame layer, and the
+**Detail** readout in the footer names the layer actually on screen — and says
+what is missing when it cannot show the one you asked for.
 
 ## IQ capture mode
 

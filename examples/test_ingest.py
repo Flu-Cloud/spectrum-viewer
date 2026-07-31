@@ -64,13 +64,18 @@ def make_data(root):
         write_csv(os.path.join(psd_dir, f"{day}_{SENSOR}_max.csv"),
                   ["datetime"] + [f"b{i}" for i in range(NF)], rows)
 
-    # PFP: PFP_<day>_<sensor>_max_peak.csv , 4 captures x 560 positions
+    # PFP: PFP_<day>_<sensor>_max_peak.csv , 4 captures x 560 positions.
+    # The `frequency` column is in HERTZ, as the real NASCTN exports write it
+    # and as pfp_ingest.py stores it verbatim -- the Summaries column next to it
+    # is the one in MHz. This fixture used to say 3555.0, so pfp.duckdb held a
+    # channel centre of 3555 Hz and every test exercised a unit the real data
+    # never uses.
     pfp_dir = os.path.join(root, "mds2-test", "sea", "frames")
     for day in DAYS:
         rows = []
         for k in range(4):
             frame = np.round(-90 + 30 * rng.random(NPOS), 2)
-            rows.append([f"{day} {k:02d}:30:00", 3555.0, *frame])
+            rows.append([f"{day} {k:02d}:30:00", 3555.0e6, *frame])
         write_csv(os.path.join(pfp_dir, f"PFP_{day}_{SENSOR}_max_peak.csv"),
                   ["datetime", "frequency"] + [f"p{i}" for i in range(NPOS)], rows)
 
@@ -188,7 +193,7 @@ def main():
                   str(got.get("psd_layer")))
             check("pfp_meta advertises the layer and its channel",
                   got["pfp_meta"].get("has") is True
-                  and got["pfp_meta"].get("freqs") == [3555.0],
+                  and got["pfp_meta"].get("freqs") == [3555.0e6],   # Hz, as ingested
                   str(got["pfp_meta"].get("freqs")))
             check("pfp_frame renders a tile",
                   got.get("pfp_frame", [0])[0] == 200, str(got.get("pfp_frame")))
