@@ -37,6 +37,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -139,12 +140,22 @@ def short(p):
 def last_line(text, width=140):
     """The last line of a captured child's output that says anything.
 
-    A traceback's last line is the exception, which is the one line worth
-    surfacing when the rest has been captured. Without this, a child that died
-    was reported as having failed with nothing to go on.
+    A traceback's last line is usually the exception, which is the one line
+    worth surfacing when the rest has been captured. Not always, though: a
+    DuckDB CatalogException prints the offending statement and a bare "^" caret
+    underneath its message, so taking the literal last line reported an entire
+    failed verification as "  [FAIL] ...  ^". Walk back to the line that names
+    an exception, and fall back to the last non-empty line only if none does.
     """
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
-    return lines[-1][:width] if lines else "(no output)"
+    if not lines:
+        return "(no output)"
+    for l in reversed(lines[-15:]):
+        head = l.split(":", 1)[0]
+        if ":" in l and " " not in head and head.endswith(
+                ("Error", "Exception", "Exit", "Interrupt")):
+            return l[:width]
+    return lines[-1][:width]
 
 
 def run(argv, dry=False):
@@ -311,6 +322,17 @@ def prebuilt_plan(found):
         # Biggest first, so the base is the one that needs the fewest inserts.
         entries.sort(key=lambda e: (-e[1], e[0]))
         dst = db_path(kind)
+        # A file that IS the destination is not a candidate to install over
+        # itself. `python atlas.py get .` from the repository found
+        # spectrum.duckdb, moved it to spectrum.duckdb.bak, and then failed to
+        # copy it back from the path it had just emptied -- a traceback that
+        # left the viewer's database missing. Report those as already installed
+        # instead, which is also the honest answer for re-running `get` on a
+        # folder that was ingested before.
+        already = [e for e in entries if same_file(e[0], dst)]
+        entries = [e for e in entries if not same_file(e[0], dst)]
+        for p, _rows in already:
+            out.append((p, dst, kind, "already"))
         live = False
         if os.path.exists(dst):
             real, _label, rows = identify_db(dst)
@@ -318,20 +340,129 @@ def prebuilt_plan(found):
         for i, (p, _rows) in enumerate(entries):
             if kind in MERGEABLE and (live or i > 0):
                 out.append((p, dst, kind, "merge"))
-            elif i == 0:
-                out.append((p, dst, kind, "install"))
-            else:
+            elif live or i > 0:
+                # Installing over data that cannot be merged destroys it. This
+                # used to test i > 0 alone, so `get <folder>` holding one
+                # spectrum database replaced a live spectrum.duckdb -- a full
+                # ingest of someone's own CSVs, gone but for the .bak, with the
+                # plan line reading only "install prebuilt spectrum.duckdb".
                 out.append((p, dst, kind, "skip"))
+            else:
+                out.append((p, dst, kind, "install"))
     return out, rejected
+
+
+def same_file(a, b):
+    """True when two paths name the same file on disk.
+
+    os.path.samefile is the reliable test -- it follows symlinks and on Windows
+    compares the volume's file id, so C:\\ATLAS\\x.duckdb and
+    c:\\atlas\\..\\ATLAS\\x.duckdb are the same file -- but it raises when
+    either path is missing. Fall back to a normalised string compare, which is
+    also what Windows' case-insensitivity needs.
+    """
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError):
+        return (os.path.normcase(os.path.abspath(a))
+                == os.path.normcase(os.path.abspath(b)))
+
+
+def discard(*paths):
+    """Delete half-finished copies. Best effort: they are only ever temporary."""
+    for p in paths:
+        try:
+            if p:
+                os.remove(p)
+        except OSError:
+            pass
+
+
+def make_writable(path):
+    """Clear the read-only bit that a copy inherits from its source.
+
+    Databases handed over on a DVD, unpacked from an archive, or copied off a
+    read-only share arrive read-only, and copy2 copies the mode along with the
+    bytes. Every ingest then fails to open its own destination for writing, and
+    on Windows the file cannot even be replaced until the bit is cleared.
+    """
+    try:
+        os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
+    except OSError:
+        pass
+
+
+def install_db(src, dst):
+    """Copy one database file into place. Returns a line describing what it did.
+
+    Every failure mode of a file copy has to leave the existing database
+    intact -- this is the one operation in atlas.py that can destroy data
+    nobody can get back. So: copy to a sibling temporary first and swap only
+    once the copy has finished, rather than moving the old file aside and
+    hoping the copy works.
+
+    The .wal sidecar is part of the database. An ingest that was interrupted,
+    or that simply has not checkpointed yet, keeps its most recent work there,
+    and <name>.duckdb on its own then opens with none of it -- often with no
+    tables at all. So the log is copied with the database. Any *stale* log at
+    the destination is moved aside first, because DuckDB replays whatever
+    <name>.duckdb.wal it finds next to the file it opens, and replaying one
+    database's log into another is what produces
+    'Catalog Error: Table with name "raw" already exists!'.
+    """
+    tmp, tmp_wal = dst + ".incoming", None
+    try:
+        shutil.copy2(src, tmp)
+        make_writable(tmp)
+        if os.path.exists(src + ".wal"):
+            tmp_wal = tmp + ".wal"
+            shutil.copy2(src + ".wal", tmp_wal)
+            make_writable(tmp_wal)
+    except BaseException:
+        # Includes Ctrl+C halfway through copying gigabytes.
+        discard(tmp, tmp_wal)
+        raise
+    kept = []
+    try:
+        for path in (dst, dst + ".wal"):
+            if os.path.exists(path):
+                # os.replace overwrites an existing .bak in one step. shutil.move
+                # would fall back to a full byte copy on Windows, where renaming
+                # onto an existing file raises instead of replacing it.
+                os.replace(path, path + ".bak")
+                kept.append(path)
+        os.replace(tmp, dst)
+        if tmp_wal:
+            os.replace(tmp_wal, dst + ".wal")
+    except OSError:
+        # On Windows a file another process holds open cannot be renamed at
+        # all, so the swap can fail with the old database already moved aside.
+        # Put it back and drop the copy: a failed install has to leave the
+        # destination exactly as it found it, not missing.
+        for path in kept:
+            if not os.path.exists(path):
+                os.replace(path + ".bak", path)
+        discard(tmp, tmp_wal)
+        raise
+    kept = [os.path.basename(p) for p in kept]
+    note = ""
+    if kept:
+        note = "\n    kept the previous " + ", ".join(f"{k} as {k}.bak"
+                                                      for k in kept)
+    return (f"  installed {os.path.basename(dst)}"
+            + (" (with its write-ahead log)" if tmp_wal else "") + note)
 
 
 def apply_prebuilt(src, dst, kind, action):
     """Put one prebuilt database into place. -> True if dst gained its data."""
     name, target = os.path.basename(src), os.path.basename(dst)
+    if action == "already":
+        print(f"  {name} is already installed as {target}; nothing to do")
+        return True
     if action == "skip":
-        print(f"  {name}: NOT loaded. {target} holds one {kind} dataset and "
+        print(f"  {name}: NOT loaded. {target} already holds {kind} data and "
               f"{kind} data cannot be merged, so this file would have replaced "
-              "the larger one.\n"
+              "it.\n"
               f"    To use this one instead, move it somewhere on its own and "
               f"run: python atlas.py get \"{src}\"")
         return False
@@ -347,11 +478,19 @@ def apply_prebuilt(src, dst, kind, action):
             print(f"  {name}: nothing new; all {len(skipped)} item(s) are "
                   f"already in {target}")
         return True
-    if os.path.exists(dst):
-        shutil.move(dst, dst + ".bak")
-        print(f"  kept the previous {target} as {target}.bak")
-    shutil.copy2(src, dst)
-    print(f"  installed {target}")
+    if same_file(src, dst):
+        print(f"  {name} is already installed as {target}; nothing to do")
+        return True
+    try:
+        print(install_db(src, dst))
+    except (OSError, shutil.Error) as e:                    # noqa: BLE001
+        # A file another process holds open (on Windows an open DuckDB handle
+        # locks the file outright), a full disk, a read-only destination, a
+        # source that disappeared mid-copy. Every one of these used to end the
+        # run in a traceback -- and, before this, after the previous database
+        # had already been moved out of the way.
+        print(f"  {name}: could NOT be installed as {target}: {e}")
+        return False
     return True
 
 
@@ -986,9 +1125,19 @@ def doctor_databases(r, adopt):
             r.warned(f"{os.path.basename(p)} is not being used",
                      f"re-run with --adopt to load it as {real}.duckdb")
             continue
+        if real in seen and real not in MERGEABLE:
+            # Adopting here would copy this file over a database that already
+            # holds data of the same kind, and spectrum data cannot be merged.
+            # --adopt asks for a stray to be put to use, not for the working
+            # database to be replaced by it.
+            r.warned(f"{os.path.basename(p)} was NOT adopted",
+                     f"{real}.duckdb already holds {real} data, which cannot "
+                     f"be merged. Move {real}.duckdb aside first if you mean "
+                     "to replace it.")
+            continue
         # Merge when there is already data to merge into, so adopting a second
         # database adds to the library instead of replacing it.
-        action = "merge" if real in MERGEABLE and real in seen else "install"
+        action = "merge" if real in seen else "install"
         if apply_prebuilt(p, dst, real, action):
             r.ok(f"adopted {os.path.basename(p)} as {real}.duckdb",
                  f"{rows:,} rows")
@@ -1542,9 +1691,10 @@ def cmd_get(args):
         what = {"install": f"install prebuilt {os.path.basename(dst)}",
                 "merge": f"merge {os.path.basename(src)} into "
                          f"{os.path.basename(dst)}",
+                "already": f"{os.path.basename(src)} is already installed",
                 "skip": f"skip {os.path.basename(src)} (see below)"}[action]
         print(f"  - {what}" + (" (no ingest needed)"
-                               if action != "skip" else ""))
+                               if action in ("install", "merge") else ""))
     for label, _ in steps:
         print(f"  - {label}")
     if found["other"]:

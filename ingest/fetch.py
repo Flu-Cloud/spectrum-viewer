@@ -158,6 +158,73 @@ class FetchError(Exception):
     pass
 
 
+class LocalFileError(FetchError):
+    """A failure writing to disk, as opposed to a failure on the network.
+
+    The two used to be indistinguishable here, and that made the common Windows
+    failures unreadable. OSError is in TRANSIENT below -- a dropped socket
+    raises one too -- so a file that could not be created was retried three
+    times against the server and then reported as "cannot reach <host> ... set
+    HTTPS_PROXY", which names neither the path nor the real problem. Raising a
+    distinct type means the local failures stop early and say where they were.
+    """
+
+
+# Characters Windows refuses in a filename, and the stems it reserves whatever
+# extension follows. A record filepath is a POSIX path and may legally contain
+# several of these, so a record that downloads on Linux can fail on Windows for
+# a reason the raw OSError never spells out.
+_WIN_BAD_CHARS = '<>:"|?*'
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL",
+                 *(f"COM{i}" for i in range(1, 10)),
+                 *(f"LPT{i}" for i in range(1, 10))}
+
+
+def _disk_error(path, exc):
+    """An OSError against a local path -> a LocalFileError naming the path.
+
+    The Windows cases are singled out because their errno is useless on its
+    own: a path past MAX_PATH, a filename containing '?', and a genuinely
+    missing directory all surface as "[WinError 3] The system cannot find the
+    path specified". Only the first two are things the user can act on, and
+    only if told which one they are looking at.
+    """
+    try:
+        full = os.path.abspath(path)
+    except (OSError, ValueError):         # a path the OS won't even resolve
+        full = str(path)
+    hint = ""
+    if os.name == "nt":
+        name = os.path.basename(full)
+        stem = name.split(".")[0].upper()
+        bad = sorted({c for c in name if c in _WIN_BAD_CHARS})
+        if '"' in full:
+            # PowerShell eats the closing quote of --dest "C:\data\", because
+            # \" is an escape there; the surviving quote lands in the path and
+            # Windows rejects it. Worth naming, because the command looks right.
+            hint = ('\n  That path contains a quote character. A --dest ending '
+                    'in a backslash\n  swallows its closing quote in PowerShell '
+                    '(--dest "C:\\data\\" arrives as\n  C:\\data"). Drop the '
+                    'trailing backslash.')
+        elif len(full) >= 260:
+            hint = (f"\n  That path is {len(full)} characters. Windows refuses "
+                    "anything past 260\n  unless long-path support is switched "
+                    "on. Use a shorter --dest -- a short\n  root such as "
+                    "C:\\atlas is the quickest fix -- or set LongPathsEnabled=1 "
+                    "under\n  HKLM\\SYSTEM\\CurrentControlSet\\Control\\"
+                    "FileSystem (admin, then reboot).")
+        elif bad:
+            hint = (f"\n  Windows does not allow {' '.join(bad)} in a filename "
+                    "and this record uses\n  them. Download this one file in a "
+                    "browser and rename it, or exclude it\n  with --filter; the "
+                    "rest of the record is unaffected.")
+        elif stem in _WIN_RESERVED:
+            hint = (f"\n  '{stem}' is a reserved device name on Windows, so no "
+                    "file may be called\n  that. Download this one in a browser "
+                    "under another name.")
+    return LocalFileError(f"cannot write {full}: {exc}{hint}")
+
+
 # ---- host policy ------------------------------------------------------
 
 def is_trusted_host(host):
@@ -255,14 +322,127 @@ def _tls_error(exc):
     return None
 
 
+def _in_conda():
+    """True when this interpreter belongs to a conda environment.
+
+    CONDA_PREFIX is only set by an activated shell, and a conda Python is
+    routinely launched by absolute path from an IDE, a scheduled task or a
+    shortcut, so fall back to the marker directory conda writes into every
+    environment it creates.
+    """
+    return bool(os.environ.get("CONDA_PREFIX")) or os.path.isdir(
+        os.path.join(sys.prefix, "conda-meta"))
+
+
+def _py_cmd(*args):
+    """`args` run against *this* interpreter, quoted for the user's shell.
+
+    Printing a bare "python" is a guess, and it is wrong exactly where it
+    matters most. On Windows, and inside any conda or venv layout, the `python`
+    first on PATH is frequently not the interpreter that just failed -- so
+    "python -m pip install --upgrade certifi" upgrades a bundle this process
+    will never read, and the user reports that the documented fix did nothing.
+    sys.executable is the interpreter that raised the error, so it is the one
+    to name.
+
+    The quoting is not cosmetic either. sys.executable regularly sits under a
+    path containing a space (C:\\Program Files\\..., or a conda env below a
+    user folder with one), and PowerShell will not execute a quoted string as a
+    command -- it just echoes it -- unless the call operator precedes it. The
+    `&` is added only when the quotes are actually needed, so the ordinary case
+    stays paste-able into cmd.exe and bash unchanged.
+    """
+    exe = sys.executable or "python"
+    if " " in exe:
+        exe = f'"{exe}"' if os.name != "nt" else f'& "{exe}"'
+    return " ".join([exe, *args])
+
+
+def _peercert_probe(host):
+    """A one-liner printing the notAfter date the *failing* interpreter sees.
+
+    Single quotes inside, double quotes outside: that is the one nesting that
+    survives PowerShell, cmd.exe and bash without alteration. It also contains
+    no $, % or backtick, which are the characters those three shells would
+    otherwise expand out from under it. The host is scrubbed to the characters
+    a hostname may legally hold so a hostile or malformed URL cannot break out
+    of the quoting in something the user is being invited to paste and run.
+    """
+    safe = re.sub(r"[^A-Za-z0-9.\-]", "", host) or "example.org"
+    code = ("import ssl,socket;"
+            "print(ssl.create_default_context().wrap_socket("
+            f"socket.create_connection(('{safe}',443)),"
+            f"server_hostname='{safe}').getpeercert()['notAfter'])")
+    return _py_cmd("-c", f'"{code}"')
+
+
+def _trust_store_fix():
+    """The "refresh this machine's roots" step, for the platform in hand.
+
+    Which store gets consulted is not a detail, and getting it wrong is why
+    "just upgrade certifi" is the advice people follow and then report back
+    that nothing changed. ssl.create_default_context() ends in
+    load_default_certs(), and that reads a different place on each platform:
+
+      Windows  the Windows certificate store (enumerated directly), and then
+               OpenSSL's default paths. certifi is never consulted unless
+               something has pointed SSL_CERT_FILE at it, so upgrading the
+               package on its own genuinely does nothing here. Windows Update
+               is what refreshes that store.
+      Linux    OpenSSL's compiled-in directory, i.e. the distribution's
+               ca-certificates package. Also not certifi.
+      macOS    on a python.org build, certifi -- but only because the bundled
+               "Install Certificates.command" pip-installs it and points
+               OpenSSL at it. Running that command is the actual fix.
+
+    A conda environment overrides all three: its OpenSSL reads the bundle that
+    the env's own ca-certificates package installs, so that package is what has
+    to move, and certifi matters there too.
+    """
+    pip = _py_cmd("-m", "pip", "install", "--upgrade", "certifi")
+    if _in_conda():
+        return ("    2. Refresh the roots. This is a conda environment, so they "
+                "come from the\n       environment rather than the system:\n"
+                "           conda update ca-certificates\n"
+                f"    3. And the bundle for this exact interpreter:\n"
+                f"           {pip}\n")
+    if os.name == "nt":
+        return ("    2. Refresh the roots this Python reads. On Windows that is "
+                "the Windows\n       certificate store, and Windows Update is "
+                "what refreshes it, so let it\n       run. (certutil "
+                "-generateSSTFromWU only writes the roots to a .sst file;\n"
+                "       they still have to be imported, so it is not the "
+                "shortcut it looks like.)\n"
+                "    3. Updating the CA bundle for this interpreter is worth "
+                "doing anyway:\n"
+                f"           {pip}\n"
+                "       but on Windows it only takes effect if OpenSSL has been "
+                "pointed at\n       certifi, so treat step 2 as the real fix "
+                "here.\n")
+    if sys.platform == "darwin":
+        return ("    2. Refresh the roots. On a python.org build these come from "
+                "certifi, and\n       the bundled \"Install Certificates.command"
+                "\" for your Python version is\n       what installs and wires "
+                "it up. Run that.\n"
+                f"    3. Or do the same by hand:\n           {pip}\n")
+    return ("    2. Refresh the roots this Python reads. On Linux that is the "
+            "distribution\n       bundle, not certifi:\n"
+            "           sudo update-ca-certificates      # Debian/Ubuntu\n"
+            "           sudo update-ca-trust             # Fedora/RHEL\n"
+            "    3. Updating the bundle for this interpreter is worth doing "
+            "anyway:\n"
+            f"           {pip}\n       but it only takes effect if OpenSSL has "
+            "been pointed at certifi.\n")
+
+
 def _cert_hint(host, err):
     """Which of the three TLS failures this is, and the fix for that one.
 
     Verification failures are not interchangeable and the wrong guess sends
-    people the wrong way. An expired certificate is nearly always the local
-    trust store rather than the server: a public host's certificate is renewed
-    long before it lapses, so a client alone in seeing it expired is a client
-    carrying a CA bundle old enough that the issuer it pins has itself run out.
+    people the wrong way. An expired certificate is nearly always this machine
+    rather than the server: a public host's certificate is renewed long before
+    it lapses, so a client alone in seeing it expired is a client whose clock
+    or whose roots are wrong.
     """
     # Which of these carries the detail varies by Python version and by how
     # the error was wrapped: .reason is the bare code, .verify_message the
@@ -275,21 +455,18 @@ def _cert_hint(host, err):
     low = text.lower()
     if "expired" in low:
         return (
-            f"  Almost certainly this machine's CA bundle, not {host}: a public\n"
-            "  host renews well before expiry, so a client alone in seeing it "
-            "expired\n"
-            "  is usually carrying roots old enough to have lapsed themselves.\n"
-            "  Update them:\n"
-            "      python -m pip install --upgrade certifi\n"
-            "  On macOS also run the bundled "
-            "\"Install Certificates.command\" for your\n"
-            "  Python. Then check what the host is actually serving:\n"
-            f"      python -c \"import ssl,socket;"
-            f"print(ssl.create_default_context().wrap_socket("
-            f"socket.create_connection(('{host}',443)),"
-            f"server_hostname='{host}').getpeercert()['notAfter'])\"\n"
-            "  If that prints a future date, the bundle was the problem and the "
-            "download\n  will now work." + _proxy_hint())
+            f"  Almost certainly this machine, not {host}: a public host renews "
+            "well\n  before expiry, so a client alone in seeing it expired is "
+            "usually looking at\n  its own clock or its own roots.\n"
+            "    1. Check the system clock and time zone. A date set even a "
+            "little into\n       the future reads every valid certificate as "
+            "expired, and it is the\n       quickest cause to rule out.\n"
+            + _trust_store_fix()
+            + "  Then ask what the host is really serving, from the same "
+              "interpreter that\n  just failed:\n"
+            f"      {_peercert_probe(host)}\n"
+            "  If that prints a future date, the trust store was the problem "
+            "and the\n  download will now work." + _proxy_hint())
     if "self signed" in low or "self-signed" in low:
         return ("  A proxy is intercepting HTTPS with its own certificate. "
                 "Point\n  SSL_CERT_FILE at your organisation's CA bundle rather "
@@ -746,7 +923,13 @@ def download(url, path, expected, label, retries=3, timeout=60):
 
     Returns 'done' | 'skipped' | 'failed'.
     """
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    except OSError as e:
+        # Named here rather than raised, so one unwritable path costs that file
+        # and not the rest of the record.
+        print(f"{label} FAILED: {_disk_error(path, e)}")
+        return "failed"
     have = os.path.getsize(path) if os.path.exists(path) else 0
     if expected is not None and have == expected:
         print(f"{label} already complete ({fmt_size(expected)}), skipped")
@@ -786,6 +969,12 @@ def download(url, path, expected, label, retries=3, timeout=60):
 
         try:
             done = _stream(resp, path, have, expected, label)
+        except LocalFileError as e:
+            # Ahead of TRANSIENT: a file that cannot be written is not a
+            # network hiccup, and retrying it three times then blaming the
+            # proxy is what used to happen.
+            print(f"\n{label} FAILED: {e}")
+            return "failed"
         except TRANSIENT as e:
             have = os.path.getsize(path) if os.path.exists(path) else 0
             if attempt < retries:
@@ -821,7 +1010,11 @@ def _stream(resp, path, have, expected, label):
         done = have
         t0 = last = time.time()
         base = have
-        with open(path, mode) as out:
+        try:
+            out = open(path, mode)
+        except OSError as e:
+            raise _disk_error(path, e) from e
+        with out:
             while True:
                 chunk = resp.read(CHUNK)
                 if not chunk:
@@ -837,6 +1030,15 @@ def _stream(resp, path, have, expected, label):
                     print(f"\r{label} {fmt_size(done):>9} / {fmt_size(total):>9}"
                           f"  {pct}  {fmt_size(rate)}/s  ETA {fmt_eta(eta)}   ",
                           end="")
+    # A body that stopped short of its own Content-Length is a truncated
+    # download, not a finished one, and http.client does not say so: it closes
+    # the connection and returns b"". The only completeness check used to be in
+    # download(), guarded by `expected is not None`, so whenever the record gave
+    # no size -- every direct file URL whose host refuses HEAD, S3 pre-signed
+    # links among them -- a cut-off transfer was written to disk and reported as
+    # done. Raise it as the short read it is; the caller already resumes those.
+    if total is not None and done < total:
+        raise http.client.IncompleteRead(b"", total - done)
     rate = (done - base) / max(time.time() - t0, 1e-9)
     print(f"\r{label} {fmt_size(done):>9} downloaded "
           f"({fmt_size(rate)}/s)" + " " * 24)

@@ -22,6 +22,9 @@ import sys
 import time
 import zlib
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _require  # noqa: F401  -- deps message instead of a traceback
+
 import duckdb
 import numpy as np
 
@@ -93,10 +96,37 @@ def compact_spectrum():
     return True
 
 
-def _copy_meta(dst, src_path, table):
+def _copy_meta(dst, src_path, table, rows_table=None):
+    """Copy <table> across, dropping rows for sensors with no data behind them.
+
+    The metadata and the data it describes can fall out of step: a database
+    rebuilt or swapped underneath its own metadata keeps the old meta rows,
+    and this function used to copy them forward verbatim. The result is a
+    meta row advertising captures that are not in the file -- with a valid
+    t_min/t_max, so nothing downstream notices. serve.py then reports the
+    layer as present, the viewer enables it, and every window comes back
+    empty: the layer silently never draws.
+
+    Compaction is the natural place to catch this, because it is already
+    reading both tables. Sensors are taken from the data table, so an orphan
+    meta row is dropped rather than blessed and carried into the compacted
+    file.
+    """
     dst.execute(f"ATTACH '{src_path}' AS msrc (READ_ONLY)")
     dst.execute(f"DROP TABLE IF EXISTS {table}")
     dst.execute(f"CREATE TABLE {table} AS SELECT * FROM msrc.{table}")
+    if rows_table:
+        orphans = [r[0] for r in dst.execute(
+            f"SELECT m.sensor FROM {table} m WHERE NOT EXISTS "
+            f"(SELECT 1 FROM msrc.{rows_table} d WHERE d.sensor = m.sensor)"
+        ).fetchall()]
+        if orphans:
+            dst.execute(f"DELETE FROM {table} WHERE sensor NOT IN "
+                        f"(SELECT DISTINCT sensor FROM msrc.{rows_table})")
+            log(f"  dropped {len(orphans)} {table} row(s) with no {rows_table} "
+                f"data behind them: {', '.join(sorted(orphans))}")
+            log(f"  re-run the matching ingest for those sensors if that is "
+                f"not what you expected.")
     dst.execute("DETACH msrc")
     dst.execute("INSERT INTO done VALUES ('meta')")
 
@@ -111,7 +141,7 @@ def compact_psd():
     _prep(dst, """CREATE TABLE IF NOT EXISTS psd_chunk (
         sensor VARCHAR, t0 DOUBLE, t1 DOUBLE, n INT, times BLOB, specs BLOB)""")
     if not _skip(dst, "meta"):
-        _copy_meta(dst, src_p, "psd_meta")
+        _copy_meta(dst, src_p, "psd_meta", "psd")
     sensors = [r[0] for r in src.execute("SELECT DISTINCT sensor FROM psd ORDER BY 1").fetchall()]
     bad = []
     for s in sensors:
@@ -159,7 +189,7 @@ def compact_pfp():
     _prep(dst, """CREATE TABLE IF NOT EXISTS pfp_chunk (
         sensor VARCHAR, freq DOUBLE, t0 DOUBLE, t1 DOUBLE, n INT, times BLOB, frames BLOB)""")
     if not _skip(dst, "meta"):
-        _copy_meta(dst, src_p, "pfp_meta")
+        _copy_meta(dst, src_p, "pfp_meta", "pfp")
     sensors = [r[0] for r in src.execute("SELECT DISTINCT sensor FROM pfp ORDER BY 1").fetchall()]
     bad = []
     for s in sensors:
