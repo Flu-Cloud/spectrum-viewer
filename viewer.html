@@ -85,6 +85,16 @@
   #stage { position: relative; flex: 1 1 auto; overflow: hidden; min-height: 320px; }
   canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; }
   canvas.drag { cursor: grabbing; }
+  /* Rotated mode: the scene is rendered for a swapped-axis box and the canvas
+     is turned as one piece, so every draw/hit-test path stays untouched --
+     Chrome maps pointer offsets back through the transform for us. */
+  #stage.rot #cv { inset: auto; transform: rotate(90deg); transform-origin: center center; }
+  /* Tick labels live on their own UNROTATED layer: canvas glyphs rasterised
+     under a rotation lose hinting and read as blurry, so in rotated mode the
+     text is drawn axis-aligned here at mapped screen coordinates instead. */
+  #labels { position: absolute; inset: 0; pointer-events: none; z-index: 11;
+             overflow: hidden; font: 11px ui-sans-serif; }
+  #labels span { position: absolute; white-space: nowrap; }
 
   /* ---- Zoom sliders: quiet track, accent knob ---- */
   .zoombar { touch-action: none; }
@@ -103,6 +113,11 @@
   #timebar { position: relative; height: 24px; margin: 5px 14px 2px 64px; cursor: pointer; }
   #timetrack { position: absolute; left: 0; right: 0; top: 9px; height: 6px;
                background: var(--track); border-radius: 3px; }
+  /* Rotated mode: the bottom bar drives frequency, so the layer zones move here. */
+  #timepfp { position: absolute; top: 9px; height: 6px; width: 0; background: var(--amber);
+             opacity: .7; border-radius: 3px; pointer-events: none; }
+  #timepsd { position: absolute; top: 9px; height: 6px; width: 0; background: var(--accent);
+             opacity: .5; border-radius: 3px; pointer-events: none; }
   .knob { position: absolute; width: 16px; height: 16px; border-radius: 50%;
           background: var(--accent); border: 2px solid var(--knob-ring); cursor: grab;
           box-shadow: 0 1px 6px rgba(0,0,0,.6);
@@ -154,6 +169,9 @@
     </div>
     <div class="group"><button id="reset" title="Zoom back out to the full time span and full band">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>Full span</button></div>
+    <div class="group"><button id="rotate" aria-pressed="false"
+      title="Rotate the plot 90°: time runs down the screen (waterfall style) instead of across">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7M21 3v5h-5"/></svg>Time on Y</button></div>
     <div class="group"><button id="exportBtn" title="Export the current view + statistics as a PNG image for reports/sharing">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>Export PNG</button></div>
     <div class="group"><label>Colors</label><select id="cmap" aria-label="Colormap"><option value="inferno">Inferno</option><option value="turbo">Turbo</option></select></div>
@@ -162,6 +180,7 @@
   </header>
   <div id="stage">
     <canvas id="cv"></canvas>
+    <div id="labels" aria-hidden="true"></div>
     <div id="freqslider" class="zoombar" tabindex="0" role="slider" aria-label="Frequency zoom"
          aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-orientation="vertical"
          title="Frequency zoom: knob at BOTTOM = full band; drag UP to zoom into frequency. The blue zone = the PSD detail layer (80 kHz bins) takes over. The amber zone near the top = one channel, where the PFP (~18µs frame) layer appears. Drag the heatmap up/down to pan frequency."><div id="freqtrack"></div><div id="freqpsd" title="PSD zone: 80 kHz detail bins replace the 10 MHz channel summary here"></div><div id="freqpfp" title="PFP zone: narrow to one channel here for ~18µs frame detail"></div><div id="freqknob" class="knob"></div></div>
@@ -170,7 +189,7 @@
   </div>
   <div id="timebar" class="zoombar" tabindex="0" role="slider" aria-label="Time zoom"
        aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
-       title="Time zoom: knob at LEFT = full span; drag RIGHT to zoom into time. Drag the heatmap left/right to pan time."><div id="timetrack"></div><div id="timeknob" class="knob"></div></div>
+       title="Time zoom: knob at LEFT = full span; drag RIGHT to zoom into time. Drag the heatmap left/right to pan time."><div id="timetrack"></div><div id="timepsd"></div><div id="timepfp"></div><div id="timeknob" class="knob"></div></div>
   <div id="sliderhint">time zoom · drag image to pan</div>
   <footer>
     <div><span class="k">Window</span><b id="winRange">-</b></div>
@@ -182,13 +201,38 @@
 <script>
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
+// Rotated-mode tick labels are real DOM text, not canvas text: the browser
+// hints and subpixel-antialiases them the same way it does the toolbar, and
+// nothing about the rotated canvas can resample them. Spans are pooled.
+const labelsEl = document.getElementById('labels');
+const labelPool = [];
+let rotLabels = [];                                 // last placed set (for export)
+function placeLabels(list){
+  rotLabels = list;
+  while (labelPool.length < list.length){
+    const sp=document.createElement('span'); labelsEl.appendChild(sp); labelPool.push(sp);
+  }
+  list.forEach((L,i)=>{
+    const sp=labelPool[i];
+    sp.textContent=L.text; sp.style.color=L.color;
+    sp.style.left=Math.round(L.sx)+'px'; sp.style.top=Math.round(L.sy)+'px';
+    sp.style.transform=L.shift; sp.style.display='';
+  });
+  for (let i=list.length;i<labelPool.length;i++) labelPool[i].style.display='none';
+}
 const stage = document.getElementById('stage');
 // Offscreen cache of the last crisp render (for stretch-while-loading).
 const cache = document.createElement('canvas');
 const cctx = cache.getContext('2d');
 
 let DPR = Math.max(1, window.devicePixelRatio || 1);
-const PAD = { l: 64, r: 14, t: 10, b: 26 };   // plot area margins (CSS px)
+// Plot margins (CSS px), in LOGICAL space. Rotated mode swaps which screen
+// edge each one lands on: logical left = screen top, logical bottom = screen
+// left. Dates drawn horizontally need a wide screen-left strip (logical b),
+// and the horizontal frequency numbers only a slim screen-top one (logical l).
+const PAD_STD = { l: 64, r: 14, t: 10, b: 26 };
+const PAD_ROT = { l: 42, r: 14, t: 10, b: 108 };   // l: room for title row + tick row on screen top
+const PAD = { ...PAD_STD };
 
 let meta = null;
 let sensor = null;
@@ -332,10 +376,13 @@ function freqRow(freq){
 }
 
 // ---- Rendering (MOMRAN!!!!) --------------------------------------------------------
+let rotated = false;                       // time on Y: scene drawn for a swapped box
 function syncCanvasSize(){
-  const sw = stage.clientWidth, sh = stage.clientHeight;
-  if (sw === 0 || sh === 0) return false;            // stage not laid out yet
+  const sw0 = stage.clientWidth, sh0 = stage.clientHeight;
+  if (sw0 === 0 || sh0 === 0) return false;          // stage not laid out yet
   DPR = Math.max(1, window.devicePixelRatio || 1);
+  // Logical (pre-rotation) box: rotated mode renders for the swapped one.
+  const sw = rotated ? sh0 : sw0, sh = rotated ? sw0 : sh0;
   // Round before comparing: canvas.width is an integer attribute, so at the
   // fractional DPR that Windows display scaling produces (1.25 at 125%, 1.5 at
   // 150%) an unrounded 1916.25 was stored as 1916 and never compared equal --
@@ -344,6 +391,17 @@ function syncCanvasSize(){
   const w = Math.round(sw*DPR), h = Math.round(sh*DPR);
   if (cv.width !== w || cv.height !== h){
     cv.width = w; cv.height = h; cache.width = w; cache.height = h;
+  }
+  if (rotated){
+    // The CSS box must be EXACTLY bitmap/DPR and sit on the device-pixel grid.
+    // Either one off by a fraction of a pixel and the compositor resamples the
+    // whole rotated bitmap instead of permuting it -- which smears every glyph.
+    const cssW = w/DPR, cssH = h/DPR, snap = v => Math.round(v*DPR)/DPR;
+    cv.style.width = cssW+'px'; cv.style.height = cssH+'px';
+    cv.style.left = snap((sw0-cssW)/2)+'px';
+    cv.style.top  = snap((sh0-cssH)/2)+'px';
+  } else if (cv.style.width){
+    cv.style.width = cv.style.height = cv.style.left = cv.style.top = '';
   }
   ctx.setTransform(DPR,0,0,DPR,0,0);
   return true;
@@ -484,17 +542,32 @@ function drawAxes(){
   ctx.fillStyle = COL.chrome;
   ctx.fillRect(0,0,PAD.l,H); ctx.fillRect(0,H-PAD.b,W,PAD.b);
   // frequency labels
-  ctx.fillStyle = COL.label; ctx.font = '11px ui-sans-serif'; ctx.textAlign='right'; ctx.textBaseline='middle';
+  ctx.fillStyle = COL.label; ctx.font = '11px ui-sans-serif';
+  // Logical (bitmap) point -> screen point. CSS rotate(90deg) about the centre
+  // of a box whose logical height equals the stage width maps (x,y) -> (H-y, x).
+  const L2S = (x,y) => [H - y, x];
+  const out = [];                     // rotated-mode labels, placed as DOM text
+  function tickText(txt, x, y, shift){
+    if (!rotated){ ctx.fillText(txt, x, y); return; }
+    const [sx, sy] = L2S(x, y);
+    out.push({text:txt, sx, sy, shift, color:ctx.fillStyle});
+  }
+  ctx.textAlign='right'; ctx.textBaseline='middle';
   let yLabel = 'Frequency (MHz)';
   if (layerMode==='pfp' && pfpView){
-    for (let k=0;k<=5;k++){ const fr=k/5; ctx.fillText((fr*pfpFrameMs).toFixed(0), PAD.l-6, PAD.t+fr*plotH()); }  // 0..10 ms
+    for (let k=0;k<=5;k++){ const fr=k/5; tickText((fr*pfpFrameMs).toFixed(0), PAD.l-6, PAD.t+fr*plotH(), 'translate(-50%,-100%)'); }  // 0..10 ms
     yLabel = `Frame position (ms) · ${(pfpView.freq/1e6).toFixed(0)} MHz channel`;
   } else {
     const fmin=viewF.f0/1e6, fmax=viewF.f1/1e6, dec = (fmax-fmin) < 20 ? 2 : 0;  // low freq at top
-    for (let k=0;k<=6;k++){ const fr=k/6; ctx.fillText((fmin+fr*(fmax-fmin)).toFixed(dec), PAD.l-6, PAD.t+fr*plotH()); }
+    for (let k=0;k<=6;k++){ const fr=k/6; tickText((fmin+fr*(fmax-fmin)).toFixed(dec), PAD.l-6, PAD.t+fr*plotH(), 'translate(-50%,-100%)'); }
   }
-  ctx.save(); ctx.translate(12, PAD.t+plotH()/2); ctx.rotate(-Math.PI/2);
-  ctx.textAlign='center'; ctx.fillStyle=COL.dim; ctx.fillText(yLabel,0,0); ctx.restore();
+  if (rotated){                       // axis title: upright on the label layer
+    const [sx, sy] = L2S(15, PAD.t+plotH()/2);
+    out.push({text:yLabel, sx, sy, shift:'translate(-50%,-50%)', color:COL.dim});
+  } else {
+    ctx.save(); ctx.translate(12, PAD.t+plotH()/2); ctx.rotate(-Math.PI/2);
+    ctx.textAlign='center'; ctx.fillStyle=COL.dim; ctx.fillText(yLabel,0,0); ctx.restore();
+  }
   // time ticks
   ctx.textAlign='center'; ctx.textBaseline='top'; ctx.fillStyle=COL.label;
   ctx.strokeStyle=COL.grid; ctx.lineWidth=1;
@@ -502,8 +575,9 @@ function drawAxes(){
   for (const t of ticks){
     const x = timeToX(t); if (x<PAD.l||x>W-PAD.r) continue;
     ctx.beginPath(); ctx.moveTo(x,PAD.t); ctx.lineTo(x,H-PAD.b); ctx.stroke();
-    ctx.fillText(tickLabel(t,step), x, H-PAD.b+5);
+    tickText(tickLabel(t,step), x, H-PAD.b+5, 'translate(-100%,-50%)');
   }
+  placeLabels(rotated ? out : []);    // normal mode keeps its labels on canvas
 }
 
 function drawAll(crisp){ crisp ? drawCrisp() : drawPreview(); updateReadout(); }
@@ -737,7 +811,7 @@ stage.addEventListener('wheel', e=>{
   const f = Math.pow(1.0015, d);             // >1 zoom out
   view.t0 = tc - (tc-view.t0)*f; view.t1 = tc + (view.t1-tc)*f;
   clampTimeView();
-  layoutTimeSlider();
+  layoutSliders();
   requestData();
 }, {passive:false});
 
@@ -762,7 +836,7 @@ stage.addEventListener('pointermove', e=>{
     if (n0<BAND_F0){ n1+=BAND_F0-n0; n0=BAND_F0; }
     if (n1>BAND_F1){ n0-=n1-BAND_F1; n1=BAND_F1; }
     viewF.f0=Math.max(BAND_F0,n0); viewF.f1=Math.min(BAND_F1,n1);
-    layoutFreqSlider();
+    layoutSliders();
   }
   requestData();
 });
@@ -772,15 +846,35 @@ stage.addEventListener('pointerup', e=>{ drag=null; cv.classList.remove('drag');
 function bandSpan(){ return BAND_F1 - BAND_F0; }        // full span of the current mode's band
 function spanToZoom(span){ const F=bandSpan(), m=minFSpan(); return Math.log(F/Math.max(span,m)) / Math.log(F/m); }
 function zoomToSpan(z){ const F=bandSpan(), m=minFSpan(); return F * Math.pow(m/F, Math.max(0,Math.min(1,z))); }
-function layoutFreqSlider(){
+// Screen-role wrappers. The LEFT bar always zooms whatever runs down the
+// screen and the BOTTOM bar whatever runs across it -- so in rotated mode the
+// bars swap data axes instead of fighting the user's intuition.
+function setVZoom(z){ rotated ? setTimeZoom(z) : setFreqZoom(z); }
+function setHZoom(z){ rotated ? setFreqZoom(z) : setTimeZoom(z); }
+function vZoomOf(){ return rotated ? tspanToZoom(view.t1-view.t0) : spanToZoom(viewF.f1-viewF.f0); }
+function hZoomOf(){ return rotated ? spanToZoom(viewF.f1-viewF.f0) : tspanToZoom(view.t1-view.t0); }
+function layoutSliders(){ layoutFreqSlider(); layoutTimeSlider(); }
+
+function layoutFreqSlider(){   // LEFT bar: screen-vertical zoom
   const sl=document.getElementById('freqslider'), knob=document.getElementById('freqknob');
-  const ph=plotH(); if (ph<=0) return;
-  sl.style.top=PAD.t+'px'; sl.style.height=ph+'px';
-  const z=Math.max(0,Math.min(1, spanToZoom(viewF.f1-viewF.f0)));
+  const top = rotated ? PAD.l : PAD.t;
+  const ph = rotated ? (stage.clientHeight - PAD.l - PAD.r) : plotH();
+  if (ph<=0) return;
+  sl.style.top=top+'px'; sl.style.height=ph+'px';
+  const z=Math.max(0,Math.min(1, vZoomOf()));
   const knobH=16;
   knob.style.top=((1-z)*(ph-knobH))+'px';           // z=0 (full) bottom, z=1 (finest) top
   sl.setAttribute('aria-valuenow', Math.round(z*100));
-  sl.setAttribute('aria-valuetext', ((viewF.f1-viewF.f0)/1e6).toFixed(2)+' MHz span');
+  sl.setAttribute('aria-valuetext', rotated ? fmtSpan(view.t1-view.t0)+' span'
+                                            : ((viewF.f1-viewF.f0)/1e6).toFixed(2)+' MHz span');
+  sl.setAttribute('aria-label', rotated ? 'Time zoom' : 'Frequency zoom');
+  document.getElementById('freqlabel').textContent = rotated ? 'time zoom' : 'freq zoom';
+  if (rotated){                 // freq zones live on the bottom bar in this mode
+    const pfpEl=document.getElementById('freqpfp'), psdEl=document.getElementById('freqpsd');
+    if (pfpEl) pfpEl.style.height='0px';
+    if (psdEl) psdEl.style.height='0px';
+    return;
+  }
   // Layer zones on the track, so the control shows where each deeper layer
   // takes over instead of leaving it to be discovered: amber = PFP (top of the
   // track down to one channel), blue = PSD (from there down to the threshold
@@ -807,7 +901,7 @@ function onFreqChange(){
   if (viewF.f0 < BAND_F0){ viewF.f1+=BAND_F0-viewF.f0; viewF.f0=BAND_F0; }
   if (viewF.f1 > BAND_F1){ viewF.f0-=viewF.f1-BAND_F1; viewF.f1=BAND_F1; }
   viewF.f0=Math.max(BAND_F0,viewF.f0); viewF.f1=Math.min(BAND_F1,viewF.f1);
-  layoutFreqSlider(); requestData();
+  layoutSliders(); requestData();
 }
 function resetFreq(){ viewF.f0=BAND_F0; viewF.f1=BAND_F1; layoutFreqSlider(); }
 function setFreqZoom(z){
@@ -823,8 +917,8 @@ function setFreqZoom(z){
     const frac=Math.max(0,Math.min(1,(clientY-r.top-knobH/2)/Math.max(1,r.height-knobH)));
     return 1-frac;                                   // top of slider -> z=1 (zoom in)
   }
-  sl.addEventListener('pointerdown', e=>{ e.stopPropagation(); e.preventDefault(); sdrag=true; knob.classList.add('grab'); sl.setPointerCapture(e.pointerId); setFreqZoom(zFromY(e.clientY)); });
-  sl.addEventListener('pointermove', e=>{ if(sdrag) setFreqZoom(zFromY(e.clientY)); });
+  sl.addEventListener('pointerdown', e=>{ e.stopPropagation(); e.preventDefault(); sdrag=true; knob.classList.add('grab'); sl.setPointerCapture(e.pointerId); setVZoom(zFromY(e.clientY)); });
+  sl.addEventListener('pointermove', e=>{ if(sdrag) setVZoom(zFromY(e.clientY)); });
   sl.addEventListener('pointerup', ()=>{ sdrag=false; knob.classList.remove('grab'); });
   // stopPropagation: #freqslider sits inside #stage, so without it the stage's
   // own wheel handler ALSO ran and every notch on the frequency slider quietly
@@ -832,17 +926,20 @@ function setFreqZoom(z){
   // from 182 days to 30 without being asked. With Ctrl held it zoomed frequency
   // twice, once off a mis-based offsetY.
   sl.addEventListener('wheel', e=>{ e.preventDefault(); e.stopPropagation();
-    setFreqZoom(spanToZoom(viewF.f1-viewF.f0) - wheelDelta(e)*0.0006); }, {passive:false});
+    setVZoom(vZoomOf() - wheelDelta(e)*0.0006); }, {passive:false});
   sl.addEventListener('keydown', e=>{                     // keyboard-operable slider
-    const z=spanToZoom(viewF.f1-viewF.f0);
+    const z=vZoomOf();
     if (e.shiftKey && (e.key==='ArrowUp' || e.key==='ArrowDown')){   // pan 10% of span
-      const d=(viewF.f1-viewF.f0)*0.1*(e.key==='ArrowUp'?-1:1);
-      viewF.f0+=d; viewF.f1+=d; onFreqChange(); e.preventDefault(); return;
+      if (rotated){ const d=(view.t1-view.t0)*0.1*(e.key==='ArrowUp'?-1:1);
+        view.t0+=d; view.t1+=d; clampTimeView(); layoutSliders(); requestData(); }
+      else { const d=(viewF.f1-viewF.f0)*0.1*(e.key==='ArrowUp'?-1:1);
+        viewF.f0+=d; viewF.f1+=d; onFreqChange(); }
+      e.preventDefault(); return;
     }
-    if (e.key==='ArrowUp'){ setFreqZoom(z+0.03); e.preventDefault(); }
-    else if (e.key==='ArrowDown'){ setFreqZoom(z-0.03); e.preventDefault(); }
-    else if (e.key==='Home'){ setFreqZoom(0); e.preventDefault(); }   // full band
-    else if (e.key==='End'){ setFreqZoom(1); e.preventDefault(); }    // finest
+    if (e.key==='ArrowUp'){ setVZoom(z+0.03); e.preventDefault(); }
+    else if (e.key==='ArrowDown'){ setVZoom(z-0.03); e.preventDefault(); }
+    else if (e.key==='Home'){ setVZoom(0); e.preventDefault(); }   // full
+    else if (e.key==='End'){ setVZoom(1); e.preventDefault(); }    // finest
   });
 })();
 
@@ -854,40 +951,58 @@ function setFreqZoom(z){
 function fullTSpan(){ return Math.max(mode==='iq'?1e-6:1, meta.tmax - meta.tmin); }
 function tspanToZoom(span){ const F=fullTSpan(), m=minTSpan(); return Math.log(F/Math.max(span,m)) / Math.log(F/m); }
 function tzoomToSpan(z){ const F=fullTSpan(), m=minTSpan(); return F * Math.pow(m/F, Math.max(0,Math.min(1,z))); }
-function layoutTimeSlider(){
+function layoutTimeSlider(){   // BOTTOM bar: screen-horizontal zoom
   const tb=document.getElementById('timebar'), knob=document.getElementById('timeknob');
   if (!tb || !meta) return;
+  tb.style.marginLeft = (rotated ? PAD.b : 64)+'px';   // start under the plot's screen-left edge
   const w=tb.clientWidth; if (w<=0) return;
-  const z=Math.max(0,Math.min(1, tspanToZoom(view.t1-view.t0)));
+  const z=Math.max(0,Math.min(1, hZoomOf()));
   knob.style.left=(z*(w-16))+'px';                 // z=0 (full) left, z=1 (finest) right
   tb.setAttribute('aria-valuenow', Math.round(z*100));
-  tb.setAttribute('aria-valuetext', fmtSpan(view.t1-view.t0)+' span');
+  tb.setAttribute('aria-valuetext', rotated ? ((viewF.f1-viewF.f0)/1e6).toFixed(2)+' MHz span'
+                                            : fmtSpan(view.t1-view.t0)+' span');
+  tb.setAttribute('aria-label', rotated ? 'Frequency zoom' : 'Time zoom');
+  const hint=document.getElementById('sliderhint');
+  if (hint) hint.textContent = rotated ? 'freq zoom · drag image to pan' : 'time zoom · drag image to pan';
+  // Layer zones (PSD blue / PFP amber) follow the frequency control here.
+  const tpsd=document.getElementById('timepsd'), tpfp=document.getElementById('timepfp');
+  if (tpsd && tpfp){
+    if (rotated && mode!=='iq'){
+      const x = span => Math.max(0,Math.min(1,spanToZoom(span)))*(w-16)+8;
+      const xPfp=x(ONE_CHANNEL), xPsd=x(PSD_FREQ_THRESHOLD);
+      tpfp.style.left=xPfp+'px'; tpfp.style.width=(pfpAvail? Math.max(0,w-xPfp-2):0)+'px';
+      tpsd.style.left=xPsd+'px'; tpsd.style.width=(psdAvail? Math.max(0,xPfp-xPsd):0)+'px';
+    } else { tpfp.style.width='0px'; tpsd.style.width='0px'; }
+  }
 }
 function setTimeZoom(z){
   z=Math.max(0,Math.min(1,z));
   const span=tzoomToSpan(z), c=(view.t0+view.t1)/2;
-  view.t0=c-span/2; view.t1=c+span/2; clampTimeView(); layoutTimeSlider(); requestData();
+  view.t0=c-span/2; view.t1=c+span/2; clampTimeView(); layoutSliders(); requestData();
 }
 (function(){
   const tb=document.getElementById('timebar'), knob=document.getElementById('timeknob');
   let tdrag=false;
   function zFromX(clientX){ const r=tb.getBoundingClientRect();
     return Math.max(0,Math.min(1,(clientX-r.left-8)/Math.max(1,r.width-16))); }
-  tb.addEventListener('pointerdown', e=>{ e.preventDefault(); tdrag=true; knob.classList.add('grab'); tb.setPointerCapture(e.pointerId); setTimeZoom(zFromX(e.clientX)); });
-  tb.addEventListener('pointermove', e=>{ if(tdrag) setTimeZoom(zFromX(e.clientX)); });
+  tb.addEventListener('pointerdown', e=>{ e.preventDefault(); tdrag=true; knob.classList.add('grab'); tb.setPointerCapture(e.pointerId); setHZoom(zFromX(e.clientX)); });
+  tb.addEventListener('pointermove', e=>{ if(tdrag) setHZoom(zFromX(e.clientX)); });
   tb.addEventListener('pointerup', ()=>{ tdrag=false; knob.classList.remove('grab'); });
   tb.addEventListener('wheel', e=>{ e.preventDefault(); e.stopPropagation();
-    setTimeZoom(tspanToZoom(view.t1-view.t0) - wheelDelta(e)*0.0006); }, {passive:false});
+    setHZoom(hZoomOf() - wheelDelta(e)*0.0006); }, {passive:false});
   tb.addEventListener('keydown', e=>{                     // keyboard-operable slider
-    const z=tspanToZoom(view.t1-view.t0);
+    const z=hZoomOf();
     if (e.shiftKey && (e.key==='ArrowLeft' || e.key==='ArrowRight')){ // pan 10% of span
-      const d=(view.t1-view.t0)*0.1*(e.key==='ArrowLeft'?-1:1);
-      view.t0+=d; view.t1+=d; clampTimeView(); layoutTimeSlider(); requestData(); e.preventDefault(); return;
+      if (rotated){ const d=(viewF.f1-viewF.f0)*0.1*(e.key==='ArrowLeft'?-1:1);
+        viewF.f0+=d; viewF.f1+=d; onFreqChange(); }
+      else { const d=(view.t1-view.t0)*0.1*(e.key==='ArrowLeft'?-1:1);
+        view.t0+=d; view.t1+=d; clampTimeView(); layoutSliders(); requestData(); }
+      e.preventDefault(); return;
     }
-    if (e.key==='ArrowRight'){ setTimeZoom(z+0.03); e.preventDefault(); }
-    else if (e.key==='ArrowLeft'){ setTimeZoom(z-0.03); e.preventDefault(); }
-    else if (e.key==='Home'){ setTimeZoom(0); e.preventDefault(); }   // full span
-    else if (e.key==='End'){ setTimeZoom(1); e.preventDefault(); }    // finest
+    if (e.key==='ArrowRight'){ setHZoom(z+0.03); e.preventDefault(); }
+    else if (e.key==='ArrowLeft'){ setHZoom(z-0.03); e.preventDefault(); }
+    else if (e.key==='Home'){ setHZoom(0); e.preventDefault(); }   // full
+    else if (e.key==='End'){ setHZoom(1); e.preventDefault(); }    // finest
   });
 })();
 
@@ -947,7 +1062,27 @@ document.getElementById('reset').addEventListener('click', ()=>{
 // ---- Export: current view + key stats -> a single shareable PNG ---------
 function exportPNG(){
   if (!meta || !cv.width) return null;
-  const M=26, W=1320, src=cv;
+  // In rotated mode the plot lives across two layers -- the turned heatmap
+  // canvas and the upright label canvas -- so flatten them into one bitmap in
+  // screen orientation, or the export would come out unlabelled.
+  let src = cv;
+  if (rotated){
+    const f=document.createElement('canvas');
+    f.width=cv.height; f.height=cv.width;              // screen orientation
+    const fg=f.getContext('2d');
+    fg.translate(f.width/2, f.height/2); fg.rotate(Math.PI/2);
+    fg.drawImage(cv, -cv.width/2, -cv.height/2);
+    fg.setTransform(DPR,0,0,DPR,0,0);
+    fg.font='11px ui-sans-serif'; fg.textBaseline='middle';
+    for (const L of rotLabels){                        // the DOM labels, redrawn
+      fg.fillStyle=L.color;
+      fg.textAlign = L.shift.startsWith('translate(-100%') ? 'right'
+                   : L.shift.startsWith('translate(-50%') ? 'center' : 'left';
+      fg.fillText(L.text, L.sx, L.shift.endsWith('-100%)') ? L.sy-5 : L.sy);
+    }
+    src = f;
+  }
+  const M=26, W=1320;
   const hmW=W-2*M, hmH=Math.round(hmW * src.height/src.width);
   const lo=document.getElementById('lo').textContent, hi=document.getElementById('hi').textContent,
         unit=document.getElementById('unit').textContent;
@@ -1018,6 +1153,14 @@ function exportPNG(){
   return c;
 }
 document.getElementById('exportBtn').addEventListener('click', exportPNG);
+document.getElementById('rotate').addEventListener('click', e=>{
+  rotated = !rotated;
+  Object.assign(PAD, rotated ? PAD_ROT : PAD_STD);
+  stage.classList.toggle('rot', rotated);
+  e.currentTarget.setAttribute('aria-pressed', String(rotated));
+  e.currentTarget.classList.toggle('active', rotated);
+  resize();                       // re-render the scene for the swapped box
+});
 document.getElementById('cmap').addEventListener('change', e=>{
   cmapName = e.target.value;
   try { localStorage.setItem('cmap', cmapName); } catch(_){}
@@ -1120,7 +1263,7 @@ async function checkPsd(){
   // Availability lands after the first paint, so re-ask: buildReq() decides
   // whether this view wants the layer, on either axis. Testing the time span
   // here as well was a second copy of that rule, and it was the stale one.
-  if (mode==='cbrs' && psdAvail) { layoutFreqSlider(); requestData(); }
+  if (mode==='cbrs' && psdAvail) { layoutSliders(); requestData(); }
 }
 async function checkPfp(){
   pfpAvail = false; pfpFreqs = [];
@@ -1131,7 +1274,7 @@ async function checkPfp(){
           // the database and getting 404s for every one of them.
           if (Array.isArray(j.freqs)) pfpFreqs = j.freqs; } }
   catch(e){ console.warn('pfp_meta probe failed:', e.message); }
-  if (mode==='cbrs' && pfpAvail) { layoutFreqSlider(); requestData(); }
+  if (mode==='cbrs' && pfpAvail) { layoutSliders(); requestData(); }
 }
 boot();
 // IQ capture mode: header "Source" dropdown switches between CBRS monitoring

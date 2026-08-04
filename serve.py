@@ -25,6 +25,7 @@ import math
 import os
 import threading
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 import duckdb
 import numpy as np
@@ -254,6 +255,30 @@ MAX_TILE_COLS = 4096
 # the fidelity is only ever traded away at zoom levels that cannot show it.
 CAPTURES_PER_COL = 10
 READ_BATCH = 16           # chunk rows pulled from DuckDB at a time
+# zlib.decompress releases the GIL, so inflating a batch of chunks in parallel
+# is a near-linear win on the wide windows where decompression dominates
+# (measured: full-span PSD tile 3.3 s -> ~1 s on 4 cores). Results come back
+# in submission order, so tiles are byte-identical to the sequential path.
+_INFLATE = ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1))
+# Decompressed-chunk LRU: pan/zoom windows overlap heavily, so the same chunks
+# are inflated over and over -- and inflation is the whole cost of a tile scan.
+# ~0.6 MB per entry decompressed; 192 entries bounds this near 110 MB.
+_CHUNKS, _chunks_lock, _CHUNKS_MAX = {}, threading.Lock(), 192
+
+
+def _inflate_cached(key, tblob, blob, n, nf):
+    with _chunks_lock:
+        hit = _CHUNKS.pop(key, None)
+        if hit is not None:
+            _CHUNKS[key] = hit          # LRU touch
+            return hit
+    val = (np.frombuffer(zlib.decompress(tblob), np.float64),
+           np.frombuffer(zlib.decompress(blob), np.uint8).reshape(n, nf))
+    with _chunks_lock:
+        _CHUNKS[key] = val
+        while len(_CHUNKS) > _CHUNKS_MAX:
+            _CHUNKS.pop(next(iter(_CHUNKS)))
+    return val
 # Captures per batch on the uncompacted schema (READ_BATCH * this). Measured on
 # 172,800 captures: 1024 takes 0.85 s, 16384 takes 2.8 s -- the cost is the
 # reduceat over each batch, so a batch far bigger than a screenful of columns
@@ -321,7 +346,18 @@ class _Grid:
                 b = np.pad(b, ((0, 0), (0, pad)))      # is padding-only
             b = b.reshape(b.shape[0], b.shape[1] // fb, fb).max(axis=2)
         img = qmin + (b.T.astype(np.float32) / 255.0) * (qmax - qmin) + offset
-        img[:, ~self.filled] = np.nan                  # gaps -> plot background
+        if self.filled.any():
+            # Sample-and-hold: stretch every capture until the next one, so a
+            # zoomed-in window renders continuously instead of as 1-px lines at
+            # each capture's exact instant. This finishes what _psd_window's
+            # "data gap -> hold the nearest capture" already does for windows
+            # with no captures at all.
+            idx = np.where(self.filled, np.arange(self.cols), -1)
+            idx = np.maximum.accumulate(idx)           # previous filled column
+            idx[idx < 0] = int(np.argmax(self.filled))  # backfill leading edge
+            img = img[:, idx]
+        else:
+            img[:, :] = np.nan                         # nothing -> background
         return img
 
 
@@ -402,7 +438,7 @@ def psd_conn():
         if _psd_con is not None:
             return _psd_con
         try:
-            _psd_con = duckdb.connect(PSD_DB, read_only=True)
+            con = duckdb.connect(PSD_DB, read_only=True)
         except Exception as e:
             # Silence here meant the layer simply was not there: /api/psd_meta
             # answers {"has": false}, the viewer switches the layer off, and
@@ -416,8 +452,13 @@ def psd_conn():
         # compact_db.py, and the row-per-capture schema psd_ingest.py writes.
         # Reading both means compaction is a size optimisation, not a step you
         # can forget and end up with a viewer that renders nothing.
-        t = table_names(_psd_con)
+        t = table_names(con)
+        # kind BEFORE con: the fast path above returns as soon as _psd_con is
+        # non-None without taking the lock, so publishing the connection first
+        # let another thread see kind still None and answer 503 -- the viewer
+        # read that as "no PSD here" and quietly stayed on the summary layer.
         _psd_kind = "chunk" if "psd_chunk" in t else ("rows" if "psd" in t else None)
+        _psd_con = con
         if _psd_kind == "rows":
             print("[serve] psd.duckdb is the uncompacted row schema; serving it "
                   "directly. Run ingest/compact_db.py to shrink it.")
@@ -444,6 +485,19 @@ def _psd_scale(c, sensor, qmin, qmax):
     sc = _psd_scale_cache.get(sensor)
     if sc is not None:
         return sc
+    full = _psd_sample(c, sensor, qmin, qmax)
+    if full is None:
+        sc = (qmin, qmax)
+    else:
+        sc = (float(np.percentile(full, 2)), float(np.percentile(full, 98)))
+    _psd_scale_cache[sensor] = sc
+    return sc
+
+
+def _psd_sample(c, sensor, qmin, qmax):
+    """A few hundred spectra spread across the sensor's range, as dBm values
+    (offset applied) -- the sample behind both the colour scale and the
+    summary-matching LUT below. None when the sensor has nothing."""
     if _psd_kind == "chunk":
         # Four chunks spread across the sensor, picked by timestamp.
         # USING SAMPLE applies to the table before WHERE does, so sampling 4
@@ -484,13 +538,45 @@ def _psd_scale(c, sensor, qmin, qmax):
         specs = (np.frombuffer(b"".join(blobs), np.uint8).reshape(len(blobs), NF)
                  if blobs else None)
     if specs is None or not len(specs):
-        sc = (qmin, qmax)
-    else:
-        specs = specs[:: max(1, len(specs) // 400)]
-        full = qmin + (specs.astype(np.float32) / 255.0) * (qmax - qmin) + PSD_DBM_OFFSET
-        sc = (float(np.percentile(full, 2)), float(np.percentile(full, 98)))
-    _psd_scale_cache[sensor] = sc
-    return sc
+        return None
+    specs = specs[:: max(1, len(specs) // 400)]
+    return qmin + (specs.astype(np.float32) / 255.0) * (qmax - qmin) + PSD_DBM_OFFSET
+
+
+# Summary->PSD colour matching. The two layers show the same signal on the
+# same dBm axis, but their value distributions differ (channel power vs
+# max-pooled PSD), so identical colour ramps still look shifted at the layer
+# boundary. Quantile matching -- map each PSD value to the summary value of
+# equal rank, per sensor, from the data itself -- pins the whole distribution,
+# not just two endpoints. Deterministic, cached, ~200 summary rows + the
+# existing PSD probe per sensor. Set ATLAS_NO_COLORMATCH=1 to disable.
+_match_cache = {}
+
+
+def _psd_match(c, sensor, qmin, qmax):
+    if con is None or os.environ.get("ATLAS_NO_COLORMATCH"):
+        return None
+    m = _match_cache.get(sensor)
+    if m is not None:
+        return m or None                    # () = known no-match, cached
+    try:
+        s = np.array([r[0] for r in con.cursor().execute(
+            "SELECT mx FROM lvl_h1 WHERE sensor=? AND mx IS NOT NULL",
+            [sensor]).fetchall()], np.float32)
+    except Exception as e:
+        print(f"[serve] colour match off for {sensor}: {e}")
+        s = np.empty(0)
+    p = _psd_sample(c, sensor, qmin, qmax)
+    if len(s) < 100 or p is None or p.size < 100:
+        _match_cache[sensor] = ()
+        return None
+    q = np.linspace(0.0, 100.0, 65)
+    pq = np.percentile(p, q).astype(np.float64)
+    sq = np.percentile(s, q).astype(np.float64)
+    pq += np.arange(65) * 1e-4              # strictly increasing for interp
+    m = (pq, sq, float(np.percentile(s, 2)), float(np.percentile(s, 98)))
+    _match_cache[sensor] = m
+    return m
 
 
 def _psd_count(c, sensor, t0, t1):
@@ -528,38 +614,52 @@ def _psd_nearest(c, sensor, t1):
     return _unpack_rows([row], NF)[1]
 
 
+# Full-band window grids, keyed by (sensor, t0, t1, cols). A frequency zoom
+# keeps the time window fixed, so every band slice of the same window can be
+# cut from one already-pooled grid instead of re-reading and re-inflating
+# every chunk (the whole cost of a wide tile). One grid is cols x NF uint8
+# (~7 MB); four of them bound the cache well under 30 MB.
+_PWIN_CACHE, _PWIN_MAX = {}, 4
+_pwin_lock = threading.Lock()
+
+
 def _psd_window(c, sensor, t0, t1, cols, fi0, fi1):
     """Spectra in [t0,t1), max-pooled onto `cols` uniform time bins.
 
-    Streamed in batches: peak memory is one batch, not one window, so a
-    six-month window costs the same resident bytes as a six-hour one. The
-    frequency band is sliced before pooling, so a zoomed-in view also carries
-    only the bins it will actually draw.
+    Pools the FULL band once per (sensor, window) and serves any requested
+    band as a slice of that grid: the first tile of a window pays the scan,
+    every frequency zoom inside it answers from memory.
 
     Data gap -> hold the nearest capture (matches the summary layer's gap-fill,
     so zooming into a quiet stretch keeps showing last-known data).
     """
-    nb = fi1 - fi0 + 1
-    grid = _Grid(t0, t1, cols, nb)
+    key = (sensor, t0, t1, cols)
+    with _pwin_lock:
+        hit = _PWIN_CACHE.pop(key, None)
+        if hit is not None:
+            _PWIN_CACHE[key] = hit                      # LRU touch
+    if hit is not None:
+        return _pwin_slice(hit[0], fi0, fi1), hit[1]
+    grid = _Grid(t0, t1, cols, NF)
     stride = _stride_for(_psd_count(c, sensor, t0, t1), cols)
 
     if _psd_kind == "chunk":
-        cur = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? "
+        cur = c.execute("SELECT t0, n, times, specs FROM psd_chunk WHERE sensor=? "
                         "AND t1>=? AND t0<? ORDER BY t0", [sensor, t0, t1])
         while True:
             rows = cur.fetchmany(READ_BATCH)
             if not rows:
                 break
-            for n, tblob, sblob in rows:
-                ts = np.frombuffer(zlib.decompress(tblob), np.float64)
-                mat = np.frombuffer(zlib.decompress(sblob), np.uint8).reshape(n, NF)
+            for ts, mat in _INFLATE.map(
+                    lambda r: _inflate_cached(("psd", sensor, r[0]),
+                                              r[2], r[3], r[1], NF), rows):
                 keep = (ts >= t0) & (ts < t1)
                 if stride > 1:                      # thin inside the chunk too
                     every = np.zeros(len(ts), bool)
                     every[::stride] = True
                     keep &= every
                 if keep.any():
-                    grid.add(ts[keep], mat[:, fi0:fi1 + 1][keep])
+                    grid.add(ts[keep], mat[keep])
     else:
         # Stride on rowid, not row_number(): a window function has to
         # materialise every row of the partition -- BLOBs included -- before it
@@ -585,16 +685,31 @@ def _psd_window(c, sensor, t0, t1, cols, fi0, fi1):
             ts = np.array([r[0] for r in rows], np.float64)
             mat = np.frombuffer(b"".join(r[1] for r in rows),
                                 np.uint8).reshape(len(rows), NF)
-            grid.add(ts, mat[:, fi0:fi1 + 1])
+            grid.add(ts, mat)
 
-    if grid.filled.any():
-        return grid, False
-    specs = _psd_nearest(c, sensor, t1)
-    if specs is None:
-        return None, False
-    hold = _Grid(t0, t1, 1, nb)
-    hold.add(np.array([t0], np.float64), specs[:, fi0:fi1 + 1])
-    return hold, True
+    gap = False
+    if not grid.filled.any():
+        specs = _psd_nearest(c, sensor, t1)
+        if specs is None:
+            return None, False
+        grid = _Grid(t0, t1, 1, NF)
+        grid.add(np.array([t0], np.float64), specs)
+        gap = True
+    with _pwin_lock:
+        _PWIN_CACHE[key] = (grid, gap)
+        while len(_PWIN_CACHE) > _PWIN_MAX:
+            _PWIN_CACHE.pop(next(iter(_PWIN_CACHE)))
+    return _pwin_slice(grid, fi0, fi1), gap
+
+
+def _pwin_slice(full, fi0, fi1):
+    """A band view of a cached full-band grid (shares the buffer, no copy)."""
+    if fi0 == 0 and fi1 == NF - 1:
+        return full
+    sub = _Grid(full.t0, full.t0 + full.span, full.cols, 1)
+    sub.buf = full.buf[:, fi0:fi1 + 1]
+    sub.filled, sub.ncap = full.filled, full.ncap
+    return sub
 
 
 @app.route("/api/psd_meta")
@@ -634,9 +749,14 @@ def psd_layer():
         return jsonify({"error": "no psd data for this sensor"}), 404
     qmin, qmax = mrow or (-180.0, -90.0)
     img = grid.image(qmin, qmax, H, PSD_DBM_OFFSET)   # (nF, cols); row 0 = low f
+    match = _psd_match(cur, sensor, qmin, qmax)
+    if match is not None:                 # remap onto the summary's dBm ramp
+        img = np.interp(img, match[0], match[1]).astype(np.float32)
     locked = _locked_scale()
     if locked:
         vmin, vmax = locked
+    elif match is not None:               # scale in summary terms too
+        vmin, vmax = match[2], match[3]
     else:
         vmin, vmax = _psd_scale(cur, sensor, qmin, qmax)     # full-range: no drift on zoom
     return _tile(_colorize(img, vmin, vmax, request.args.get("cmap", "inferno")), {
@@ -664,7 +784,7 @@ def pfp_conn():
         if _pfp_con is not None:
             return _pfp_con
         try:
-            _pfp_con = duckdb.connect(PFP_DB, read_only=True)
+            con = duckdb.connect(PFP_DB, read_only=True)
         except Exception as e:
             # Silence here meant the layer simply was not there: /api/pfp_meta
             # answers {"has": false}, the viewer switches the layer off, and
@@ -674,11 +794,12 @@ def pfp_conn():
             print(f"[serve] cannot open {os.path.basename(PFP_DB)}: {e}")
             print("[serve]   -- the PFP layer will not be available.")
             return None
-        t = table_names(_pfp_con)       # same dual-schema rule as PSD above
+        t = table_names(con)            # same dual-schema rule as PSD above
         _pfp_kind = "chunk" if "pfp_chunk" in t else ("rows" if "pfp" in t else None)
         if _pfp_kind == "rows":
             print("[serve] pfp.duckdb is the uncompacted row schema; serving it "
                   "directly. Run ingest/compact_db.py to shrink it.")
+        _pfp_con = con                  # publish last (kind first; see psd_conn)
     return _pfp_con
 
 
@@ -752,15 +873,15 @@ def pfp_frame():
     grid = _Grid(t0, t1, _grid_cols(W), npos)
     if _pfp_kind == "chunk":
         cur = q.execute(
-            "SELECT n, times, frames FROM pfp_chunk WHERE sensor=? AND freq=? "
+            "SELECT t0, n, times, frames FROM pfp_chunk WHERE sensor=? AND freq=? "
             "AND t1>=? AND t0<? ORDER BY t0", [sensor, ch, t0, t1])
         while True:
             rows = cur.fetchmany(READ_BATCH)
             if not rows:
                 break
-            for n, tblob, fblob in rows:
-                ts = np.frombuffer(zlib.decompress(tblob), np.float64)
-                mat = np.frombuffer(zlib.decompress(fblob), np.uint8).reshape(n, npos)
+            for ts, mat in _INFLATE.map(
+                    lambda r: _inflate_cached(("pfp", sensor, ch, r[0]),
+                                              r[2], r[3], r[1], npos), rows):
                 keep = (ts >= t0) & (ts < t1)
                 if keep.any():
                     grid.add(ts[keep], mat[keep])
