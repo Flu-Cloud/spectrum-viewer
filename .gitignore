@@ -46,3 +46,8 @@ SEA-DATA/
 
 # Quarantine for cleanup moves (empty this folder to really delete)
 _to_delete/
+
+# Fast stat ingest: personal Box tokens + generated file manifest + work dir
+ingest/box_tokens.json
+ingest/manifest_stats.json
+_stat_build/
