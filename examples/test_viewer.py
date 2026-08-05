@@ -95,6 +95,143 @@ def build(tmp):
     return dbs, env
 
 
+def zone_checks(page, check, settle):
+    """The zoom bars must show WHERE zooming hands off to a deeper layer.
+
+    Both bars carry the same two markers: blue where the PSD detail layer takes
+    over, amber where the PFP frame layer can. A marker that sits somewhere
+    other than the real threshold is worse than no marker, so this pins the
+    blue's edge to the threshold two independent ways -- by geometry, and by
+    bisecting for the zoom where layerMode actually flips -- and requires the
+    two answers to be the same place. It also checks the amber is dimmed while
+    the frame layer is out of reach and brightens when it is not, because that
+    dimming is the only thing stopping the marker promising a layer that cannot
+    be drawn.
+    """
+    bar = page.locator("#timebar")
+    psd, pfp = page.locator("#timepsd"), page.locator("#timepfp")
+    if not (bar.count() and psd.count() and pfp.count()):
+        return
+    # The markers describe the CBRS layer stack. An IQ capture is one layer with
+    # its own pyramid and deliberately shows no zones, so switch to CBRS first
+    # rather than measuring a bar that is correctly empty.
+    if not page.evaluate("mode === 'cbrs'"):
+        opts = page.evaluate(
+            "Array.from(document.getElementById('source').options).map(o=>o.value)")
+        if "cbrs" not in opts:
+            return
+        page.select_option("#source", "cbrs")
+        settle()
+    if not page.evaluate("mode === 'cbrs' && psdAvail"):
+        return
+
+    def zoom_to(z):
+        page.evaluate(f"setTimeZoom({z})")
+        settle()
+
+    def state():
+        return page.evaluate("""(function(){
+            const b=document.getElementById('timebar').getBoundingClientRect();
+            const z=document.getElementById('timepsd').getBoundingClientRect();
+            const k=document.getElementById('timeknob').getBoundingClientRect();
+            return {layer: layerMode, span: view.t1-view.t0,
+                    blue_w: z.width, blue_l: z.left-b.left, bar_w: b.width,
+                    inside: z.width>0 && k.left+k.width/2 >= z.left-1};
+        })()""")
+
+    zoom_to(0)
+    s = state()
+    check("the time bar carries a blue PSD zone", s["blue_w"] > 4,
+          f"{round(s['blue_w'])} px of {round(s['bar_w'])}")
+
+    # 1. geometry: the blue starts exactly where the PSD threshold sits
+    want = page.evaluate(
+        "(function(){const w=document.getElementById('timebar').clientWidth;"
+        "return Math.max(0,Math.min(1,tspanToZoom(PSD_THRESHOLD)))*(w-16)+8;})()")
+    check("the blue zone starts at the PSD threshold, not somewhere decorative",
+          abs(s["blue_l"] - want) <= 2,
+          f"edge at {round(s['blue_l'])} px, threshold at {round(want)} px")
+
+    # A dataset shorter than the threshold is PSD territory end to end, so
+    # there is no plain stretch to see and none must be drawn. Which assertion
+    # applies is a property of the fixture, not of the code.
+    full = page.evaluate("meta.tmax-meta.tmin")
+    thr = page.evaluate("PSD_THRESHOLD")
+    long_enough = full > thr * 1.2
+    if long_enough:
+        check("the bar stays plain across spans too wide for PSD",
+              s["blue_l"] > 8, f"plain for the first {round(s['blue_l'])} px")
+    else:
+        check("a span shorter than the threshold is blue from the left edge",
+              s["blue_l"] <= 9 and s["layer"] in ("psd", "pfp"),
+              f"{full / 3600:.0f} h fixture, all of it PSD territory")
+
+    # 2. behaviour: bisect for the layer flip and for the knob entering the
+    # blue. Coarse sampling can agree by luck; the edges themselves cannot.
+    def bisect(by_layer):
+        lo, hi = 0.0, 0.8
+        for _ in range(8):
+            mid = (lo + hi) / 2
+            zoom_to(mid)
+            st = state()
+            inside = st["layer"] in ("psd", "pfp") if by_layer else st["inside"]
+            if inside:
+                hi = mid
+            else:
+                lo = mid
+        return hi
+
+    flip, edge = bisect(True), bisect(False)
+    check("crossing into the blue is exactly when the layer becomes PSD",
+          abs(flip - edge) <= 0.02, f"layer flips at {flip:.3f}, blue edge {edge:.3f}")
+    zoom_to(edge)
+    st = state()
+    if long_enough:
+        check("that crossing lands on the documented PSD span threshold",
+              abs(st["span"] - thr) / thr < 0.10,
+              f"{st['span'] / 3600:.1f} h vs threshold {thr / 3600:.0f} h")
+    else:
+        # No crossing exists inside this fixture: it starts already in PSD.
+        check("no false crossing is invented on a short fixture",
+              st["layer"] in ("psd", "pfp") and edge < 0.01,
+              f"PSD from full span ({st['span'] / 3600:.1f} h)")
+
+    # 3. the amber marker must not promise what it cannot deliver
+    zoom_to(0)
+    page.evaluate("() => { resetFreq(); layoutSliders(); }")
+    settle()
+    dim = float(page.evaluate(
+        "getComputedStyle(document.getElementById('timepfp')).opacity"))
+    page.evaluate("""() => { const c = nearestChannelHz();
+        viewF.f0 = c - 4e6; viewF.f1 = c + 4e6; onFreqChange(); }""")
+    settle()
+    lit = float(page.evaluate(
+        "getComputedStyle(document.getElementById('timepfp')).opacity"))
+    check("the amber PFP zone is dim while the frame layer is out of reach",
+          dim < lit, f"{dim} wide band -> {lit} on one channel")
+    page.evaluate("() => { resetFreq(); layoutSliders(); }")
+    settle()
+
+    # 4. Time on Y swaps which bar drives time, and the markers have to follow
+    # it. A blue zone left behind on the bar that no longer controls time would
+    # point at the wrong axis.
+    rot = page.locator("#rotate")
+    if rot.count() and rot.is_visible():
+        rot.click()
+        settle()
+        r = page.evaluate("""(function(){
+            const v=document.getElementById('freqpsd').getBoundingClientRect();
+            const h=document.getElementById('timepsd').getBoundingClientRect();
+            return {rotated, vertical_blue: v.height, horizontal_blue: h.width};
+        })()""")
+        check("Time on Y moves the blue PSD zone onto the bar that now drives time",
+              r["rotated"] and r["vertical_blue"] > 4,
+              f"vertical {round(r['vertical_blue'])} px, "
+              f"horizontal (frequency) {round(r['horizontal_blue'])} px")
+        rot.click()
+        settle()
+
+
 def main():
     print("viewer.html browser test\n")
     try:
@@ -253,6 +390,8 @@ def main():
                 settle()
                 check(f"the {what} zoom slider drags and keeps rendering",
                       tiles_drawn() > 0)
+
+            zone_checks(page, check, settle)
 
             reset = page.locator("#reset")
             if reset.count():
