@@ -14,6 +14,8 @@ What each one covers:
     test_fetch.py   downloading: source parsing, host policy, resume,
                     checksums, and the HTTP 403 that bot protection causes
     test_ingest.py  the CBRS path end to end, compacted and uncompacted
+    test_repeat.py  re-running the ingest months later: additive, idempotent,
+                    and safe on an already-compacted database
     test_atlas.py   `atlas.py get` on every kind of data, including a record
                     downloaded and ingested through to a rendered tile
     test_cli.py     every command, flag, prompt input and menu choice
@@ -37,6 +39,7 @@ SUITES = [
     ("verify.py", "install and endpoints"),
     ("test_fetch.py", "downloading, including the 403 path"),
     ("test_ingest.py", "the CBRS ingest path"),
+    ("test_repeat.py", "re-running the ingest as new data arrives"),
     ("test_atlas.py", "atlas.py get, on data and on records"),
     ("test_cli.py", "every command, flag and menu choice"),
     ("test_serve.py", "every endpoint and viewer control"),

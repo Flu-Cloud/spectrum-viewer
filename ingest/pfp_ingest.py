@@ -13,7 +13,9 @@ underneath, so the folder layout does not matter.
 
 The server reads this file directly. compact_db.py repacks it into a smaller
 chunked form and swaps that in; that step is now optional and only affects
-size and speed, not whether the viewer works.
+size and speed, not whether the viewer works. Re-running against a database
+that is already compacted appends in the chunked shape rather than the row
+shape, so next month's data lands where the server will read it.
 
     py pfp_ingest.py --list                          # what is on disk
     py pfp_ingest.py CBBT-Directional                # default stat max_peak
@@ -35,6 +37,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cbrs_files                                    # noqa: E402
+import chunk_io                                      # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
@@ -69,29 +72,12 @@ def stats_present(root):
     return cbrs_files.stats_present(root, NAME_RE)
 
 
-def read_frames(path, rcon):
+def read_frames(path, csv_connection):
     """CSV -> (epoch_seconds[n], freq_hz[n], quantized uint8 [n,560])."""
-    res = rcon.execute("SELECT * FROM read_csv_auto(?, header=true)", [path])
-    cols = [c[0] for c in res.description]              # datetime, frequency, 0..559
-    if len(cols) - 2 != NPOS:
-        raise ValueError(f"expected {NPOS} frame-position columns after "
-                         f"timestamp and frequency, found {len(cols) - 2}. "
-                         "This file is not a 560-position CBRS PFP export.")
-    d = res.fetchnumpy()
-    ts = d[cols[0]].astype("datetime64[us]").astype("int64") / 1e6
-    freq = np.asarray(d[cols[1]], dtype=np.float64)
-    pos_cols = cols[2:]
-    P = np.stack([np.asarray(d[c], dtype=np.float64) for c in pos_cols], axis=1)   # (n,560)
-    Q = np.clip(np.round((P - QMIN) / (QMAX - QMIN) * 255.0), 0, 255).astype(np.uint8)
-    # Values outside the quantization range clip to a flat 0 or 255 instead of
-    # failing, so a file in the wrong units ingests as a featureless band and
-    # looks like a rendering bug later. Name the file now, while it is still
-    # obvious which one it was.
-    out = int(np.count_nonzero((P < QMIN) | (P > QMAX)))
-    if out > P.size // 100:
-        print(f"  WARN {os.path.basename(path)}: {100.0 * out / P.size:.0f}% of "
-              f"values are outside [{QMIN}, {QMAX}] dBm and were clipped flat")
-    return ts, freq, Q
+    ts, keys, Q = cbrs_files.read_quantized(
+        path, csv_connection, NPOS, QMIN, QMAX, "dBm", "frame-position",
+        lead=("frequency",))
+    return ts, keys["frequency"], Q
 
 
 def main():
@@ -137,43 +123,58 @@ def main():
     days = sorted(by_day)
     print(f"{sensor} PFP ({args.stat}): {len(days)} day(s) on disk")
 
-    con = duckdb.connect(PFP_DB)
-    con.execute("CREATE TABLE IF NOT EXISTS pfp (sensor VARCHAR, freq DOUBLE, t DOUBLE, frame BLOB)")
-    con.execute("""CREATE TABLE IF NOT EXISTS pfp_meta (
+    connection = duckdb.connect(PFP_DB)
+    connection.execute("CREATE TABLE IF NOT EXISTS pfp (sensor VARCHAR, freq DOUBLE, t DOUBLE, frame BLOB)")
+    connection.execute("""CREATE TABLE IF NOT EXISTS pfp_meta (
         sensor VARCHAR, stat VARCHAR, npos INT, frame_ms DOUBLE, qmin DOUBLE, qmax DOUBLE,
         t_min DOUBLE, t_max DOUBLE, rows BIGINT)""")
-    # Resumable: skip days already ingested. Same two corrections as
-    # psd_ingest.py, for the same reasons. to_timestamp() renders in the
-    # machine's local zone while the filename's day is UTC, so west of
-    # Greenwich an early-UTC-morning day never matches its own filename and is
-    # re-read and re-inserted on every resume; bucket by UTC so both sides of
-    # the comparison mean the same thing. And count the days this run is
-    # actually skipping rather than every day the sensor has in the table --
-    # `existing` spans days that are not under this --root at all, which is
-    # how "1 day(s) on disk / 2 day(s) already ingested" came about.
-    existing = set(str(r[0]) for r in con.execute(
-        "SELECT DISTINCT CAST(to_timestamp(t) AT TIME ZONE 'UTC' AS DATE) "
-        "FROM pfp WHERE sensor=?", [sensor]).fetchall())
+    # This database may already be compacted -- see the note in psd_ingest.py.
+    # Append in whichever shape is on disk, so a second run months later lands
+    # where serve.py will actually read it.
+    kind = chunk_io.schema_of(connection, "pfp")
+    if kind == "chunk":
+        print("  this database is compacted; appending new days as chunks")
+    # Resumable: skip days already ingested, in UTC on both sides.
+    # to_timestamp() renders in the machine's local zone while the filename's
+    # day is UTC, so west of Greenwich an early-UTC-morning day never matches
+    # its own filename and is re-read and re-inserted on every resume. And count
+    # the days this run is actually skipping rather than every day the sensor has
+    # in the table -- `existing` spans days that are not under this --root at
+    # all, which is how "1 day(s) on disk / 2 day(s) already ingested" came about.
+    existing = chunk_io.existing_days(connection, "pfp", sensor, kind)
     skipping = sum(1 for d in days if d in existing)
     if skipping:
         print(f"  resuming: {skipping} of {len(days)} day(s) already "
               f"ingested, skipping those")
-    rcon = duckdb.connect()
+    csv_connection = duckdb.connect()
 
     t0 = time.time()
     done = err = nrows = 0
     errors = []
+    # A chunk is one channel's consecutive frames, so the appenders are keyed by
+    # frequency and kept open across days -- a day holds only a handful of frames
+    # per channel, and closing per day would leave a chunk table of stubs.
+    apps = {}
     for i, day in enumerate(days, 1):
         if day in existing:
             done += 1
             continue
         path = by_day[day]
         try:
-            ts, freq, Q = read_frames(path, rcon)
-            con.executemany(
-                "INSERT INTO pfp VALUES (?,?,?,?)",
-                [(sensor, float(freq[j]), float(ts[j]), Q[j].tobytes())
-                 for j in range(len(ts))])
+            ts, freq, Q = read_frames(path, csv_connection)
+            if kind == "chunk":
+                for f in np.unique(np.asarray(freq, dtype=np.float64)):
+                    sel = np.flatnonzero(np.asarray(freq, dtype=np.float64) == f)
+                    app = apps.get(float(f))
+                    if app is None:
+                        app = apps[float(f)] = chunk_io.ChunkAppender(
+                            connection, "pfp", sensor, "frames", key=float(f))
+                    app.add([ts[j] for j in sel], [Q[j] for j in sel])
+            else:
+                connection.executemany(
+                    "INSERT INTO pfp VALUES (?,?,?,?)",
+                    [(sensor, float(freq[j]), float(ts[j]), Q[j].tobytes())
+                     for j in range(len(ts))])
             done += 1; nrows += len(ts)
         except Exception as e:
             err += 1
@@ -182,22 +183,23 @@ def main():
         if i % 10 == 0 or i == len(days):
             print(f"  [{i}/{len(days)}] rows={nrows:,} done={done} err={err} "
                   f"{i/max(time.time()-t0,1e-6):.2f} days/s")
+    for app in apps.values():
+        app.flush()
 
-    r = con.execute("SELECT min(t), max(t), count(*) FROM pfp WHERE sensor=?",
-                    [sensor]).fetchone()
+    r = chunk_io.stored_span(connection, "pfp", sensor, chunk_io.schema_of(connection, "pfp"))
     total = r[2] or 0
     if total == 0:
-        con.execute("DELETE FROM pfp_meta WHERE sensor=?", [sensor])
-        con.close()
+        connection.execute("DELETE FROM pfp_meta WHERE sensor=?", [sensor])
+        connection.close()
         print(f"\nNothing ingested for {sensor}: every one of the {len(days)} "
               f"file(s) failed to read.", file=sys.stderr)
         for e in errors[:5]:
             print(f"  {e}", file=sys.stderr)
         return 1
-    con.execute("DELETE FROM pfp_meta WHERE sensor=?", [sensor])
-    con.execute("INSERT INTO pfp_meta VALUES (?,?,?,?,?,?,?,?,?)",
+    connection.execute("DELETE FROM pfp_meta WHERE sensor=?", [sensor])
+    connection.execute("INSERT INTO pfp_meta VALUES (?,?,?,?,?,?,?,?,?)",
                 [sensor, args.stat, NPOS, FRAME_MS, QMIN, QMAX, r[0], r[1], total])
-    con.close()
+    connection.close()
     print(f"\nDone in {(time.time()-t0)/60:.1f} min. {nrows:,} new frames, "
           f"{total:,} total. DB = {os.path.getsize(PFP_DB)/1e9:.2f} GB")
     if err:

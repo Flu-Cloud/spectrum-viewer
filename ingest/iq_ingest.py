@@ -41,11 +41,13 @@ except Exception:
     pass
 
 
-CAPTURE_EXT = (".sigmf-meta", ".tdms", ".npy")
+# The iq-tar entry is the samples file, not its .xml sidecar: the sidecar is
+# found from the samples file, and matching both would ingest every capture twice.
+CAPTURE_EXT = (".sigmf-meta", ".tdms", ".npy", ".complex1ch.float32")
 
 
 def discover(root):
-    """Capture files under root (or root itself): .sigmf-meta / .tdms / .npy."""
+    """Capture files under root (or root itself), by extension."""
     return cbrs_files.walk_ext(root, CAPTURE_EXT)
 
 
@@ -75,14 +77,14 @@ def scan_scale(cap, win):
     return float(np.percentile(db, 0.1) - 6.0), float(np.percentile(db, 99.9) + 6.0)
 
 
-def ingest_capture(con, path, dataset):
+def ingest_capture(connection, path, dataset):
     cap = sigmf_io.open_capture(path)
     cid = cap.name
     if cap.n_samples < NFFT:
         raise ValueError(f"only {cap.n_samples} sample(s); an STFT needs at "
                          f"least {NFFT}. This file is too short to render, or "
                          "its .sigmf-data is truncated.")
-    if con.execute("SELECT 1 FROM iq_meta WHERE id=?", [cid]).fetchone():
+    if connection.execute("SELECT 1 FROM iq_meta WHERE id=?", [cid]).fetchone():
         print(f"  skip (already ingested): {cid}")
         return False
     if cap.center_freq == 0.0:
@@ -92,7 +94,7 @@ def ingest_capture(con, path, dataset):
     ncols0 = cap.n_samples // NFFT
     print(f"  {cid}: fs={cap.sample_rate/1e6:.3g} Msps fc={cap.center_freq/1e6:.6g} MHz "
           f"dur={cap.duration:.3f}s cols={ncols0} q=[{qmin:.1f},{qmax:.1f}] dBm")
-    con.execute("DELETE FROM iq_stft WHERE id=?", [cid])
+    connection.execute("DELETE FROM iq_stft WHERE id=?", [cid])
 
     # ---- level 0: stream the full STFT in CHUNK_COLS blocks ----
     t0 = time.time()
@@ -101,7 +103,7 @@ def ingest_capture(con, path, dataset):
         n = min(CHUNK_COLS, ncols0 - c0)
         db = stft_db(cap, c0 * NFFT, n, win)
         q = np.clip(np.round((db - qmin) / (qmax - qmin) * 255.0), 0, 255).astype(np.uint8)
-        con.execute("INSERT INTO iq_stft VALUES (?,?,?,?,?)",
+        connection.execute("INSERT INTO iq_stft VALUES (?,?,?,?,?)",
                     [cid, 0, c0, n, q.tobytes()])
     print(f"    level 0: {ncols0} cols in {time.time()-t0:.1f}s")
 
@@ -112,7 +114,7 @@ def ingest_capture(con, path, dataset):
         ncols = prev_ncols // 2
         for c0 in range(0, ncols, CHUNK_COLS):
             n = min(CHUNK_COLS, ncols - c0)
-            rows = con.execute(
+            rows = connection.execute(
                 "SELECT col0, ncols, chunk FROM iq_stft WHERE id=? AND level=? "
                 "AND col0 < ? AND col0 + ncols > ? ORDER BY col0",
                 [cid, level - 1, (c0 + n) * 2, c0 * 2]).fetchall()
@@ -120,12 +122,12 @@ def ingest_capture(con, path, dataset):
                 np.frombuffer(r[2], dtype=np.uint8).reshape(r[1], NFFT) for r in rows])
             off = c0 * 2 - rows[0][0]
             pair = src[off:off + n * 2].reshape(n, 2, NFFT).max(axis=1)
-            con.execute("INSERT INTO iq_stft VALUES (?,?,?,?,?)",
+            connection.execute("INSERT INTO iq_stft VALUES (?,?,?,?,?)",
                         [cid, level, c0, n, pair.tobytes()])
         prev_ncols = ncols
 
     # ---- display scale from the coarsest level (stable colours) ----
-    rows = con.execute("SELECT chunk FROM iq_stft WHERE id=? AND level=?",
+    rows = connection.execute("SELECT chunk FROM iq_stft WHERE id=? AND level=?",
                        [cid, level]).fetchall()
     coarse = np.concatenate([np.frombuffer(r[0], dtype=np.uint8) for r in rows])
     dbv = qmin + coarse.astype(np.float32) / 255.0 * (qmax - qmin)
@@ -133,7 +135,7 @@ def ingest_capture(con, path, dataset):
     if vmax - vmin < 6.0:
         vmax = vmin + 6.0
 
-    con.execute("INSERT INTO iq_meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    connection.execute("INSERT INTO iq_meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [cid, dataset, cap.name, os.path.abspath(cap.path),
                  cap.center_freq, cap.sample_rate, cap.duration, cap.n_samples,
                  NFFT, NFFT, NFFT, level + 1, qmin, qmax,
@@ -156,24 +158,24 @@ def main():
         paths = paths[:limit]
     print(f"{len(paths)} capture file(s) under {root} -> {IQ_DB}")
 
-    con = duckdb.connect(IQ_DB)
-    con.execute("""CREATE TABLE IF NOT EXISTS iq_meta (
+    connection = duckdb.connect(IQ_DB)
+    connection.execute("""CREATE TABLE IF NOT EXISTS iq_meta (
         id VARCHAR PRIMARY KEY, dataset VARCHAR, name VARCHAR, path VARCHAR,
         fc DOUBLE, fs DOUBLE, duration DOUBLE, n_samples BIGINT,
         nfft INT, nfreq INT, hop INT, nlevels INT,
         qmin DOUBLE, qmax DOUBLE, vmin DOUBLE, vmax DOUBLE)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS iq_stft (
+    connection.execute("""CREATE TABLE IF NOT EXISTS iq_stft (
         id VARCHAR, level INT, col0 BIGINT, ncols INT, chunk BLOB)""")
 
     done = err = 0
     for p in paths:
         try:
-            if ingest_capture(con, p, dataset):
+            if ingest_capture(connection, p, dataset):
                 done += 1
         except Exception as e:
             err += 1
             print(f"  ERR {os.path.basename(p)}: {e}")
-    con.close()
+    connection.close()
     size = os.path.getsize(IQ_DB) / 1e6
     print(f"\nDone: {done} ingested, {err} errors. {IQ_DB} = {size:.1f} MB")
     if err and done == 0:

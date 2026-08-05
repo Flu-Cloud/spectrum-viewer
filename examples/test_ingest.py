@@ -82,6 +82,14 @@ def write_batch(root, days, seed=7, sub="mds2-test", summaries="Summaries_test.c
             rows.append([f"{day} {k:02d}:00:00", *spec])
         write_csv(os.path.join(psd_dir, f"{day}_{SENSOR}_max.csv"),
                   ["datetime"] + [f"b{i}" for i in range(NF)], rows)
+        # The sibling statistics, offset by an exact constant from max so any
+        # test can tell at a glance whose data a tile was rendered from --
+        # median 12 dB and mean 6 dB below, the ordering the real detectors have.
+        for stat_name, offset in (("median", 12.0), ("mean", 6.0)):
+            srows = [[r[0], *np.round(np.array(r[1:], dtype=float) - offset, 2)]
+                     for r in rows]
+            write_csv(os.path.join(psd_dir, f"{day}_{SENSOR}_{stat_name}.csv"),
+                      ["datetime"] + [f"b{i}" for i in range(NF)], srows)
 
     # PFP: PFP_<day>_<sensor>_max_peak.csv , FRAMES_PER_DAY x 560 positions.
     # The `frequency` column is in HERTZ, as the real NASCTN exports write it
@@ -155,6 +163,19 @@ if m.get("has"):
     x = json.loads(r.headers["X-Meta"])
     out["psd_legend"] = [x["vmin"], x["vmax"]]
 out["dbm_div"] = serve.DBM_DIV
+out["psd_stats"] = (m or {}).get("stats")
+if m.get("has") and "median" in (m.get("stats") or []):
+    import numpy as _np
+    from PIL import Image as _Image
+    import io as _io
+    def _grey(stat):
+        rr = c.get(f"/api/psd_layer?sensor={s}&t0={m['t_min']-1}&t1={m['t_max']+1}"
+                   f"&w=200&h=150&cmap=greys&vmin=-100&vmax=-30&stat={stat}")
+        return float(_np.asarray(_Image.open(_io.BytesIO(rr.data)).convert("L")).mean())
+    g_max, g_med, g_mean = _grey("max"), _grey("median"), _grey("mean")
+    # fixture writes median 12 dB and mean 6 dB below max: greys must ORDER
+    out["stat_greys"] = [round(g_max,2), round(g_mean,2), round(g_med,2)]
+    out["stat_order_ok"] = bool(g_med < g_mean < g_max)
 # read after the requests: the schema is detected on first connect
 out["psd_kind"] = serve._psd_kind
 out["pfp_kind"] = serve._pfp_kind
@@ -233,6 +254,15 @@ def main():
               rc == 0 and "Traceback" not in out and "8 new frames" in out,
               next((l for l in out.splitlines() if "Done in" in l), out[-200:]))
 
+        # the sibling statistics: same days, own databases
+        for stat_name in ("median", "mean"):
+            rc, out = run([sys.executable, os.path.join(ING, "psd_ingest.py"),
+                           SENSOR, "--root", data, "--stat", stat_name], env)
+            check(f"psd_ingest --stat {stat_name} builds its own database",
+                  rc == 0 and os.path.exists(os.path.join(
+                      dbs, f"psd_{stat_name}.duckdb")),
+                  next((l for l in out.splitlines() if "Done in" in l), out[-160:]))
+
         # ---- the viewer renders with NO compaction step ----
         got, out = probe(dbs, tmp)
         ok = got is not None
@@ -251,6 +281,11 @@ def main():
                   str(got["pfp_meta"].get("freqs")))
             check("pfp_frame renders a tile",
                   got.get("pfp_frame", [0])[0] == 200, str(got.get("pfp_frame")))
+            check("psd_meta advertises all three statistics",
+                  got.get("psd_stats") == ["max", "median", "mean"],
+                  str(got.get("psd_stats")))
+            check("median/mean tiles come from their own databases (ordered)",
+                  got.get("stat_order_ok") is True, str(got.get("stat_greys")))
 
         # ---- build_db.py, then compaction, then the same checks again ----
         rc, out = run([sys.executable, os.path.join(ING, "build_db.py"),
@@ -339,10 +374,12 @@ def main():
               rc != 0 and SENSOR in out and "Traceback" not in out,
               next((l.strip() for l in out.splitlines() if "Available" in l), ""))
 
+        # median/mean exist in the fixture now (they are ingested above), so the
+        # no-such-stat path needs a statistic the fixture does not write.
         rc, out = run([sys.executable, os.path.join(ING, "psd_ingest.py"),
-                       SENSOR, "--root", data, "--stat", "median"], env)
+                       SENSOR, "--root", data, "--stat", "p99"], env)
         check("a stat with no files says which stats exist",
-              rc != 0 and "their stats are: max" in out)
+              rc != 0 and "their stats are: max, mean, median" in out)
 
         # a PSD export handed to build_db.py must not silently build nothing
         rc, out = run([sys.executable, os.path.join(ING, "build_db.py"),

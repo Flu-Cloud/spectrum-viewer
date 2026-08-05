@@ -15,9 +15,9 @@ and re-reads every day the chunk table already had, duplicating the lot.
 
 So an append has to speak whichever schema it finds:
 
-    kind = schema_of(con, "psd")            # 'chunk' | 'rows' | 'empty'
-    have = existing_days(con, "psd", sensor, kind)
-    with ChunkAppender(con, "psd", sensor) as app:   # kind == 'chunk'
+    kind = schema_of(connection, "psd")            # 'chunk' | 'rows' | 'empty'
+    have = existing_days(connection, "psd", sensor, kind)
+    with ChunkAppender(connection, "psd", sensor) as app:   # kind == 'chunk'
         app.add(times, quantized)
 
 `existing_days` returns UTC date strings from whichever table holds the data,
@@ -41,7 +41,7 @@ LAYOUT = {
 }
 
 
-def schema_of(con, base):
+def schema_of(connection, base):
     """Which shape this database is in: 'chunk', 'rows', or 'empty'.
 
     Mirrors serve.py's own detection, including its preference for the chunk
@@ -49,18 +49,18 @@ def schema_of(con, base):
     server will read, not where it would rather write.
     """
     chunk, rows, _n, _k = LAYOUT[base]
-    have = {r[0] for r in con.execute(
+    have = {r[0] for r in connection.execute(
         "SELECT table_name FROM information_schema.tables").fetchall()}
-    if chunk in have and con.execute(
+    if chunk in have and connection.execute(
             f"SELECT count(*) FROM {chunk}").fetchone()[0]:
         return "chunk"
-    if rows in have and con.execute(
+    if rows in have and connection.execute(
             f"SELECT count(*) FROM {rows}").fetchone()[0]:
         return "rows"
     return "empty"
 
 
-def existing_days(con, base, sensor, kind):
+def existing_days(connection, base, sensor, kind):
     """UTC dates ('YYYY-MM-DD') this sensor already has stored, either shape.
 
     Bucketed in UTC on both sides. `to_timestamp()` renders in the machine's
@@ -69,7 +69,7 @@ def existing_days(con, base, sensor, kind):
     """
     chunk, rows, _n, _k = LAYOUT[base]
     if kind == "rows":
-        return {str(r[0]) for r in con.execute(
+        return {str(r[0]) for r in connection.execute(
             "SELECT DISTINCT CAST(to_timestamp(t) AT TIME ZONE 'UTC' AS DATE) "
             f"FROM {rows} WHERE sensor=?", [sensor]).fetchall()}
     if kind != "chunk":
@@ -79,7 +79,7 @@ def existing_days(con, base, sensor, kind):
     # and ends early on the next would mark both days complete when neither is,
     # and the missing captures would never be picked up. So read the instants.
     days = set()
-    for (blob,) in con.execute(
+    for (blob,) in connection.execute(
             f"SELECT times FROM {chunk} WHERE sensor=?", [sensor]).fetchall():
         ts = np.frombuffer(zlib.decompress(blob), dtype=np.float64)
         if ts.size:
@@ -104,8 +104,8 @@ class ChunkAppender:
     and a later `compact_db.py` pass tidies it.
     """
 
-    def __init__(self, con, base, sensor, payload_col, key=None):
-        self.con, self.base, self.sensor = con, base, sensor
+    def __init__(self, connection, base, sensor, payload_col, key=None):
+        self.connection, self.base, self.sensor = connection, base, sensor
         self.key = () if key is None else (key,)
         self.limit = LAYOUT[base][2]
         self.sql = _sql(base, (payload_col,))
@@ -123,7 +123,7 @@ class ChunkAppender:
         if not self.buf:
             return
         ts = np.array(self.ts, dtype=np.float64)
-        self.con.execute(self.sql, [
+        self.connection.execute(self.sql, [
             self.sensor, *self.key, float(ts[0]), float(ts[-1]), len(self.buf),
             zlib.compress(ts.tobytes(), Z),
             zlib.compress(b"".join(self.buf), Z)])
@@ -139,13 +139,13 @@ class ChunkAppender:
         return False
 
 
-def stored_span(con, base, sensor, kind):
+def stored_span(connection, base, sensor, kind):
     """(t_min, t_max, captures) for this sensor, whichever shape is on disk."""
     chunk, rows, _n, _k = LAYOUT[base]
     if kind == "chunk":
-        r = con.execute(f"SELECT min(t0), max(t1), coalesce(sum(n), 0) "
+        r = connection.execute(f"SELECT min(t0), max(t1), coalesce(sum(n), 0) "
                         f"FROM {chunk} WHERE sensor=?", [sensor]).fetchone()
     else:
-        r = con.execute(f"SELECT min(t), max(t), count(*) "
+        r = connection.execute(f"SELECT min(t), max(t), count(*) "
                         f"FROM {rows} WHERE sensor=?", [sensor]).fetchone()
     return r[0], r[1], r[2] or 0

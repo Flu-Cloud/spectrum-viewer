@@ -133,13 +133,18 @@ def _copy_meta(dst, src_path, table, rows_table=None):
     dst.execute("INSERT INTO done VALUES ('meta')")
 
 
-def compact_psd():
-    """-> True only if every sensor round-tripped with the same row count."""
-    src_p = os.path.join(DB_DIR, "psd.duckdb")
+def compact_psd(name="psd"):
+    """-> True only if every sensor round-tripped with the same row count.
+
+    `name` is the database's base name: `psd` for the max statistic,
+    `psd_median` / `psd_mean` for the sibling databases psd_ingest.py --stat
+    writes. Same schema inside, so one implementation compacts them all.
+    """
+    src_p = os.path.join(DB_DIR, f"{name}.duckdb")
     if _missing(src_p):
         return False
     src = duckdb.connect(src_p, read_only=True)
-    dst = duckdb.connect(os.path.join(DB_DIR, "psd_c.duckdb"))
+    dst = duckdb.connect(os.path.join(DB_DIR, f"{name}_c.duckdb"))
     _prep(dst, """CREATE TABLE IF NOT EXISTS psd_chunk (
         sensor VARCHAR, t0 DOUBLE, t1 DOUBLE, n INT, times BLOB, specs BLOB)""")
     if not _skip(dst, "meta"):
@@ -175,9 +180,9 @@ def compact_psd():
         log(f"  psd {s}: {total} spectra in {time.time()-t0:.0f}s")
     src.close(); dst.close()
     if bad:
-        log(f"psd_c.duckdb INCOMPLETE for {', '.join(bad)}; not swapping it in")
+        log(f"{name}_c.duckdb INCOMPLETE for {', '.join(bad)}; not swapping it in")
         return False
-    log("psd_c.duckdb complete")
+    log(f"{name}_c.duckdb complete")
     return True
 
 
@@ -280,10 +285,15 @@ if __name__ == "__main__":
     ok = {"spectrum": compact_spectrum()}
     log("compacting psd.duckdb ...")
     ok["psd"] = compact_psd()
+    for extra in ("psd_median", "psd_mean"):
+        if os.path.exists(os.path.join(DB_DIR, f"{extra}.duckdb")):
+            log(f"compacting {extra}.duckdb ...")
+            ok[extra] = compact_psd(extra)
     log("compacting pfp.duckdb (the big one) ...")
     ok["pfp"] = compact_pfp()
-    for f in ("spectrum_c.duckdb", "psd_c.duckdb", "pfp_c.duckdb"):
-        p = os.path.join(ROOT, f)      # the compacted DBs land beside serve.py
+    for f in ("spectrum_c.duckdb", "psd_c.duckdb", "psd_median_c.duckdb",
+              "psd_mean_c.duckdb", "pfp_c.duckdb"):
+        p = os.path.join(DB_DIR, f)    # where this run actually wrote them
         if os.path.exists(p):
             log(f"  {f}: {os.path.getsize(p)/1e9:.2f} GB")
     if args.no_swap:
@@ -291,7 +301,8 @@ if __name__ == "__main__":
     else:
         log("swapping compacted files into place ...")
         # Only a verified-complete build file replaces a live database.
-        swapped = [n for n in ("spectrum", "psd", "pfp") if ok[n] and swap_in(n)]
+        swapped = [n for n in ("spectrum", "psd", "psd_median", "psd_mean", "pfp")
+                   if ok.get(n) and swap_in(n)]
         if not swapped:
             log("  nothing to swap")
     log("DONE ALL")

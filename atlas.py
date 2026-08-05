@@ -49,7 +49,7 @@ sys.path.insert(0, ING)
 # outside the repo (and so the tests can point the menu at a local fixture).
 DATASETS = os.environ.get("ATLAS_DATASETS", os.path.join(HERE, "datasets.json"))
 DBS = ("spectrum", "psd", "pfp", "iq")
-IQ_EXT = (".sigmf-meta", ".tdms", ".npy")
+IQ_EXT = (".sigmf-meta", ".tdms", ".npy", ".complex1ch.float32")
 # Files that belong to a capture but are not the thing you point an
 # ingest at. Counting these as "unrecognised" would be misleading.
 COMPANION_EXT = (".sigmf-data", ".sha256")
@@ -1659,7 +1659,8 @@ def cmd_get(args):
                   "it and re-run.", file=sys.stderr)
             return 1
         print(f"\nNothing recognisable under {root}.\n"
-              "  Expected IQ captures (.sigmf-meta/.tdms/.npy), CBRS PSD or PFP\n"
+              "  Expected IQ captures (.sigmf-meta/.tdms/.npy/.complex1ch.float32),\n"
+              "  CBRS PSD or PFP\n"
               "  CSV exports, Summaries CSVs, or prebuilt .duckdb files.",
               file=sys.stderr)
         if found["other"]:

@@ -26,6 +26,7 @@ import json
 import math
 import os
 import threading
+import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 
@@ -107,13 +108,13 @@ def _cbrs_sensors():
 
 
 if os.path.exists(DB_PATH):
-    con = duckdb.connect(DB_PATH, read_only=True)
+    connection = duckdb.connect(DB_PATH, read_only=True)
     # Static per-boot metadata (sensor list + channel freqs): computed once so
     # /api/meta never rescans the 47M-row raw table per page load.
-    freqs = [r[0] for r in con.execute(
+    freqs = [r[0] for r in connection.execute(
         "SELECT DISTINCT freq FROM raw ORDER BY freq").fetchall()]
 else:
-    con = None
+    connection = None
     freqs = []          # no channel summaries; the PSD layer carries its own axis
 
 
@@ -129,11 +130,11 @@ def _dbm_div():
     factor of 10, which is what put a -980 dBm PSD legend next to a summary
     reading -98, and made the two layers jump when zoom crossed between them.
     """
-    if con is None:
+    if connection is None:
         return 1.0
     for tbl in ("lvl_h1", "lvl_m10", "lvl_d1", "raw"):
         try:
-            r = con.execute("SELECT data_type FROM duckdb_columns() WHERE "
+            r = connection.execute("SELECT data_type FROM duckdb_columns() WHERE "
                             "table_name=? AND column_name='mx'", [tbl]).fetchone()
         except Exception:
             continue
@@ -145,8 +146,8 @@ def _dbm_div():
 DBM_DIV = _dbm_div()
 # `summary` tells the viewer whether the top layer exists at all. Without it,
 # PSD is the zoomed-out view rather than something to fall back FROM.
-_META = {"sensors": _cbrs_sensors(), "freqs": freqs, "summary": con is not None}
-if con is None:
+_META = {"sensors": _cbrs_sensors(), "freqs": freqs, "summary": connection is not None}
+if connection is None:
     what = (f"{len(_META['sensors'])} sensor(s) from the PSD/PFP databases"
             if _META["sensors"] else "no CBRS data")
     print(f"[serve] {os.path.basename(DB_PATH)} not found -- no channel summary "
@@ -352,7 +353,10 @@ def _colorize(mat, vmin, vmax, cmap=DEFAULT_CMAP):
     nan = ~np.isfinite(mat)
     idx[nan] = 0
     rgb = lut[idx.astype(np.uint8)]
-    rgb[nan] = (8, 9, 12)
+    # Exactly the client's plot background (#05070b). It was (8,9,12) -- close,
+    # but a tile's no-data areas rendered a visibly different shade from the
+    # client-drawn summary's, so every layer switch re-tinted the gaps.
+    rgb[nan] = (5, 7, 11)
     return rgb
 
 
@@ -495,7 +499,9 @@ class _Grid:
         """
         b = self.buf                                   # (cols, nbins)
         nb = b.shape[1]
-        fb = max(1, math.ceil(nb / max(1, h)))         # bins per pixel row
+        # bins_per_row: how many stored frequency bins pool into one pixel row
+        bins_per_row = max(1, math.ceil(nb / max(1, h)))
+        fb = bins_per_row
         if fb > 1:
             pad = (-nb) % fb
             if pad:                                    # pad < fb, so no group
@@ -545,7 +551,7 @@ def meta():
 
 @app.route("/api/heatmap")
 def heatmap():
-    if con is None:                     # no CBRS database present (IQ-only install)
+    if connection is None:                     # no CBRS database present (IQ-only install)
         return _gz(jsonify({"level": None, "bucket": 0, "count": 0,
                             "freq": [], "t": [], "max": [], "median": [], "mean": []}))
     sensor = request.args.get("sensor")
@@ -555,7 +561,7 @@ def heatmap():
     span = max(t1 - t0, 1.0)
 
     tbl, bucket = pick_level(span, width)
-    rows = con.cursor().execute(f"""
+    rows = connection.cursor().execute(f"""
         SELECT freq, t, mx, md, mn
         FROM {tbl}
         WHERE sensor = ? AND t >= ? AND t < ?
@@ -564,16 +570,19 @@ def heatmap():
 
     # Columnar payload, in real dBm. DBM_DIV is 10 on a compacted database (dBm
     # stored as SMALLINT dBm*10) and 1 on the shape the ingest writes -- read off
-    # the file, not assumed; see _dbm_div.
-    freq, t, mx, md, mn = [], [], [], [], []
-    for r in rows:
-        freq.append(r[0]); t.append(int(r[1]))
-        mx.append(None if r[2] is None else r[2] / DBM_DIV)
-        md.append(None if r[3] is None else r[3] / DBM_DIV)
-        mn.append(None if r[4] is None else r[4] / DBM_DIV)
+    # the file, not assumed; see _dbm_div. (The mx/md/mn COLUMN names are the
+    # on-disk schema and stay as they are; these local names spell them out.)
+    frequencies, times = [], []
+    max_values, median_values, mean_values = [], [], []
+    for row in rows:
+        frequencies.append(row[0]); times.append(int(row[1]))
+        max_values.append(None if row[2] is None else row[2] / DBM_DIV)
+        median_values.append(None if row[3] is None else row[3] / DBM_DIV)
+        mean_values.append(None if row[4] is None else row[4] / DBM_DIV)
     return _gz(jsonify({
         "level": tbl, "bucket": bucket, "count": len(rows),
-        "freq": freq, "t": t, "max": mx, "median": md, "mean": mn,
+        "freq": frequencies, "t": times,
+        "max": max_values, "median": median_values, "mean": mean_values,
     }))
 
 
@@ -586,7 +595,7 @@ NF = 2250             # bins  (full band 3530.04 .. 3709.96 MHz)
 # PSD layer on the SAME dBm scale so colours line up across the zoom boundary.
 PSD_DBM_OFFSET = 70.0
 
-_psd_con = None
+_psd_connection = None
 _psd_scale_cache = {}   # sensor -> (vmin, vmax) sampled across the whole range
 _psd_kind = None        # 'chunk' | 'rows' | None
 # Coarse-time PSD levels (bucket seconds, finest first) if ingest/build_psd_levels.py
@@ -604,54 +613,107 @@ def table_names(c):
         return set()
 
 
-def psd_conn():
-    """Persistent read-only handle (saves the ~15ms reopen per zoom). The live
-    DB is never written while serving; ingest builds a fresh file and swaps."""
-    global _psd_con, _psd_kind
-    if _psd_con is not None or not os.path.exists(PSD_DB):
-        return _psd_con
+# The PSD layer exists per STATISTIC: `max` lives in psd.duckdb (the original
+# path, untouched), `median` and `mean` in sibling files psd_median.duckdb /
+# psd_mean.duckdb written by `psd_ingest.py --stat median|mean`. Separate files
+# rather than a schema change on purpose: every existing database keeps working
+# unmodified, and a stat the user never ingested simply is not there.
+PSD_LAYER_STATS = ("max", "median", "mean")
+_psd_dbs = {}           # stat -> {"connection", "kind", "levels"} once opened
+
+
+def psd_db_path(stat):
+    if stat == "max":
+        return PSD_DB
+    base = os.path.dirname(PSD_DB) or "."
+    return os.path.join(base, f"psd_{stat}.duckdb")
+
+
+def psd_connection(stat="max"):
+    """Persistent read-only handle for one statistic's PSD database (saves the
+    ~15ms reopen per zoom). The live DB is never written while serving; ingest
+    builds a fresh file and swaps."""
+    global _psd_connection, _psd_kind, _psd_lvls
+    entry = _psd_dbs.get(stat)
+    if entry is not None:
+        return entry["connection"]
+    path = psd_db_path(stat)
+    if stat not in PSD_LAYER_STATS or not os.path.exists(path):
+        return None
     with _psd_init:                 # two requests can race here on first load
-        if _psd_con is not None:
-            return _psd_con
+        entry = _psd_dbs.get(stat)
+        if entry is not None:
+            return entry["connection"]
         try:
-            con = duckdb.connect(PSD_DB, read_only=True)
+            connection = duckdb.connect(path, read_only=True)
         except Exception as e:
             # Silence here meant the layer simply was not there: /api/psd_meta
             # answers {"has": false}, the viewer switches the layer off, and
             # nothing anywhere says why. The usual causes are an ingest or
             # compact_db still holding the write lock, and a file that is not a
             # DuckDB database -- both worth naming.
-            print(f"[serve] cannot open {os.path.basename(PSD_DB)}: {e}")
-            print("[serve]   -- the PSD layer will not be available.")
+            print(f"[serve] cannot open {os.path.basename(path)}: {e}")
+            print(f"[serve]   -- the PSD {stat} layer will not be available.")
+            _psd_dbs[stat] = {"connection": None, "kind": None, "levels": []}
             return None
         # Two on-disk shapes are valid: the compact chunk schema written by
         # compact_db.py, and the row-per-capture schema psd_ingest.py writes.
         # Reading both means compaction is a size optimisation, not a step you
         # can forget and end up with a viewer that renders nothing.
-        t = table_names(con)
-        # kind BEFORE con: the fast path above returns as soon as _psd_con is
-        # non-None without taking the lock, so publishing the connection first
-        # let another thread see kind still None and answer 503 -- the viewer
-        # read that as "no PSD here" and quietly stayed on the summary layer.
-        _psd_kind = "chunk" if "psd_chunk" in t else ("rows" if "psd" in t else None)
-        _psd_con = con
-        if _psd_kind == "rows":
-            print("[serve] psd.duckdb is the uncompacted row schema; serving it "
-                  "directly. Run ingest/compact_db.py to shrink it.")
-        global _psd_lvls
+        t = table_names(connection)
+        kind = "chunk" if "psd_chunk" in t else ("rows" if "psd" in t else None)
+        levels = []
         if "psd_lvl" in t:
             try:
-                _psd_lvls = sorted(r[0] for r in con.execute(
+                levels = sorted(r[0] for r in connection.execute(
                     "SELECT DISTINCT bucket FROM psd_lvl").fetchall())
             except Exception:
-                _psd_lvls = []
-        if _psd_lvls:
-            print("[serve] PSD coarse levels available: "
-                  + ", ".join(f"{b}s" for b in _psd_lvls))
-        else:
+                levels = []
+        # entry BEFORE the mirror globals: the fast path above returns as soon
+        # as the entry exists without taking the lock, so the dict value must
+        # already be complete when it becomes visible.
+        _psd_dbs[stat] = {"connection": connection, "kind": kind, "levels": levels}
+        if stat == "max":
+            # Mirrors kept for the tests and tooling that read these directly;
+            # they always describe the max database, the one that always existed.
+            _psd_kind, _psd_connection, _psd_lvls = kind, connection, levels
+        if kind == "rows":
+            print(f"[serve] {os.path.basename(path)} is the uncompacted row "
+                  "schema; serving it directly. Run ingest/compact_db.py to shrink it.")
+        if levels:
+            print(f"[serve] PSD {stat} coarse levels available: "
+                  + ", ".join(f"{b}s" for b in levels))
+        elif stat == "max":
             print("[serve] no PSD coarse levels; very wide PSD windows will be "
                   "slow. Build them with ingest/build_psd_levels.py.")
-    return _psd_con
+    return connection
+
+
+def psd_stat_info(stat):
+    """(connection, kind, levels) for one statistic, opening it if needed."""
+    connection = psd_connection(stat)
+    entry = _psd_dbs.get(stat) or {"kind": None, "levels": []}
+    return connection, entry.get("kind"), entry.get("levels", [])
+
+
+def psd_stats_available(sensor=None):
+    """Which statistics have a database on disk (and this sensor in it)."""
+    out = []
+    for stat in PSD_LAYER_STATS:
+        connection = psd_connection(stat)
+        if connection is None:
+            continue
+        if sensor is not None:
+            try:
+                row = connection.cursor().execute(
+                    "SELECT 1 FROM psd_meta WHERE sensor=? LIMIT 1",
+                    [sensor]).fetchone()
+            except Exception:
+                row = None
+            if row is None:
+                continue
+        out.append(stat)
+    return out
 
 
 def _unpack(rows, width):
@@ -670,24 +732,24 @@ def _unpack_rows(rows, width):
     return ts, mat.reshape(len(rows), width)
 
 
-def _psd_scale(c, sensor, qmin, qmax):
-    sc = _psd_scale_cache.get(sensor)
+def _psd_scale(c, sensor, qmin, qmax, stat="max", kind=None):
+    sc = _psd_scale_cache.get((stat, sensor))
     if sc is not None:
         return sc
-    full = _psd_sample(c, sensor, qmin, qmax)
+    full = _psd_sample(c, sensor, qmin, qmax, kind)
     if full is None:
         sc = (qmin, qmax)
     else:
         sc = (float(np.percentile(full, 2)), float(np.percentile(full, 98)))
-    _psd_scale_cache[sensor] = sc
+    _psd_scale_cache[(stat, sensor)] = sc
     return sc
 
 
-def _psd_sample(c, sensor, qmin, qmax):
+def _psd_sample(c, sensor, qmin, qmax, kind=None):
     """A few hundred spectra spread across the sensor's range, as dBm values
     (offset applied) -- the sample behind both the colour scale and the
     summary-matching LUT below. None when the sensor has nothing."""
-    if _psd_kind == "chunk":
+    if (kind or _psd_kind) == "chunk":
         # Four chunks spread across the sensor, picked by timestamp.
         # USING SAMPLE applies to the table before WHERE does, so sampling 4
         # rows out of every chunk in the file and *then* keeping this sensor's
@@ -742,10 +804,21 @@ def _psd_sample(c, sensor, qmin, qmax):
 _match_cache = {}
 
 
-def _psd_match(c, sensor, qmin, qmax):
-    if con is None or os.environ.get("ATLAS_NO_COLORMATCH"):
+# Which summary column each display statistic matches onto. The match used to
+# target mx no matter what the SHOW buttons said, so a user viewing the median
+# summary and zooming into PSD got tiles matched onto the max distribution --
+# measured as a built-in ~7 dB legend jump at the handoff. The PSD data itself
+# is always the max detector; matching it onto the DISPLAYED stat's quantiles is
+# what makes the colours continuous across the switch, which is the whole point
+# of the match.
+_STAT_COL = {"max": "mx", "median": "md", "mean": "mn"}
+
+
+def _psd_match(c, sensor, qmin, qmax, stat="max", kind=None):
+    if connection is None or os.environ.get("ATLAS_NO_COLORMATCH"):
         return None
-    m = _match_cache.get(sensor)
+    col = _STAT_COL.get(stat, "mx")
+    m = _match_cache.get((sensor, col))
     if m is not None:
         return m or None                    # () = known no-match, cached
     try:
@@ -753,22 +826,22 @@ def _psd_match(c, sensor, qmin, qmax):
         # PSD layer is being matched ONTO, so it has to be the dBm the summary
         # layer actually draws. Reading it raw off a compacted database made every
         # matched PSD value, and the legend derived from it, 10x too large.
-        s = np.array([r[0] for r in con.cursor().execute(
-            "SELECT mx FROM lvl_h1 WHERE sensor=? AND mx IS NOT NULL",
+        s = np.array([r[0] for r in connection.cursor().execute(
+            f"SELECT {col} FROM lvl_h1 WHERE sensor=? AND {col} IS NOT NULL",
             [sensor]).fetchall()], np.float32) / DBM_DIV
     except Exception as e:
         print(f"[serve] colour match off for {sensor}: {e}")
         s = np.empty(0)
-    p = _psd_sample(c, sensor, qmin, qmax)
+    p = _psd_sample(c, sensor, qmin, qmax, kind)
     if len(s) < 100 or p is None or p.size < 100:
-        _match_cache[sensor] = ()
+        _match_cache[(sensor, col)] = ()
         return None
     q = np.linspace(0.0, 100.0, 65)
     pq = np.percentile(p, q).astype(np.float64)
     sq = np.percentile(s, q).astype(np.float64)
     pq += np.arange(65) * 1e-4              # strictly increasing for interp
     m = (pq, sq, float(np.percentile(s, 2)), float(np.percentile(s, 98)))
-    _match_cache[sensor] = m
+    _match_cache[(sensor, col)] = m
     return m
 
 
@@ -830,10 +903,10 @@ def _pfp_nearest(c, sensor, freq, t1, npos):
     return _unpack_rows([row], npos)[1]
 
 
-def _psd_count(c, sensor, t0, t1):
+def _psd_count(c, sensor, t0, t1, kind=None):
     """Captures stored in [t0,t1) -- only used to decide whether to stride, so
     the chunk estimate (whole chunks that overlap) is close enough."""
-    if _psd_kind == "chunk":
+    if (kind or _psd_kind) == "chunk":
         r = c.execute("SELECT coalesce(sum(n),0) FROM psd_chunk WHERE sensor=? "
                       "AND t1>=? AND t0<?", [sensor, t0, t1]).fetchone()
     else:
@@ -842,9 +915,9 @@ def _psd_count(c, sensor, t0, t1):
     return int(r[0] or 0)
 
 
-def _psd_nearest(c, sensor, t1):
+def _psd_nearest(c, sensor, t1, kind=None):
     """The one capture to hold when the window itself is empty."""
-    if _psd_kind == "chunk":
+    if (kind or _psd_kind) == "chunk":
         row = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? AND t0<? "
                         "ORDER BY t0 DESC LIMIT 1", [sensor, t1]).fetchone()
         if row is None:
@@ -874,7 +947,7 @@ _PWIN_CACHE, _PWIN_MAX = {}, 4
 _pwin_lock = threading.Lock()
 
 
-def _pick_psd_level(span, cols, ncap):
+def _pick_psd_level(span, cols, ncap, levels=None):
     """Which coarse bucket to draw this window from, or None for the captures.
 
     Two guards, both learned the hard way by measuring against a no-thinning
@@ -889,13 +962,160 @@ def _pick_psd_level(span, cols, ncap):
     Where both hold, the level is both faster and closer to the true max than
     reading one capture in N -- which is the only reason to prefer it.
     """
-    if not _psd_lvls or cols <= 0 or span <= 0:
+    if levels is None:
+        levels = _psd_lvls
+    if not levels or cols <= 0 or span <= 0:
         return None
     if _stride_for(ncap, cols) <= 1:
         return None                       # captures are exact here; leave them
     col = span / cols
-    usable = [b for b in _psd_lvls if b <= col]
+    usable = [b for b in levels if b <= col]
     return max(usable) if usable else None
+
+
+# A coarse index built in RAM, for databases that have never had
+# build_psd_levels.py run on them. Same rows the on-disk table would hold -- one
+# bin-wise max spectrum per bucket -- computed by one background pass over a
+# sensor's captures the first time anything asks about its PSD layer, which the
+# viewer does on page load. So the expensive wide window is usually ready before
+# the user can zoom to it, and nothing on disk had to change.
+#
+# On-disk levels are still better and are preferred whenever present: they cost
+# no RAM and survive a restart. This is the fallback that makes that build step
+# optional rather than required.
+MEM_BUCKET = 3600
+_MEM_MAX = 3                      # sensors held; ~22 MB per sensor-year
+_memlvl = {}                      # sensor -> dict | 'building' | 'failed'
+_mem_lock = threading.Lock()
+
+
+# The build is a background convenience, never a reason for a request the user IS
+# waiting on to get slower. Measured on a 2-core box: an unthrottled build turned
+# an 18 s first wide window into 56 s by competing for the same cores. After each
+# batch the thread sleeps for a share of the time that batch took, which caps it
+# near 60% of one core and leaves the tile path the rest. Costs the build about
+# half again in wall clock, which nobody is watching.
+MEM_THROTTLE = 0.7
+
+
+def _memlvl_build(sensor, stat="max"):
+    """One pass over one statistic's captures -> bucketed spectra, in RAM.
+
+    The pooling inside a bucket is max for every statistic: for the median and
+    mean layers the stored per-capture values ARE medians/means (computed at
+    the sensor over 320k FFTs); pooling those to one value per bucket for a
+    pixel keeps the strongest capture visible, the same display convention the
+    capture path itself uses when several captures share a pixel column.
+    """
+    try:
+        connection_s, kind_s, _lv = psd_stat_info(stat)
+        c = connection_s.cursor()
+        buckets = {}
+        if kind_s == "chunk":
+            cur = c.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? "
+                            "ORDER BY t0", [sensor])
+            batch = 32
+        else:
+            cur = c.execute("SELECT t, spec FROM psd WHERE sensor=? ORDER BY t",
+                            [sensor])
+            batch = 4096
+        while True:
+            t_batch = time.monotonic()
+            rows = cur.fetchmany(batch)
+            if not rows:
+                break
+            if kind_s == "chunk":
+                pairs = [_unpack([r], NF) for r in rows]
+            else:
+                pairs = [(np.array([r[0] for r in rows], np.float64),
+                          np.frombuffer(b"".join(r[1] for r in rows),
+                                        np.uint8).reshape(len(rows), NF))]
+            for ts, mat in pairs:
+                keys = (ts // MEM_BUCKET).astype(np.int64)
+                for k in np.unique(keys):
+                    m = mat[keys == k].max(axis=0)
+                    prev = buckets.get(k)
+                    buckets[k] = m if prev is None else np.maximum(prev, m)
+            time.sleep(min(0.25, (time.monotonic() - t_batch) * MEM_THROTTLE))
+        if not buckets:
+            with _mem_lock:
+                _memlvl[(stat, sensor)] = "failed"
+            return
+        ks = np.array(sorted(buckets), np.int64)
+        built = {"t": ks * MEM_BUCKET,
+                 "smax": np.stack([buckets[k] for k in ks]),
+                 "t0": float(ks[0] * MEM_BUCKET),
+                 "t1": float((ks[-1] + 1) * MEM_BUCKET)}
+        with _mem_lock:
+            _memlvl[(stat, sensor)] = built
+            while len(_memlvl) > _MEM_MAX:
+                for k in list(_memlvl):
+                    if k != (stat, sensor):
+                        _memlvl.pop(k); break
+                else:
+                    break
+        print(f"[serve] coarse PSD {stat} index for {sensor} ready in RAM "
+              f"({len(ks)} x {MEM_BUCKET}s buckets). ingest/build_psd_levels.py "
+              f"stores this on disk instead, so it survives a restart.")
+    except Exception as e:
+        print(f"[serve] could not build the in-RAM PSD {stat} index for {sensor}: {e}")
+        with _mem_lock:
+            _memlvl[(stat, sensor)] = "failed"
+
+
+def memlvl_warm(sensor, stat="max"):
+    """Start the background build once per (stat, sensor). Cheap to call often."""
+    connection_s, kind_s, levels_s = psd_stat_info(stat)
+    if not sensor or connection_s is None or kind_s is None or levels_s:
+        return                        # on-disk levels present: nothing to do
+    with _mem_lock:
+        if (stat, sensor) in _memlvl:
+            return
+        _memlvl[(stat, sensor)] = "building"
+    threading.Thread(target=_memlvl_build, args=(sensor, stat), daemon=True,
+                     name=f"psdlvl-{stat}-{sensor}").start()
+
+
+def memlvl_ready(sensor, t0, t1, stat="max"):
+    """The in-RAM index for this statistic's sensor, if built and spanning."""
+    with _mem_lock:
+        m = _memlvl.get((stat, sensor))
+    if not isinstance(m, dict):
+        return None
+    return m if (m["t0"] <= t0 and t1 <= m["t1"]) else None
+
+
+_lvl_cov, _lvl_cov_lock = {}, threading.Lock()
+
+
+def _lvl_covers(c, sensor, lvl, t0, t1, stat="max"):
+    """Does this level actually span the whole window being asked for?
+
+    build_psd_levels.py is a separate step, so the levels can legitimately stop
+    short of the captures: the obvious way is ingesting a new month and not
+    re-running it. Reading a level anyway would leave the newest part of the
+    window with no rows at all, and the grid's sample-and-hold would paper over
+    it with the last value it did have -- stale data presented as current, which
+    is worse than the slow path by a wide margin. So check, and fall back.
+
+    Cached per (sensor, bucket): the file is opened read-only and ingest swaps a
+    new one in rather than writing this one, so coverage cannot change under us.
+    """
+    key = (stat, sensor, lvl)
+    with _lvl_cov_lock:
+        cov = _lvl_cov.get(key)
+    if cov is None:
+        try:
+            r = c.execute("SELECT min(t), max(t) FROM psd_lvl WHERE sensor=? "
+                          "AND bucket=?", [sensor, lvl]).fetchone()
+        except Exception:
+            r = None
+        cov = (None, None) if not r or r[0] is None else (r[0], r[1] + lvl)
+        with _lvl_cov_lock:
+            _lvl_cov[key] = cov
+    if cov[0] is None:
+        return False
+    return cov[0] <= t0 and t1 <= cov[1]
 
 
 def _fill_from_levels(grid, rows, t0, t1, lvl, cols, ncap):
@@ -914,8 +1134,12 @@ def _fill_from_levels(grid, rows, t0, t1, lvl, cols, ncap):
     # a wide window is tens of thousands of 2250-byte rows, and building that
     # many little arrays and stacking them cost more than the query.
     ts = np.fromiter((r[0] for r in rows), np.float64, len(rows))
-    mat = np.frombuffer(b"".join(r[1] for r in rows),
-                        np.uint8).reshape(len(rows), NF)
+    # DuckDB hands these over as BLOBs; the in-RAM index already has arrays.
+    if isinstance(rows[0][1], (bytes, bytearray, memoryview)):
+        mat = np.frombuffer(b"".join(r[1] for r in rows),
+                            np.uint8).reshape(len(rows), NF)
+    else:
+        mat = np.stack([r[1] for r in rows])
     span = max(t1 - t0, 1e-9)
     col_w = span / cols
 
@@ -948,17 +1172,26 @@ def _fill_from_levels(grid, rows, t0, t1, lvl, cols, ncap):
     grid.ncap = ncap
 
 
-def _psd_window(c, sensor, t0, t1, cols, fi0, fi1):
-    """Spectra in [t0,t1), max-pooled onto `cols` uniform time bins.
+def _psd_window(c, sensor, t0, t1, cols, fi0, fi1,
+                stat="max", kind=None, levels=None):
+    """Spectra in [t0,t1), pooled onto `cols` uniform time bins.
 
-    Pools the FULL band once per (sensor, window) and serves any requested
-    band as a slice of that grid: the first tile of a window pays the scan,
-    every frequency zoom inside it answers from memory.
+    Pools the FULL band once per (sensor, stat, window) and serves any
+    requested band as a slice of that grid: the first tile of a window pays
+    the scan, every frequency zoom inside it answers from memory.
+
+    `stat` names which statistic's database the cursor belongs to; it is part
+    of every cache key, because a max grid answering a median request would be
+    silently wrong in the way nothing downstream could detect.
 
     Data gap -> hold the nearest capture (matches the summary layer's gap-fill,
     so zooming into a quiet stretch keeps showing last-known data).
     """
-    key = (sensor, t0, t1, cols)
+    if kind is None:
+        kind = _psd_kind
+    if levels is None:
+        levels = _psd_lvls
+    key = (stat, sensor, t0, t1, cols)
     with _pwin_lock:
         hit = _PWIN_CACHE.pop(key, None)
         if hit is not None:
@@ -973,24 +1206,37 @@ def _psd_window(c, sensor, t0, t1, cols, fi0, fi1):
     # more faithful answer: the level row is the max over EVERY capture in its
     # bucket, where the capture path below keeps only every Nth one at these
     # widths. Sound because the layer is a max -- see build_psd_levels.py.
-    ncap = _psd_count(c, sensor, t0, t1)       # metadata only, no BLOBs read
-    lvl = _pick_psd_level(t1 - t0, cols, ncap)
+    ncap = _psd_count(c, sensor, t0, t1, kind)   # metadata only, no BLOBs read
+    lvl = _pick_psd_level(t1 - t0, cols, ncap, levels)
+    if lvl is not None and not _lvl_covers(c, sensor, lvl, t0, t1, stat):
+        lvl = None                             # levels are behind the captures
+    rows = None
     if lvl is not None:
         rows = c.execute("SELECT t, smax FROM psd_lvl WHERE sensor=? AND bucket=? "
                          "AND t>=? AND t<? ORDER BY t",
                          [sensor, lvl, t0 - lvl, t1]).fetchall()
-        if rows:
-            _fill_from_levels(grid, rows, t0, t1, lvl, cols, ncap)
-            gap = not grid.filled.all()
-            with _pwin_lock:
-                _PWIN_CACHE[key] = (grid, gap)
-                while len(_PWIN_CACHE) > _PWIN_MAX:
-                    _PWIN_CACHE.pop(next(iter(_PWIN_CACHE)))
-            return _pwin_slice(grid, fi0, fi1), gap
+    elif _stride_for(ncap, cols) > 1 and MEM_BUCKET <= (t1 - t0) / max(cols, 1):
+        # No usable table on disk, but the in-RAM index may be built and is the
+        # same thing. Guards are identical: only where the captures would thin,
+        # and only when a bucket fits inside a pixel column.
+        m = memlvl_ready(sensor, t0, t1, stat)
+        if m is not None:
+            sel = (m["t"] >= t0 - MEM_BUCKET) & (m["t"] < t1)
+            if sel.any():
+                lvl = MEM_BUCKET
+                rows = list(zip(m["t"][sel].tolist(), m["smax"][sel]))
+    if lvl is not None and rows:
+        _fill_from_levels(grid, rows, t0, t1, lvl, cols, ncap)
+        gap = not grid.filled.all()
+        with _pwin_lock:
+            _PWIN_CACHE[key] = (grid, gap)
+            while len(_PWIN_CACHE) > _PWIN_MAX:
+                _PWIN_CACHE.pop(next(iter(_PWIN_CACHE)))
+        return _pwin_slice(grid, fi0, fi1), gap
 
     stride = _stride_for(ncap, cols)
 
-    if _psd_kind == "chunk":
+    if kind == "chunk":
         cur = c.execute("SELECT t0, n, times, specs FROM psd_chunk WHERE sensor=? "
                         "AND t1>=? AND t0<? ORDER BY t0", [sensor, t0, t1])
         while True:
@@ -998,7 +1244,12 @@ def _psd_window(c, sensor, t0, t1, cols, fi0, fi1):
             if not rows:
                 break
             for ts, mat in _INFLATE.map(
-                    lambda r: _inflate_cached(("psd", sensor, r[0]),
+                    # stat IS part of the key: the three statistics' databases
+                    # hold the same sensors with the same chunk timestamps, so
+                    # without it whichever statistic was drawn first poisoned
+                    # every other one for overlapping chunks -- reproduced on
+                    # compacted databases, tiles byte-identical across stats.
+                    lambda r: _inflate_cached(("psd", stat, sensor, r[0]),
                                               r[2], r[3], r[1], NF), rows):
                 keep = (ts >= t0) & (ts < t1)
                 if stride > 1:                      # thin inside the chunk too
@@ -1036,7 +1287,7 @@ def _psd_window(c, sensor, t0, t1, cols, fi0, fi1):
 
     gap = False
     if not grid.filled.any():
-        specs = _psd_nearest(c, sensor, t1)
+        specs = _psd_nearest(c, sensor, t1, kind)
         if specs is None:
             return None, False
         grid = _Grid(t0, t1, 1, NF)
@@ -1061,18 +1312,29 @@ def _pwin_slice(full, fi0, fi1):
 
 @app.route("/api/psd_meta")
 def psd_meta():
-    c = psd_conn()
-    if c is None or _psd_kind is None:
+    stat = request.args.get("stat", "max")
+    if stat not in PSD_LAYER_STATS:
+        stat = "max"                       # same rule as /api/psd_layer
+    database, kind, _levels = psd_stat_info(stat)
+    if database is None or kind is None:
         return jsonify({"has": False})
-    row = c.cursor().execute("SELECT f0, df, nf, t_min, t_max FROM psd_meta WHERE sensor=?",
-                             [request.args.get("sensor")]).fetchone()
+    sensor = request.args.get("sensor")
+    # The viewer calls this on page load and on every sensor change, which is the
+    # earliest moment we know which sensor matters -- so the coarse index starts
+    # building while the user is still looking at the summary layer.
+    memlvl_warm(sensor, stat)
+    row = database.cursor().execute("SELECT f0, df, nf, t_min, t_max FROM psd_meta WHERE sensor=?",
+                             [sensor]).fetchone()
     # An ingest that read no files leaves a meta row with a null time range.
     # Never advertise a layer whose backing rows are not actually there.
     if not row or row[3] is None or row[4] is None:
         return jsonify({"has": False})
     f0, df, nf, tmin, tmax = row
+    # `stats`: every statistic that has a database holding THIS sensor, so the
+    # viewer can light up exactly the SHOW buttons that will actually answer.
     return jsonify({"has": True, "fmin": f0, "fmax": f0 + (nf - 1) * df,
-                    "t_min": tmin, "t_max": tmax})
+                    "t_min": tmin, "t_max": tmax,
+                    "stats": psd_stats_available(sensor)})
 
 
 @app.route("/api/psd_layer")
@@ -1085,18 +1347,27 @@ def psd_layer():
     fi0 = max(0, min(NF - 1, fi0)); fi1 = max(0, min(NF - 1, fi1))
     if fi1 <= fi0:
         fi0, fi1 = 0, NF - 1
-    c = psd_conn()
-    if c is None or _psd_kind is None:
-        return jsonify({"error": "psd layer not ready"}), 503
+    # Unknown statistics coerce to max rather than erroring -- a viewer must
+    # never lose its picture to a typo -- but the substitution is DECLARED: the
+    # tile's X-Meta carries the statistic actually rendered, and /api/psd_meta
+    # applies the same rule, so the two endpoints agree about invalid input.
+    stat = request.args.get("stat", "max")
+    if stat not in PSD_LAYER_STATS:
+        stat = "max"
+    database, kind, levels = psd_stat_info(stat)
+    if database is None or kind is None:
+        return jsonify({"error": f"psd {stat} layer not ready"}), 503
+    memlvl_warm(sensor, stat)
     W = max(1, _num("w", 1200, int))
-    cur = c.cursor()
-    grid, gap = _psd_window(cur, sensor, t0, t1, _grid_cols(W), fi0, fi1)
-    mrow = cur.execute("SELECT qmin, qmax FROM psd_meta WHERE sensor=?", [sensor]).fetchone()
+    cursor = database.cursor()
+    grid, gap = _psd_window(cursor, sensor, t0, t1, _grid_cols(W), fi0, fi1,
+                            stat=stat, kind=kind, levels=levels)
+    mrow = cursor.execute("SELECT qmin, qmax FROM psd_meta WHERE sensor=?", [sensor]).fetchone()
     if grid is None:
         return jsonify({"error": "no psd data for this sensor"}), 404
     qmin, qmax = mrow or (-180.0, -90.0)
     img = grid.image(qmin, qmax, H, PSD_DBM_OFFSET)   # (nF, cols); row 0 = low f
-    match = _psd_match(cur, sensor, qmin, qmax)
+    match = _psd_match(cursor, sensor, qmin, qmax, stat, kind)
     if match is not None:                 # remap onto the summary's dBm ramp
         img = _apply_match(img, match, qmin, qmax, PSD_DBM_OFFSET)
     locked = _locked_scale()
@@ -1105,9 +1376,9 @@ def psd_layer():
     elif match is not None:               # scale in summary terms too
         vmin, vmax = match[2], match[3]
     else:
-        vmin, vmax = _psd_scale(cur, sensor, qmin, qmax)     # full-range: no drift on zoom
+        vmin, vmax = _psd_scale(cursor, sensor, qmin, qmax, stat, kind)  # full-range: no drift
     return _tile(_colorize(img, vmin, vmax, request.args.get("cmap", "inferno")), {
-        "t0": t0, "t1": t1,
+        "t0": t0, "t1": t1, "stat": stat,
         "fmin": F0 + fi0 * DF, "fmax": F0 + fi1 * DF,
         "ncap": int(grid.ncap), "cols": int(img.shape[1]), "nf": int(img.shape[0]),
         "vmin": round(vmin, 1), "vmax": round(vmax, 1), "gap": gap,
@@ -1116,22 +1387,22 @@ def psd_layer():
 
 # ---- PFP layer (periodic-frame-power, ~18 us within a 10 ms frame) ----
 PFP_DB = os.environ.get("PFP_DB") or os.path.join(DB_DIR, "pfp.duckdb")
-_pfp_con = None
+_pfp_connection = None
 _pfp_freqs_cache = {}
 PFP_SNAP_HZ = 10e6      # how far a requested channel may be off and still resolve
 _pfp_kind = None        # 'chunk' | 'rows' | None
 _pfp_init = threading.Lock()
 
 
-def pfp_conn():
-    global _pfp_con, _pfp_kind
-    if _pfp_con is not None or not os.path.exists(PFP_DB):
-        return _pfp_con
+def pfp_connection():
+    global _pfp_connection, _pfp_kind
+    if _pfp_connection is not None or not os.path.exists(PFP_DB):
+        return _pfp_connection
     with _pfp_init:                 # same first-load race as PSD above
-        if _pfp_con is not None:
-            return _pfp_con
+        if _pfp_connection is not None:
+            return _pfp_connection
         try:
-            con = duckdb.connect(PFP_DB, read_only=True)
+            connection = duckdb.connect(PFP_DB, read_only=True)
         except Exception as e:
             # Silence here meant the layer simply was not there: /api/pfp_meta
             # answers {"has": false}, the viewer switches the layer off, and
@@ -1141,27 +1412,27 @@ def pfp_conn():
             print(f"[serve] cannot open {os.path.basename(PFP_DB)}: {e}")
             print("[serve]   -- the PFP layer will not be available.")
             return None
-        t = table_names(con)            # same dual-schema rule as PSD above
+        t = table_names(connection)            # same dual-schema rule as PSD above
         _pfp_kind = "chunk" if "pfp_chunk" in t else ("rows" if "pfp" in t else None)
         if _pfp_kind == "rows":
             print("[serve] pfp.duckdb is the uncompacted row schema; serving it "
                   "directly. Run ingest/compact_db.py to shrink it.")
-        _pfp_con = con                  # publish last (kind first; see psd_conn)
-    return _pfp_con
+        _pfp_connection = connection                  # publish last (kind first; see psd_connection)
+    return _pfp_connection
 
 
 @app.route("/api/pfp_meta")
 def pfp_meta():
     sensor = request.args.get("sensor")
-    c = pfp_conn()
-    if c is None or _pfp_kind is None:
+    database = pfp_connection()
+    if database is None or _pfp_kind is None:
         return jsonify({"has": False})
-    cur = c.cursor()
-    m = cur.execute("SELECT npos, frame_ms, t_min, t_max, stat FROM pfp_meta WHERE sensor=?",
+    cursor = database.cursor()
+    m = cursor.execute("SELECT npos, frame_ms, t_min, t_max, stat FROM pfp_meta WHERE sensor=?",
                     [sensor]).fetchone()
     if not m or m[2] is None or m[3] is None:
         return jsonify({"has": False})
-    freqs = _pfp_freqs(cur, sensor)
+    freqs = _pfp_freqs(cursor, sensor)
     return jsonify({"has": True, "npos": m[0], "frame_ms": m[1],
                     "t_min": m[2], "t_max": m[3], "stat": m[4], "freqs": freqs})
 
@@ -1205,25 +1476,25 @@ def pfp_frame():
     freq = _num("freq", required=True)
     t0, t1, H = _window()
     W = max(1, _num("w", 1200, int))
-    c = pfp_conn()
-    if c is None or _pfp_kind is None:
+    database = pfp_connection()
+    if database is None or _pfp_kind is None:
         return jsonify({"error": "pfp not ready"}), 503
-    q = c.cursor()
-    m = q.execute("SELECT npos, frame_ms, qmin, qmax FROM pfp_meta WHERE sensor=?",
+    cursor = database.cursor()
+    m = cursor.execute("SELECT npos, frame_ms, qmin, qmax FROM pfp_meta WHERE sensor=?",
                   [sensor]).fetchone()
     if not m:
         return jsonify({"error": "no pfp for this sensor"}), 404
     npos, frame_ms, qmin, qmax = m
-    ch = _pfp_snap(q, sensor, freq)
+    ch = _pfp_snap(cursor, sensor, freq)
     if ch is None:
         return jsonify({"error": f"no pfp channel near {freq/1e6:.1f} MHz"}), 404
     grid = _Grid(t0, t1, _grid_cols(W), npos)
     if _pfp_kind == "chunk":
-        cur = q.execute(
+        cursor = cursor.execute(
             "SELECT t0, n, times, frames FROM pfp_chunk WHERE sensor=? AND freq=? "
             "AND t1>=? AND t0<? ORDER BY t0", [sensor, ch, t0, t1])
         while True:
-            rows = cur.fetchmany(READ_BATCH)
+            rows = cursor.fetchmany(READ_BATCH)
             if not rows:
                 break
             for ts, mat in _INFLATE.map(
@@ -1233,11 +1504,11 @@ def pfp_frame():
                 if keep.any():
                     grid.add(ts[keep], mat[keep])
     else:
-        cur = q.execute(
+        cursor = cursor.execute(
             "SELECT t, frame FROM pfp WHERE sensor=? AND freq=? "
             "AND t>=? AND t<? ORDER BY t", [sensor, ch, t0, t1])
         while True:
-            rows = cur.fetchmany(READ_BATCH * PSD_ROWS_PER_BATCH)
+            rows = cursor.fetchmany(READ_BATCH * PSD_ROWS_PER_BATCH)
             if not rows:
                 break
             ts = np.array([r[0] for r in rows], np.float64)
@@ -1248,7 +1519,7 @@ def pfp_frame():
         # Nothing for this channel inside the window: hold the frame that was
         # last measured before it, exactly as the PSD layer does, so zooming
         # past the ~90 s sweep interval goes steady rather than blank.
-        held = _pfp_nearest(q, sensor, ch, t1, npos)
+        held = _pfp_nearest(cursor, sensor, ch, t1, npos)
         if held is None:
             return jsonify({"error": "no pfp in window"}), 404
         grid.add(np.array([t0], np.float64), held)
@@ -1277,7 +1548,7 @@ def pfp_frame():
 IQ_DB = os.environ.get("IQ_DB") or os.path.join(DB_DIR, "iq.duckdb")
 
 
-def iq_conn():
+def iq_connection():
     if not os.path.exists(IQ_DB):
         return None
     try:
@@ -1288,12 +1559,12 @@ def iq_conn():
 
 @app.route("/api/iq_index")
 def iq_index():
-    c = iq_conn()
-    if c is None:
+    database = iq_connection()
+    if database is None:
         return jsonify({"captures": []})
-    rows = c.execute("SELECT id, name, dataset, fc, fs, duration FROM iq_meta "
+    rows = database.execute("SELECT id, name, dataset, fc, fs, duration FROM iq_meta "
                      "ORDER BY dataset, name").fetchall()
-    c.close()
+    database.close()
     return jsonify({"captures": [
         {"id": r[0], "name": r[1], "dataset": r[2], "fc": r[3], "fs": r[4],
          "duration": r[5]} for r in rows]})
@@ -1301,13 +1572,13 @@ def iq_index():
 
 @app.route("/api/iq_meta")
 def iq_meta():
-    c = iq_conn()
-    row = c and c.execute(
+    database = iq_connection()
+    row = database and database.execute(
         "SELECT id, dataset, name, fc, fs, duration, n_samples, nfft, nfreq, "
         "hop, nlevels, vmin, vmax FROM iq_meta WHERE id=?",
         [request.args.get("id")]).fetchone()
-    if c:
-        c.close()
+    if database:
+        database.close()
     if not row:
         return jsonify({"has": False})
     k = ["id", "dataset", "name", "fc", "fs", "duration", "n_samples", "nfft",
@@ -1320,13 +1591,13 @@ def iq_layer():
     """WebP tile of one capture's spectrogram for a [t0,t1]x[f0,f1] window.
     Picks the finest pyramid level with <= ~2*w columns (mirrors pick_level)."""
     cid = request.args.get("id")
-    c = iq_conn()
-    if c is None:
+    database = iq_connection()
+    if database is None:
         return jsonify({"error": "iq layer not ready"}), 503
-    m = c.execute("SELECT fc, fs, duration, nfft, hop, nlevels, qmin, qmax, "
+    m = database.execute("SELECT fc, fs, duration, nfft, hop, nlevels, qmin, qmax, "
                   "vmin, vmax FROM iq_meta WHERE id=?", [cid]).fetchone()
     if not m:
-        c.close()
+        database.close()
         return jsonify({"error": "unknown capture"}), 404
     fc, fs, dur, nfft, hop, nlevels, qmin, qmax, dvmin, dvmax = m
     t0 = max(0.0, _num("t0", 0.0))
@@ -1337,7 +1608,7 @@ def iq_layer():
     f0 = max(fmin_full, _num("f0", fmin_full))
     f1 = min(fmax_full, _num("f1", fmax_full))
     if t1 <= t0 or f1 <= f0:
-        c.close()
+        database.close()
         return jsonify({"error": "empty window"}), 400
     span_cols0 = (t1 - t0) * fs / hop
     level = 0
@@ -1346,11 +1617,11 @@ def iq_layer():
     colw = hop * (1 << level) / fs                    # seconds per column
     c0 = int(t0 / colw)
     c1 = max(c0 + 1, int(math.ceil(t1 / colw)))
-    rows = c.execute(
+    rows = database.execute(
         "SELECT col0, ncols, chunk FROM iq_stft WHERE id=? AND level=? "
         "AND col0 < ? AND col0 + ncols > ? ORDER BY col0",
         [cid, level, c1, c0]).fetchall()
-    c.close()
+    database.close()
     if not rows:
         return jsonify({"error": "no data in window"}), 404
     mat = np.concatenate([np.frombuffer(r[2], dtype=np.uint8).reshape(r[1], nfft)

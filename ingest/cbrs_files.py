@@ -1,16 +1,19 @@
 """
-cbrs_files.py: finding CBRS export CSVs on disk.
+cbrs_files.py: finding and reading CBRS export CSVs.
 
 psd_ingest.py and pfp_ingest.py differ only in the filename pattern they look
 for and the shape of the numbers inside. Walking a directory, grouping matches
-by sensor and day, and explaining an empty result are the same job in both, so
-they live here once. Each caller passes its own compiled pattern.
+by sensor and day, explaining an empty result, and turning one CSV into
+int8-quantized rows are the same job in both, so they live here once. Each
+caller passes its own compiled pattern and its own quantization range.
 
 A matching filename must yield named groups `day`, `sensor` and `stat`.
 """
 
 import os
 import sys
+
+import numpy as np
 
 
 def walk_ext(root, exts):
@@ -121,3 +124,43 @@ def resolve_sensor(sensor, found, root):
             "\n  Available: " + ", ".join(sorted(found)))
     return None, (f"no CSVs for sensor '{sensor}' under "
                   f"{os.path.abspath(root)}." + hint)
+
+
+def read_quantized(path, csv_connection, nvals, qmin, qmax, unit, what, lead=()):
+    """One export CSV -> (epoch_seconds[n], {lead column: values}, uint8[n, nvals]).
+
+    Both deep layers store the same thing in the same way: a timestamp, zero or
+    more key columns, then a fixed number of power values per capture, quantized
+    to int8 over a per-layer range. PSD has 2250 bins and no key column; PFP has
+    560 frame positions keyed by `frequency`. Only those three numbers differ, so
+    the reading, the column-count check, the quantization and the out-of-range
+    warning are written once here.
+
+    `lead` names the columns between the timestamp and the values, in order.
+    """
+    res = csv_connection.execute("SELECT * FROM read_csv_auto(?, header=true)", [path])
+    cols = [c[0] for c in res.description]
+    nlead = 1 + len(lead)
+    if len(cols) - nlead != nvals:
+        after = " and ".join(["timestamp", *lead]) if lead else "the timestamp"
+        raise ValueError(f"expected {nvals} {what} columns after {after}, "
+                         f"found {len(cols) - nlead}. This file is not a "
+                         f"{nvals}-{'bin' if not lead else 'position'} CBRS "
+                         f"{'PSD' if not lead else 'PFP'} export.")
+    data = res.fetchnumpy()
+    timestamps = data[cols[0]].astype("datetime64[us]").astype("int64") / 1e6  # epoch sec
+    keys = {name: np.asarray(data[cols[1 + i]], dtype=np.float64)
+            for i, name in enumerate(lead)}
+    powers = np.stack([np.asarray(data[c], dtype=np.float64) for c in cols[nlead:]],
+                      axis=1)
+    quantized = np.clip(np.round((powers - qmin) / (qmax - qmin) * 255.0),
+                        0, 255).astype(np.uint8)
+    # Values outside the quantization range clip to a flat 0 or 255 instead of
+    # failing, so a file in the wrong units (dBm rather than dBm/Hz, say)
+    # ingests as a featureless band and looks like a rendering bug later. Name
+    # the file now, while it is still obvious which one it was.
+    out = int(np.count_nonzero((powers < qmin) | (powers > qmax)))
+    if out > powers.size // 100:
+        print(f"  WARN {os.path.basename(path)}: {100.0 * out / powers.size:.0f}% of "
+              f"values are outside [{qmin}, {qmax}] {unit} and were clipped flat")
+    return timestamps, keys, quantized

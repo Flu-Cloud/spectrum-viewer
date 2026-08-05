@@ -786,21 +786,55 @@ def capture_unit(fp):
     Without this, "the 3 smallest files" of a record full of captures is 3 tiny
     metadata files and no signal at all -- a download that succeeds and then
     ingests nothing.
+
+    A Rohde & Schwarz iq-tar capture is a whole directory (`<name>.iq/` holding
+    a .float32 of samples beside the .xml that describes them), so the
+    directory is the unit there.
     """
     low = fp.lower()
     for ext in (".sigmf-meta", ".sigmf-data"):
         if low.endswith(ext):
             return fp[:-len(ext)]
+    parent = posixpath.dirname(fp)
+    if parent.lower().endswith(".iq"):
+        return parent
     return fp
 
 
+# What a file extension means, best first. Bulk signal data outranks tabular
+# data, which outranks documentation. `--first N` means "the N smallest things
+# that actually carry data", so a record's 2 KB config CSV or its README never
+# outranks the 37 MB captures they describe.
+BULK_EXTS = (".sigmf-data", ".sigmf-meta", ".tdms", ".npy", ".duckdb", ".h5",
+             ".hdf5", ".mat", ".float32", ".zip", ".sdat", ".dat", ".bin")
+TABULAR_EXTS = (".csv", ".parquet")
+
+
+def unit_tier(group):
+    """0 = bulk signal data, 1 = tabular data, 2 = docs and sidecars."""
+    low = [f["filepath"].lower() for f in group]
+    if any(p.endswith(BULK_EXTS) for p in low):
+        return 0
+    if any(p.endswith(TABULAR_EXTS) for p in low):
+        return 1
+    return 2
+
+
 def smallest_units(files, n):
-    """The n smallest units of data, keeping multi-file captures whole."""
+    """The n smallest units of data, keeping multi-file captures whole.
+
+    Ordered by what a unit *is* before how big it is: the smallest file in a
+    record is very often a stray config table or a readme, and returning that
+    for `--first 1` is a download that succeeds and then ingests nothing. Worse
+    tiers are still reachable -- they sort last rather than being dropped -- so
+    a record made only of CSVs still yields its CSVs.
+    """
     units = {}
     for f in files:
         units.setdefault(capture_unit(f["filepath"]), []).append(f)
     ordered = sorted(units.values(),
-                     key=lambda g: (any(x["size"] is None for x in g),
+                     key=lambda g: (unit_tier(g),
+                                    any(x["size"] is None for x in g),
                                     sum(x["size"] or 0 for x in g),
                                     g[0]["filepath"]))
     return [f for g in ordered[:n] for f in g], len(units)

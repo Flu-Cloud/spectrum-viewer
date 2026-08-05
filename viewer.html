@@ -136,6 +136,7 @@
   /* Rotated mode: the bottom bar drives frequency, so the layer zones move here. */
   #timepfp { position: absolute; top: 9px; height: 6px; width: 0; background: var(--amber);
              opacity: .7; border-radius: 3px; pointer-events: none; }
+  #timepfp.wait { opacity: .22; }
   #timepsd { position: absolute; top: 9px; height: 6px; width: 0; background: var(--accent);
              opacity: .5; border-radius: 3px; pointer-events: none; }
   .knob { position: absolute; width: 16px; height: 16px; border-radius: 50%;
@@ -222,7 +223,7 @@
   </div>
   <div id="timebar" class="zoombar" tabindex="0" role="slider" aria-label="Time zoom"
        aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
-       title="Time zoom: knob at LEFT = full span; drag RIGHT to zoom into time. Drag the heatmap left/right to pan time."><div id="timetrack"></div><div id="timepsd"></div><div id="timepfp"></div><div id="timeknob" class="knob"></div></div>
+       title="Time zoom: knob at LEFT = full span; drag RIGHT to zoom into time. The blue zone = spans where the PSD detail layer takes over (under 3 days). The amber zone = spans where the PFP frame layer can appear (under 6 h; it also needs the frequency window down to one channel). Drag the heatmap left/right to pan time."><div id="timetrack"></div><div id="timepsd"></div><div id="timepfp"></div><div id="timeknob" class="knob"></div></div>
   <div id="sliderhint">time zoom · drag image to pan</div>
   <footer>
     <div><span class="k">Window</span><b id="winRange">-</b></div>
@@ -284,7 +285,8 @@ let psdAvail = false;                  // does the current sensor have PSD data?
 let summaryAvail = true;               // is spectrum.duckdb installed at all?
 let layerNote = '';                    // why the layer on screen is not the one asked for
 // Locked colour scales so colours stay fixed across zoom (reset on sensor change).
-let psdScale = null;                   // {vmin,vmax} for the PSD layer (per sensor)
+let psdScale = {};                     // stat -> {vmin,vmax} for the PSD layer (per sensor)
+let psdStats = ['max'];                // statistics with a PSD database for this sensor
 let pfpScale = {};                     // channel-freq -> {vmin,vmax} for PFP
 let summaryLock = {};                  // stat -> {lo,hi} for the summary
 // A layer is chosen by whichever axis has been zoomed far enough to make the
@@ -789,14 +791,19 @@ function cacheSet(url,v){ tileCache.set(url,v); if (tileCache.size>TILE_CACHE_MA
 function tileId(url, v){
   const u=new URL(url, location.origin), p=u.searchParams, j=v && v.j;
   const num=(k)=> p.get(k)!=null ? +p.get(k) : (j ? j[k] : null);
+  // stat is part of a PSD tile's identity: the colour match targets the
+  // displayed statistic's quantiles, so a max-matched tile is NOT a valid
+  // answer for a median request even over the identical window -- reusing one
+  // silently locked the median scale to max's numbers.
   return {path:u.pathname, sensor:p.get('sensor'), freq:p.get('freq'),
-          cmap:p.get('cmap'), vmin:num('vmin'), vmax:num('vmax')};
+          cmap:p.get('cmap'), stat:p.get('stat'), vmin:num('vmin'), vmax:num('vmax')};
 }
 // A request that names no scale is asking the server to choose one, and the
 // viewer adopts whatever comes back -- so any scale already on hand is a valid
 // answer. Only two *named* scales that disagree make tiles incompatible.
 function sameTile(a, b){
   return a.path===b.path && a.sensor===b.sensor && a.freq===b.freq && a.cmap===b.cmap
+      && a.stat===b.stat
       && (a.vmin==null || b.vmin==null || (a.vmin===b.vmin && a.vmax===b.vmax));
 }
 function tileWin(url){ const p=new URL(url, location.origin).searchParams;
@@ -835,18 +842,33 @@ function cacheFind(req){
 
 function iqUrl(w,h){ let u=`/api/iq_layer?id=${enc(iqCap.id)}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&f0=${viewF.f0}&f1=${viewF.f1}&cmap=${cmapName}`;
   if (iqScale) u+=`&vmin=${iqScale.vmin}&vmax=${iqScale.vmax}`; return u; }
+// The frame layer's colour scale is INHERITED, not chosen: PFP frame power and
+// the layers above it are the same dBm-per-10MHz axis, and letting the server
+// pick a fresh per-channel 2/98-percentile ramp made the handoff jump -- a
+// quiet channel that sat near-black on the PSD ramp came back near-white on its
+// own (measured: PSD legend [-82.8,-44.7] against a PFP legend of [-81.5,-78.2]
+// for the SAME dBm values). Seeding from the scale already on screen makes the
+// same power the same colour across the switch by construction. The server
+// percentiles remain the fallback for sensors with no layer above (PFP-only).
+function pfpSeedScale(){
+  if (psdScale[stat]) return {...psdScale[stat]};
+  if (summaryAvail && summaryLock[stat]) return {vmin:scale.lo, vmax:scale.hi};
+  return null;
+}
 function pfpUrl(ch,w,h){ let u=`/api/pfp_frame?sensor=${enc(sensor)}&freq=${ch}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&cmap=${cmapName}`;
+  if (!pfpScale[ch]){ const s=pfpSeedScale(); if (s) pfpScale[ch]=s; }
   if (pfpScale[ch]) u+=`&vmin=${pfpScale[ch].vmin}&vmax=${pfpScale[ch].vmax}`; return u; }
-function psdUrl(w,h){ let u=`/api/psd_layer?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&f0=${viewF.f0}&f1=${viewF.f1}&cmap=${cmapName}`;
-  if (psdScale) u+=`&vmin=${psdScale.vmin}&vmax=${psdScale.vmax}`; return u; }
+function psdUrl(w,h){ let u=`/api/psd_layer?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&f0=${viewF.f0}&f1=${viewF.f1}&cmap=${cmapName}&stat=${stat}`;
+  if (psdScale[stat]) u+=`&vmin=${psdScale[stat].vmin}&vmax=${psdScale[stat].vmax}`; return u; }
 function sumUrl(w){ return `/api/heatmap?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&width=${w}`; }
 
 function applyIq(j, im){ iqImg=im; iqView=j; layerMode='iq'; if(!iqScale) iqScale={vmin:j.vmin,vmax:j.vmax};
   document.getElementById('lo').textContent=iqScale.vmin.toFixed(0); document.getElementById('hi').textContent=iqScale.vmax.toFixed(0);
   setLegendUnit('dBm'); updateStatButtons(); drawCrisp(); updateReadout(); }
 function applySummary(j){ data=j; layerMode='summary'; autoScale(); setLegendUnit('dBm'); updateStatButtons(); drawCrisp(); updateReadout(); }
-function applyPsd(j, im){ psdImg=im; psdView=j; layerMode='psd'; if(!psdScale) psdScale={vmin:j.vmin,vmax:j.vmax};
-  document.getElementById('lo').textContent=psdScale.vmin.toFixed(0); document.getElementById('hi').textContent=psdScale.vmax.toFixed(0);
+function applyPsd(j, im){ psdImg=im; psdView=j; layerMode='psd'; if(!psdScale[stat]) psdScale[stat]={vmin:j.vmin,vmax:j.vmax};
+  const sc=psdScale[stat];
+  document.getElementById('lo').textContent=sc.vmin.toFixed(0); document.getElementById('hi').textContent=sc.vmax.toFixed(0);
   setLegendUnit('dBm'); updateStatButtons(); drawCrisp(); updateReadout(); }
 function applyPfp(j, im, ch){ pfpImg=im; pfpView=j; pfpFrameMs=j.frame_ms; layerMode='pfp'; if(!pfpScale[ch]) pfpScale[ch]={vmin:j.vmin,vmax:j.vmax};
   const sc=pfpScale[ch]; document.getElementById('lo').textContent=sc.vmin.toFixed(0); document.getElementById('hi').textContent=sc.vmax.toFixed(0);
@@ -868,8 +890,13 @@ function buildReq(){
   // And with no summary layer installed at all (PSD/PFP ingested without a
   // Summaries export, which is a normal shape for the published data) PSD is
   // the zoomed-out view, not something to fall back from.
-  if (psdAvail && (!summaryAvail || span<=PSD_THRESHOLD || freqSpan<=PSD_FREQ_THRESHOLD))
+  if (psdAvail && (!summaryAvail || span<=PSD_THRESHOLD || freqSpan<=PSD_FREQ_THRESHOLD)){
+    // Entering PSD with a statistic that has no database would 503 into the
+    // summary fallback and the layer would appear broken. Snap to max -- the
+    // button row updates with it, so what is selected is what is shown.
+    if (!psdStats.includes(stat)) setStat('max');
     return {kind:'psd', url:psdUrl(w,h)};
+  }
   return {kind:'summary', url:sumUrl(w)};
 }
 // Why the frame layer is not showing even though the frequency window is down
@@ -1173,10 +1200,19 @@ function layoutFreqSlider(){   // LEFT bar: screen-vertical zoom
                                             : ((viewF.f1-viewF.f0)/1e6).toFixed(2)+' MHz span');
   sl.setAttribute('aria-label', rotated ? 'Time zoom' : 'Frequency zoom');
   document.getElementById('freqlabel').textContent = rotated ? 'time zoom' : 'freq zoom';
-  if (rotated){                 // freq zones live on the bottom bar in this mode
+  if (rotated){                 // this bar controls TIME here: show the time zones
     const pfpEl=document.getElementById('freqpfp'), psdEl=document.getElementById('freqpsd');
-    if (pfpEl) pfpEl.style.height='0px';
-    if (psdEl) psdEl.style.height='0px';
+    if (pfpEl && psdEl){
+      if (mode==='iq'){ pfpEl.style.height='0px'; psdEl.style.height='0px'; return; }
+      const y = span => (1-Math.max(0,Math.min(1,tspanToZoom(span))))*(ph-knobH)+knobH/2;
+      const yPfp = Math.max(0, y(PFP_TIME_THRESHOLD)), yPsd = Math.max(0, y(PSD_THRESHOLD));
+      pfpEl.style.top='0px';
+      pfpEl.style.height=(!pfpAvail) ? '0px' : yPfp+'px';
+      pfpEl.classList.toggle('wait',
+        (viewF.f1-viewF.f0) > ONE_CHANNEL || !channelInView());
+      psdEl.style.top=yPfp+'px';
+      psdEl.style.height=(!psdAvail) ? '0px' : Math.max(0, yPsd-yPfp)+'px';
+    }
     return;
   }
   // Layer zones on the track, so the control shows where each deeper layer
@@ -1269,15 +1305,29 @@ function layoutTimeSlider(){   // BOTTOM bar: screen-horizontal zoom
   tb.setAttribute('aria-label', rotated ? 'Frequency zoom' : 'Time zoom');
   const hint=document.getElementById('sliderhint');
   if (hint) hint.textContent = rotated ? 'freq zoom · drag image to pan' : 'time zoom · drag image to pan';
-  // Layer zones (PSD blue / PFP amber) follow the frequency control here.
+  // Layer zones on this bar, for whichever axis it controls: frequency zones
+  // in rotated mode (as before), TIME zones otherwise -- blue where zooming in
+  // hands off to PSD (span <= 3 d), amber where the PFP frame layer can appear
+  // (span <= 6 h). The amber dims until the frequency window is down to one
+  // channel, because the frame layer needs both conditions -- same language as
+  // the frequency slider has always spoken.
   const tpsd=document.getElementById('timepsd'), tpfp=document.getElementById('timepfp');
   if (tpsd && tpfp){
-    if (rotated && mode!=='iq'){
+    if (mode==='iq'){ tpfp.style.width='0px'; tpsd.style.width='0px'; }
+    else if (rotated){
       const x = span => Math.max(0,Math.min(1,spanToZoom(span)))*(w-16)+8;
       const xPfp=x(ONE_CHANNEL), xPsd=x(PSD_FREQ_THRESHOLD);
       tpfp.style.left=xPfp+'px'; tpfp.style.width=(pfpAvail? Math.max(0,w-xPfp-2):0)+'px';
+      tpfp.classList.toggle('wait', (view.t1-view.t0) > PFP_TIME_THRESHOLD);
       tpsd.style.left=xPsd+'px'; tpsd.style.width=(psdAvail? Math.max(0,xPfp-xPsd):0)+'px';
-    } else { tpfp.style.width='0px'; tpsd.style.width='0px'; }
+    } else {
+      const x = span => Math.max(0,Math.min(1,tspanToZoom(span)))*(w-16)+8;
+      const xPsd=x(PSD_THRESHOLD), xPfp=x(PFP_TIME_THRESHOLD);
+      tpfp.style.left=xPfp+'px'; tpfp.style.width=(pfpAvail? Math.max(0,w-xPfp-2):0)+'px';
+      tpfp.classList.toggle('wait',
+        (viewF.f1-viewF.f0) > ONE_CHANNEL || !channelInView());
+      tpsd.style.left=xPsd+'px'; tpsd.style.width=(psdAvail? Math.max(0,xPfp-xPsd):0)+'px';
+    }
   }
 }
 function setTimeZoom(z){
@@ -1312,10 +1362,18 @@ function setTimeZoom(z){
 })();
 
 // ---- Controls ---------------------------------------------------------
+function setStat(s){
+  stat = s;
+  document.querySelectorAll('[data-stat]').forEach(x=>{
+    const on = x.dataset.stat===s;
+    x.classList.toggle('active', on); x.setAttribute('aria-pressed', String(on));
+  });
+}
 document.querySelectorAll('[data-stat]').forEach(b=>b.addEventListener('click', ()=>{
-  document.querySelectorAll('[data-stat]').forEach(x=>{ x.classList.remove('active'); x.setAttribute('aria-pressed','false'); });
-  b.classList.add('active'); b.setAttribute('aria-pressed','true'); stat=b.dataset.stat;
-  if (data){ autoScale(); drawCrisp(); }
+  if (b.disabled) return;
+  setStat(b.dataset.stat);
+  if (layerMode==='summary'){ if (data){ autoScale(); drawCrisp(); } }
+  else requestData();   // PSD: the stat is in the tile URL; fetch that database's tiles
 }));
 // ---- Source/mode switcher: CBRS monitoring <-> independent IQ captures ----
 function clearLayers(){ psdImg=null; psdView=null; pfpImg=null; pfpView=null; iqImg=null; iqView=null; cacheView=null;
@@ -1357,7 +1415,7 @@ document.getElementById('sensor').addEventListener('change', async e=>{
   sensor=e.target.value; const s=meta.sensors.find(x=>x.sensor===sensor);
   meta.tmin=s.t_min; meta.tmax=s.t_max; view={t0:s.t_min,t1:s.t_max}; cacheView=null;
   psdImg=null; psdView=null; pfpImg=null; pfpView=null; layerMode='summary'; resetFreq(); layoutTimeSlider();
-  psdScale=null; pfpScale={}; summaryLock={};        // recompute locked colours for the new sensor
+  psdScale={}; pfpScale={}; summaryLock={};          // recompute locked colours for the new sensor
   warmCancel();                  // the old sensor's prefetch is now dead weight
   requestData();                                     // paint new sensor's summary now
   checkPsd(); checkPfp();                             // availability flags load in parallel
@@ -1648,13 +1706,22 @@ function setLegendUnit(u){ const e=document.getElementById('unit'); if (e) e.tex
 // PSD/PFP layers are stored max-only; median/mean apply to the summary layer
 // only, so disable them (greyed) outside summary mode to keep the toggle honest.
 function updateStatButtons(){
-  const summaryMode = (layerMode==='summary');
-  document.querySelector('.seg').classList.toggle('max-only', !summaryMode);
+  // Summary always offers all three (they live in the same payload). The PSD
+  // layer offers whichever statistics have a database on disk -- psd.duckdb is
+  // max; psd_ingest.py --stat median/mean builds the siblings. PFP stays
+  // max-only: only the max_peak trace is ingested.
+  const perStat = s => layerMode==='summary' ? true
+                     : layerMode==='psd' ? psdStats.includes(s)
+                     : s==='max';
+  let anyOff = false;
   document.querySelectorAll('[data-stat]').forEach(b=>{
-    if (b.dataset.stat==='max') return;
-    b.disabled = !summaryMode;
-    b.title = summaryMode ? '' : 'PSD / PFP layers are max-only';
+    const on = perStat(b.dataset.stat);
+    b.disabled = !on; anyOff = anyOff || !on;
+    b.title = on ? '' :
+      layerMode==='psd' ? `no ${b.dataset.stat} PSD database -- build one with: python ingest/psd_ingest.py <sensor> --stat ${b.dataset.stat}`
+                        : 'the PFP layer stores the max_peak statistic only';
   });
+  document.querySelector('.seg').classList.toggle('max-only', anyOff);
 }
 
 
@@ -1726,7 +1793,12 @@ async function loadIqIndex(){
 }
 async function checkPsd(){
   psdAvail = false;
-  try { const j = await (await fetch('/api/psd_meta?sensor='+enc(sensor))).json(); if (mode==='cbrs') psdAvail = !!j.has; }
+  try { const j = await (await fetch('/api/psd_meta?sensor='+enc(sensor))).json();
+        if (mode==='cbrs'){ psdAvail = !!j.has; psdStats = j.stats || ['max'];
+          // A stat whose database vanished (sensor change) must not stay
+          // selected: tiles for it would 503. Fall back to max quietly.
+          if (layerMode==='psd' && !psdStats.includes(stat)) setStat('max');
+          updateStatButtons(); } }
   // A probe that fails leaves the layer switched off for this sensor with
   // nothing on screen to say so, which is indistinguishable from there being
   // no PSD data at all. Say it once, in the console and in the readout.

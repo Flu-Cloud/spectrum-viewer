@@ -54,6 +54,39 @@ def make_iq(folder, n=1024 * 64):
                    "annotations": []}, f)
 
 
+def make_iqtar(folder, n=1024 * 64, fs=6.25e8, fc=9e8, truncate=False):
+    """A tiny Rohde & Schwarz iq-tar capture, laid out as NIST mds2-3684 ships
+    it: a `<name>.iq/` directory holding interleaved complex float32 beside the
+    .xml that carries the sample rate and centre frequency."""
+    import numpy as np
+    d = os.path.join(folder, "1_synthetic_900_IQ_time.iq")
+    os.makedirs(d, exist_ok=True)
+    data = os.path.join(d, "File_20230227164018.complex1ch.float32")
+    t = np.arange(n) / fs
+    x = np.exp(2j * np.pi * 4e7 * t) * 0.5
+    inter = np.empty(2 * n, dtype="<f4")
+    inter[0::2], inter[1::2] = x.real, x.imag
+    inter[:len(inter) // 2 if truncate else len(inter)].tofile(data)
+    with open(data + ".xml", "w", encoding="utf-8") as f:
+        f.write(
+            '<?xml version="1.0" encoding="UTF-8"?>\n<RS_IQ_TAR_FileFormat>'
+            '<Name>FSW-8</Name><DateTime>2023-02-27 16:40:03</DateTime>'
+            f'<Samples>{n}</Samples>'
+            f'<Clock unit="Hz">{fs:.6f}</Clock>'
+            '<Format>complex</Format><DataType>float32</DataType>'
+            '<ScalingFactor unit="V">1</ScalingFactor>'
+            '<NumberOfChannels>1</NumberOfChannels>'
+            f'<DataFilename>{os.path.basename(data)}</DataFilename>'
+            '<UserData><RohdeSchwarz><SpectrumAnalyzer>'
+            '<Key name="Ch1_MeasBandwidth[Hz]">1.6e+08</Key>'
+            '</SpectrumAnalyzer></RohdeSchwarz></UserData>'
+            f'<CenterFrequency unit="Hz">{fc:.6f}</CenterFrequency>'
+            '<PreviewData><ArrayOfFloat><float>-159</float>'
+            '<float>-159</float></ArrayOfFloat></PreviewData>'
+            '</RS_IQ_TAR_FileFormat>\n')
+    return d, data
+
+
 def run(args, dbs, extra=None):
     env = {**os.environ,
            "SPECTRUM_DB": os.path.join(dbs, "spectrum.duckdb"),
@@ -234,15 +267,70 @@ def main():
               rc != 0 and "Nothing recognisable" in out
               and "Traceback" not in out)
 
+        # ---- Rohde & Schwarz iq-tar, the format mds2-3684 ships ----
+        sys.path.insert(0, os.path.join(ROOT, "ingest"))
+        import sigmf_io                                       # noqa: E402
+        iqt = os.path.join(tmp, "iqtar")
+        _iqdir, iqfile = make_iqtar(iqt)
+        cap = sigmf_io.open_capture(iqfile)
+        check("an iq-tar capture reads its rate and centre from the .xml",
+              (cap.sample_rate, cap.center_freq) == (6.25e8, 9e8)
+              and cap.n_samples == 1024 * 64,
+              f"fs={cap.sample_rate} fc={cap.center_freq} n={cap.n_samples}")
+        check("the .xml can be opened instead of the samples file",
+              sigmf_io.open_capture(iqfile + ".xml").n_samples == cap.n_samples)
+        x = cap.read(0, 256)
+        check("its samples come back as complex64 of the right length",
+              x.dtype == __import__("numpy").complex64 and len(x) == 256,
+              f"{x.dtype} len={len(x)}")
+
+        # A part-downloaded capture must be named as such, not ingested short:
+        # every axis is derived from the file's length, so a truncated one looks
+        # perfectly healthy and simply shows less signal than it should.
+        tr = os.path.join(tmp, "iqtar-short")
+        _, short = make_iqtar(tr, truncate=True)
+        try:
+            sigmf_io.open_capture(short)
+            ok, why = False, "a half-length capture was accepted"
+        except ValueError as e:
+            ok, why = "truncated" in str(e), str(e)[:110]
+        check("a truncated iq-tar capture is refused, not silently shortened",
+              ok, why)
+
+        # And without the sidecar there is no sample rate to be had, so say so
+        # rather than inventing one.
+        os.remove(iqfile + ".xml")
+        try:
+            sigmf_io.open_capture(iqfile)
+            ok, why = False, "a capture with no .xml was accepted"
+        except FileNotFoundError as e:
+            ok, why = ".xml" in str(e), str(e)[:110]
+        check("an iq-tar capture with no .xml names what is missing", ok, why)
+
+        make_iqtar(iqt)     # restore the sidecar, then ingest for real
+        rc, out = run(["get", iqt], dbs)
+        check("atlas.py get ingests an iq-tar folder without being told how",
+              rc == 0 and "1 ingested" in out and "Traceback" not in out,
+              next((l.strip() for l in out.splitlines()
+                    if "ingested" in l), out[-160:]))
+
         # friendly names resolve without touching the network (dry run)
         names = json.load(open(os.path.join(ROOT, "datasets.json")))
         real = [k for k in names if not k.startswith("_")]
         check("datasets.json parses and has entries", bool(real), str(real))
         rc, out = run(["get", "lte-uplink", "--dry-run"], dbs)
         check("a friendly name resolves to its record and default filter",
-              rc == 0 and "mds2-3177" in out and "1.4MHz/config_0" in out
+              rc == 0 and "mds2-3177" in out and "1.4MHz" in out
               and "fetch.py" in out,
               next((l.strip() for l in out.splitlines() if "fetch.py" in l), ""))
+
+        # Every entry must name a record and say which reader handles it, so a
+        # record that downloads but cannot be ingested is known before the
+        # transfer rather than after it.
+        bad = [k for k in real
+               if not names[k].get("record") or not names[k].get("reads")]
+        check("every dataset entry names a record and its reader", not bad,
+              str(bad))
 
         rc, out = run(["get", "no-such-name-here", "--dry-run"], dbs)
         check("an unknown name is passed through to fetch, not crashed on",

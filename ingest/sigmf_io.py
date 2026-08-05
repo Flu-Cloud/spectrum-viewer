@@ -5,6 +5,8 @@ Gives iq_ingest.py / serve.py one interface over the formats the NIST
 "I/Q Data Sets" actually ship:
     .sigmf-meta / .sigmf-data   SigMF (JSON sidecar + raw interleaved I/Q)
     .tdms                       NI LabVIEW (mds2-3177 High-SNR LTE uplink)
+    .complex1ch.float32         Rohde & Schwarz iq-tar, samples + .xml sidecar
+                                (mds2-3226 microwave oven, mds2-3684 TIG welding)
     .npy / .mat                 fallback for datasets shipping numpy/MATLAB
 
 open_capture(path) -> IQCapture with:
@@ -161,6 +163,109 @@ class TdmsCapture(IQCapture):
         return ((i + 1j * q) * self._scale).astype(np.complex64)
 
 
+class IqTarCapture(IQCapture):
+    """Rohde & Schwarz iq-tar, as shipped extracted by NIST mds2-3226/mds2-3684.
+
+    Each capture is a `<name>.iq/` directory holding one
+    `File_<timestamp>.complex1ch.float32` of interleaved complex float32 beside
+    the `.xml` that describes it. The XML is the only place the sample rate and
+    centre frequency exist, so it is required; without it the file is an
+    undifferentiated wall of floats.
+
+    Relevant elements, as written by the instrument (an FSW-8 here):
+        <Samples>50000000</Samples>
+        <Clock unit="Hz">625000000.000000</Clock>
+        <Format>complex</Format>  <DataType>float32</DataType>
+        <ScalingFactor unit="V">1</ScalingFactor>
+        <NumberOfChannels>1</NumberOfChannels>
+        <CenterFrequency unit="Hz">900000000.000000</CenterFrequency>
+    The file also ends with a long <PreviewData> block of <float> elements --
+    an instrument-drawn thumbnail, not samples, and ignored here.
+    """
+
+    SUFFIX = ".complex1ch.float32"
+
+    def __init__(self, path):
+        import xml.etree.ElementTree as ET
+        data_path, xml_path = self._pair(path)
+        try:
+            root = ET.parse(xml_path).getroot()
+        except ET.ParseError as e:
+            raise ValueError(f"{xml_path}: not readable as iq-tar XML ({e})")
+
+        def first(tag, default=None):
+            for el in root.iter(tag):
+                return (el.text or "").strip()
+            return default
+
+        fmt = (first("Format") or "").lower()
+        dtype = (first("DataType") or "").lower()
+        nch = first("NumberOfChannels", "1")
+        if fmt != "complex" or dtype != "float32":
+            raise ValueError(
+                f"{xml_path}: this reader handles complex/float32 iq-tar, not "
+                f"{fmt or '?'}/{dtype or '?'}")
+        if nch not in ("1", None, ""):
+            raise ValueError(f"{xml_path}: {nch} channels; only single-channel "
+                             "iq-tar captures are supported")
+        fs = first("Clock")
+        if not fs:
+            raise ValueError(f"{xml_path}: no <Clock>, so the sample rate is "
+                             "unknown")
+        declared = int(float(first("Samples") or 0))
+        scale = float(first("ScalingFactor") or 1.0)
+
+        # One complex sample is two float32s. A part-downloaded file is simply
+        # shorter and nothing downstream would notice -- duration and the time
+        # axis are both derived from the length -- so compare against the count
+        # the instrument recorded and say so plainly instead.
+        itemsize = 2 * np.dtype(np.float32).itemsize
+        fsize = os.path.getsize(data_path)
+        if fsize % itemsize:
+            raise ValueError(f"{data_path}: size {fsize} is not a whole number "
+                             f"of complex float32 samples")
+        n = fsize // itemsize
+        if declared and n < declared:
+            raise ValueError(
+                f"{data_path}: truncated -- the XML declares {declared} "
+                f"samples but the file holds {n} ({100.0 * n / declared:.1f}%). "
+                "Re-download this capture.")
+        self._mm = np.memmap(data_path, dtype="<f4", mode="r")
+        self._scale = scale
+        hdr = {"instrument": first("Name"), "recorded": first("DateTime"),
+               "bandwidth_hz": None}
+        for el in root.iter("Key"):
+            if (el.get("name") or "").endswith("MeasBandwidth[Hz]"):
+                hdr["bandwidth_hz"] = (el.text or "").strip()
+                break
+        super().__init__(data_path, os.path.basename(os.path.dirname(data_path))
+                         or os.path.basename(data_path),
+                         float(fs), float(first("CenterFrequency") or 0.0),
+                         "iqtar_cf32", n, [{"iqtar": hdr}])
+
+    @classmethod
+    def _pair(cls, path):
+        """-> (samples file, xml file), given either one."""
+        if path.lower().endswith(".xml"):
+            data = path[:-len(".xml")]
+            if not os.path.exists(data):
+                raise FileNotFoundError(
+                    f"{data}: the samples file this XML describes is missing")
+            return data, path
+        xml = path + ".xml"
+        if not os.path.exists(xml):
+            raise FileNotFoundError(
+                f"{xml}: iq-tar captures need the .xml beside the samples for "
+                "the sample rate and centre frequency")
+        return path, xml
+
+    def read(self, start, end):
+        raw = np.asarray(self._mm[2 * start:2 * end], dtype=np.float32)
+        if self._scale != 1.0:
+            raw = raw * self._scale
+        return (raw[0::2] + 1j * raw[1::2]).astype(np.complex64)
+
+
 class ArrayCapture(IQCapture):
     """Fallback for .npy (complex array), memory-mapped."""
 
@@ -185,6 +290,9 @@ def open_capture(path, sample_rate=None, center_freq=None):
         return SigMFCapture(path[:-len(".sigmf-data")] + ".sigmf-meta")
     if low.endswith(".tdms"):
         return TdmsCapture(path, center_freq=center_freq)
+    if low.endswith(IqTarCapture.SUFFIX) or low.endswith(
+            IqTarCapture.SUFFIX + ".xml"):
+        return IqTarCapture(path)
     if low.endswith(".npy"):
         return ArrayCapture(path, sample_rate, center_freq or 0.0)
     if low.endswith(".mat"):

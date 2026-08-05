@@ -59,8 +59,8 @@ def _missing(src_p):
     return True
 
 
-def _already_chunked(con, table):
-    have = {r[0] for r in con.execute(
+def _already_chunked(connection, table):
+    have = {r[0] for r in connection.execute(
         "SELECT table_name FROM information_schema.tables").fetchall()}
     return table in have
 

@@ -23,12 +23,18 @@ Two things worth being precise about:
     each derived exactly from the one below it, no re-reading. A mean or median
     layer could NOT be built this way.
 
-Additive and resumable: it only ever creates and fills the psd_lvl table,
-records finished sensors, and leaves every existing table untouched. Stop
-serve.py first -- DuckDB allows one writer at a time.
+Additive and INCREMENTAL: each sensor records how far through time it has been
+summarised, so running this again after next month's ingest reads only the new
+captures instead of the whole sensor. Re-run it after every ingest -- serve.py
+will not draw from a level beyond the range it actually covers, so forgetting to
+means wide windows quietly go back to being slow, not to being wrong.
 
-    py build_psd_levels.py
+Every existing table is left untouched. Stop serve.py first -- DuckDB allows one
+writer at a time.
+
+    py build_psd_levels.py                  # build or top up every sensor
     py build_psd_levels.py --sensor HU
+    py build_psd_levels.py --rebuild        # from scratch
 """
 import argparse
 import os
@@ -72,16 +78,20 @@ def log(m):
     print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
 
 
-def _tables(con):
-    return {r[0] for r in con.execute(
+def _tables(connection):
+    return {r[0] for r in connection.execute(
         "SELECT table_name FROM information_schema.tables").fetchall()}
 
 
-def _iter_captures(con, sensor, kind):
-    """(times, spectra) batches for one sensor, whichever schema is on disk."""
+def _iter_captures(connection, sensor, kind, since):
+    """(times, spectra) batches for one sensor, whichever schema is on disk.
+
+    `since` skips whole chunks that end before it; the caller still masks the
+    individual captures, because a chunk straddling the boundary carries both.
+    """
     if kind == "chunk":
-        cur = con.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? "
-                          "ORDER BY t0", [sensor])
+        cur = connection.execute("SELECT n, times, specs FROM psd_chunk WHERE sensor=? "
+                          "AND t1>=? ORDER BY t0", [sensor, since])
         while True:
             rows = cur.fetchmany(64)
             if not rows:
@@ -91,8 +101,8 @@ def _iter_captures(con, sensor, kind):
                 mat = np.frombuffer(zlib.decompress(sb), np.uint8).reshape(n, NF)
                 yield ts, mat
     else:
-        cur = con.execute("SELECT t, spec FROM psd WHERE sensor=? ORDER BY t",
-                          [sensor])
+        cur = connection.execute("SELECT t, spec FROM psd WHERE sensor=? AND t>=? "
+                          "ORDER BY t", [sensor, since])
         while True:
             rows = cur.fetchmany(4096)
             if not rows:
@@ -102,16 +112,22 @@ def _iter_captures(con, sensor, kind):
             yield ts, mat
 
 
-def build_sensor(con, sensor, kind):
-    """-> number of level rows written for this sensor."""
+def build_sensor(connection, sensor, kind, since):
+    """-> (rows written, latest capture time seen), from `since` onwards."""
     t_start = time.time()
     # Bin-wise max per BASE bucket, accumulated in memory. One bucket is 2250
     # bytes; a year at 1 h is 8760 of them, under 20 MB, so a dict is fine and
     # avoids a second pass over the captures.
     buckets = {}
     ncap = 0
-    for ts, mat in _iter_captures(con, sensor, kind):
+    tmax = since
+    for ts, mat in _iter_captures(connection, sensor, kind, since):
+        keep = ts >= since
+        if not keep.any():
+            continue
+        ts, mat = ts[keep], mat[keep]
         ncap += len(ts)
+        tmax = max(tmax, float(ts[-1]))
         keys = (ts // BASE).astype(np.int64)
         for k in np.unique(keys):
             sel = mat[keys == k]
@@ -119,12 +135,17 @@ def build_sensor(con, sensor, kind):
             prev = buckets.get(k)
             buckets[k] = m if prev is None else np.maximum(prev, m)
     if not buckets:
-        return 0
+        return 0, since
 
     written = 0
-    con.execute("DELETE FROM psd_lvl WHERE sensor=?", [sensor])   # partial redo
+    # Only the range being rebuilt is cleared. `since` is aligned down to the
+    # COARSEST bucket by the caller, so every coarse bucket that gets rewritten
+    # here is fully covered by the base buckets recomputed above -- otherwise a
+    # coarse row spanning the boundary would be replaced by one summarising only
+    # the new half of its own time range.
+    connection.execute("DELETE FROM psd_lvl WHERE sensor=? AND t>=?", [sensor, int(since)])
     cur_level = {k * BASE: v for k, v in buckets.items()}
-    con.executemany("INSERT INTO psd_lvl VALUES (?,?,?,?)",
+    connection.executemany("INSERT INTO psd_lvl VALUES (?,?,?,?)",
                     [(sensor, BASE, int(t), v.tobytes())
                      for t, v in sorted(cur_level.items())])
     written += len(cur_level)
@@ -138,7 +159,7 @@ def build_sensor(con, sensor, kind):
             k = (t // bucket) * bucket
             cur = nxt.get(k)
             nxt[k] = v if cur is None else np.maximum(cur, v)
-        con.executemany("INSERT INTO psd_lvl VALUES (?,?,?,?)",
+        connection.executemany("INSERT INTO psd_lvl VALUES (?,?,?,?)",
                         [(sensor, bucket, int(t), v.tobytes())
                          for t, v in sorted(nxt.items())])
         written += len(nxt)
@@ -146,7 +167,7 @@ def build_sensor(con, sensor, kind):
 
     log(f"  {sensor}: {ncap:,} captures -> {written:,} level rows "
         f"in {time.time()-t_start:.0f}s")
-    return written
+    return written, tmax
 
 
 def main():
@@ -158,7 +179,16 @@ def main():
     ap.add_argument("--coarse", action="store_true",
                     help="skip the finest (10 min) level: much smaller on disk, "
                          "but mid-range spans then read the captures as before")
+    ap.add_argument("--stat", default="max", choices=("max", "median", "mean"),
+                    help="which statistic's PSD database to summarise "
+                         "(median/mean live in psd_<stat>.duckdb)")
     args = ap.parse_args()
+
+    global PSD_DB
+    if args.stat != "max":
+        PSD_DB = os.path.join(os.path.dirname(PSD_DB) or ".",
+                              f"psd_{args.stat}.duckdb")
+        log(f"stat '{args.stat}' -> {os.path.basename(PSD_DB)}")
 
     if args.coarse:
         BASE, DERIVED = DERIVED[0], DERIVED[1:]
@@ -167,24 +197,36 @@ def main():
     if not os.path.exists(PSD_DB):
         sys.exit(f"{PSD_DB} not found. Build it with ingest/psd_ingest.py first.")
     try:
-        con = duckdb.connect(PSD_DB)
+        connection = duckdb.connect(PSD_DB)
     except Exception as e:
         sys.exit(f"cannot open {os.path.basename(PSD_DB)} for writing: {e}\n"
                  "  Stop serve.py (and any other reader) and run this again -- "
                  "DuckDB allows one writer at a time.")
 
-    have = _tables(con)
+    have = _tables(connection)
     kind = ("chunk" if "psd_chunk" in have
             else "rows" if "psd" in have else None)
     if kind is None:
         sys.exit(f"{os.path.basename(PSD_DB)} has no PSD table to summarise.")
 
-    con.execute("""CREATE TABLE IF NOT EXISTS psd_lvl (
+    connection.execute("""CREATE TABLE IF NOT EXISTS psd_lvl (
         sensor VARCHAR, bucket INTEGER, t BIGINT, smax BLOB)""")
-    con.execute("CREATE TABLE IF NOT EXISTS psd_lvl_done (sensor VARCHAR)")
+    # built_through is what makes a re-run incremental. An older build wrote this
+    # table with the sensor name alone, which made a re-run after new data skip
+    # the sensor and leave the levels short of the captures; drop that shape and
+    # rebuild rather than guess how far it had got.
+    cols = ({r[1] for r in connection.execute(
+                "PRAGMA table_info(psd_lvl_done)").fetchall()}
+            if "psd_lvl_done" in _tables(connection) else set())
+    if cols and "built_through" not in cols:
+        log("  older progress table found; rebuilding the levels once")
+        connection.execute("DROP TABLE psd_lvl_done")
+        connection.execute("DELETE FROM psd_lvl")
+    connection.execute("CREATE TABLE IF NOT EXISTS psd_lvl_done ("
+                "sensor VARCHAR, built_through DOUBLE)")
 
     src = "psd_chunk" if kind == "chunk" else "psd"
-    sensors = [r[0] for r in con.execute(
+    sensors = [r[0] for r in connection.execute(
         f"SELECT DISTINCT sensor FROM {src} ORDER BY 1").fetchall()]
     if args.sensor:
         if args.sensor not in sensors:
@@ -192,26 +234,31 @@ def main():
                      + ", ".join(sensors))
         sensors = [args.sensor]
     if args.rebuild:
-        con.execute("DELETE FROM psd_lvl_done"
+        connection.execute("DELETE FROM psd_lvl_done"
                     + ("" if args.sensor is None else " WHERE sensor=?"),
                     [] if args.sensor is None else [args.sensor])
 
-    done = {r[0] for r in con.execute("SELECT sensor FROM psd_lvl_done").fetchall()}
+    done = {r[0]: r[1] for r in connection.execute(
+        "SELECT sensor, built_through FROM psd_lvl_done").fetchall()}
     log(f"{os.path.basename(PSD_DB)} ({kind} schema): {len(sensors)} sensor(s), "
         f"levels {', '.join(str(b) for b in LEVELS)}s")
     total = 0
+    coarsest = max(LEVELS)
     for s in sensors:
-        if s in done:
-            log(f"  {s}: already built (--rebuild to redo)")
-            continue
-        n = build_sensor(con, s, kind)
+        prev = done.get(s)
+        # Realign to the coarsest bucket boundary and redo from there, so the one
+        # partial bucket at the end of the last run is completed rather than left
+        # summarising half its own time range.
+        since = -1e18 if prev is None else (prev // coarsest) * coarsest
+        n, tmax = build_sensor(connection, s, kind, since)
         if n == 0:
-            log(f"  {s}: no captures, skipped")
+            log(f"  {s}: nothing new" if prev is not None else f"  {s}: no captures")
             continue
-        con.execute("INSERT INTO psd_lvl_done VALUES (?)", [s])
+        connection.execute("DELETE FROM psd_lvl_done WHERE sensor=?", [s])
+        connection.execute("INSERT INTO psd_lvl_done VALUES (?,?)", [s, float(tmax)])
         total += n
-    rows = con.execute("SELECT count(*) FROM psd_lvl").fetchone()[0]
-    con.close()
+    rows = connection.execute("SELECT count(*) FROM psd_lvl").fetchone()[0]
+    connection.close()
     log(f"DONE: {total:,} row(s) added this run; psd_lvl holds {rows:,}. "
         f"DB is now {os.path.getsize(PSD_DB)/1e9:.2f} GB")
     log("serve.py picks the levels up automatically on its next start.")

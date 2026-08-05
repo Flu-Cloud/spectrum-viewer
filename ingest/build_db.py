@@ -94,12 +94,12 @@ def main():
     wal_path = DB_PATH + ".wal"
     if os.path.exists(wal_path):
         os.remove(wal_path)
-    con = duckdb.connect(DB_PATH)
+    connection = duckdb.connect(DB_PATH)
     # Be polite with RAM on a laptop; DuckDB will spill to disk if needed.
-    con.execute("PRAGMA memory_limit='3GB'")
-    con.execute("PRAGMA threads=4")
+    connection.execute("PRAGMA memory_limit='3GB'")
+    connection.execute("PRAGMA threads=4")
 
-    con.execute("""
+    connection.execute("""
         CREATE TABLE raw (
             sensor VARCHAR,   -- sensor_name
             freq   DOUBLE,    -- channel_frequency_mhz
@@ -117,7 +117,7 @@ def main():
         name = os.path.basename(f)
         # read_csv_auto figures out the schema; we only pull the 6 columns we need.
         try:
-            con.execute("""
+            connection.execute("""
                 INSERT INTO raw
                 SELECT
                     sensor_name,
@@ -136,11 +136,11 @@ def main():
             print(f"  [{i:2}/{len(files)}] {name:18}  skipped: {first}")
             continue
         used += 1
-        n = con.execute("SELECT count(*) FROM raw").fetchone()[0]
+        n = connection.execute("SELECT count(*) FROM raw").fetchone()[0]
         print(f"  [{i:2}/{len(files)}] {name:18}  total rows: {n:,}  ({time.time()-t0:.0f}s)")
 
     if used == 0:
-        con.close()
+        connection.close()
         os.remove(DB_PATH)
         print(f"\nNone of the {len(files)} CSV file(s) under "
               f"{os.path.abspath(args.csv_dir)} are Summaries exports.\n"
@@ -153,7 +153,7 @@ def main():
 
     print("Building pyramid levels...")
     for tbl, bucket in LEVELS:
-        con.execute(f"""
+        connection.execute(f"""
             CREATE TABLE {tbl} AS
             SELECT sensor, freq,
                    floor(t/{bucket})*{bucket} AS t,
@@ -165,16 +165,16 @@ def main():
             GROUP BY sensor, freq, floor(t/{bucket})*{bucket}
             ORDER BY sensor, t
         """)
-        rows = con.execute(f"SELECT count(*) FROM {tbl}").fetchone()[0]
+        rows = connection.execute(f"SELECT count(*) FROM {tbl}").fetchone()[0]
         print(f"  {tbl:10} bucket={bucket:>6}s  rows: {rows:,}")
 
     # Keep raw sorted for fast range scans at full zoom.
-    con.execute("CREATE TABLE raw_sorted AS SELECT * FROM raw ORDER BY sensor, t")
-    con.execute("DROP TABLE raw")
-    con.execute("ALTER TABLE raw_sorted RENAME TO raw")
+    connection.execute("CREATE TABLE raw_sorted AS SELECT * FROM raw ORDER BY sensor, t")
+    connection.execute("DROP TABLE raw")
+    connection.execute("ALTER TABLE raw_sorted RENAME TO raw")
 
     # Metadata the viewer needs on load.
-    con.execute("""
+    connection.execute("""
         CREATE TABLE meta AS
         SELECT sensor,
                min(t) AS t_min, max(t) AS t_max,
@@ -183,16 +183,16 @@ def main():
     """)
 
     print("\nSensors:")
-    for sensor, tmin, tmax, n in con.execute(
+    for sensor, tmin, tmax, n in connection.execute(
             "SELECT sensor, t_min, t_max, n FROM meta").fetchall():
         days = (tmax - tmin) / 86400
         print(f"  {sensor:22} {n:>12,} rows  spanning {days:6.1f} days")
 
-    freqs = [r[0] for r in con.execute(
+    freqs = [r[0] for r in connection.execute(
         "SELECT DISTINCT freq FROM raw ORDER BY freq").fetchall()]
     print(f"\nFrequencies (MHz): {freqs}")
 
-    con.close()
+    connection.close()
     size_gb = os.path.getsize(DB_PATH) / 1e9
     print(f"\nDone in {time.time()-t0:.0f}s. Database: {DB_PATH} ({size_gb:.2f} GB)")
     print("next: python serve.py")
