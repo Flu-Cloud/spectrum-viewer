@@ -49,50 +49,74 @@ def write_csv(path, header, rows):
             f.write(",".join(str(v) for v in r) + "\n")
 
 
-def make_data(root):
-    """Synthetic CBRS exports, deliberately buried in an odd folder layout."""
-    import numpy as np
-    rng = np.random.default_rng(7)
+CAPS_PER_DAY = 6       # PSD captures written per day
+FRAMES_PER_DAY = 4     # PFP frames written per day
+# Summaries rows per day = HOURS * len(CHANNELS). A full 24 on purpose: the PSD
+# layer's colour match needs >=100 summary rows before it will engage, and at 12
+# this fixture had 72 -- so the whole quantile-matching path, and the dBm scaling
+# inside it, went untested. Every count that depends on this is written in terms
+# of the constant (see test_repeat.py), so it scales with the number.
+HOURS_PER_DAY = 24
+CHANNELS = (3555.0, 3565.0, 3575.0)
 
-    # PSD: <day>_<sensor>_max.csv , 6 captures of 2250 bins
-    psd_dir = os.path.join(root, "mds2-test", "sea", "spectra", "level-1")
-    for day in DAYS:
+
+def write_batch(root, days, seed=7, sub="mds2-test", summaries="Summaries_test.csv"):
+    """One batch of synthetic CBRS exports -> (psd_dir, pfp_dir, summaries_dir).
+
+    Deliberately buried in a folder layout nobody would guess, so the ingests
+    have to find their own files. `days` and `summaries` are parameters because
+    test_repeat.py writes several batches into one tree to play out "next
+    month's data arrived" -- same generator, so the two tests cannot drift into
+    describing different data.
+    """
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    base = os.path.join(root, sub) if sub else root
+
+    # PSD: <day>_<sensor>_max.csv , CAPS_PER_DAY captures of 2250 bins
+    psd_dir = os.path.join(base, "sea", "spectra", "level-1")
+    for day in days:
         rows = []
-        for k in range(6):
+        for k in range(CAPS_PER_DAY):
             spec = np.round(-140 + 20 * rng.random(NF), 2)
             rows.append([f"{day} {k:02d}:00:00", *spec])
         write_csv(os.path.join(psd_dir, f"{day}_{SENSOR}_max.csv"),
                   ["datetime"] + [f"b{i}" for i in range(NF)], rows)
 
-    # PFP: PFP_<day>_<sensor>_max_peak.csv , 4 captures x 560 positions.
+    # PFP: PFP_<day>_<sensor>_max_peak.csv , FRAMES_PER_DAY x 560 positions.
     # The `frequency` column is in HERTZ, as the real NASCTN exports write it
     # and as pfp_ingest.py stores it verbatim -- the Summaries column next to it
     # is the one in MHz. This fixture used to say 3555.0, so pfp.duckdb held a
     # channel centre of 3555 Hz and every test exercised a unit the real data
     # never uses.
-    pfp_dir = os.path.join(root, "mds2-test", "sea", "frames")
-    for day in DAYS:
+    pfp_dir = os.path.join(base, "sea", "frames")
+    for day in days:
         rows = []
-        for k in range(4):
+        for k in range(FRAMES_PER_DAY):
             frame = np.round(-90 + 30 * rng.random(NPOS), 2)
             rows.append([f"{day} {k:02d}:30:00", 3555.0e6, *frame])
         write_csv(os.path.join(pfp_dir, f"PFP_{day}_{SENSOR}_max_peak.csv"),
                   ["datetime", "frequency"] + [f"p{i}" for i in range(NPOS)], rows)
 
     # Summaries, for build_db.py
-    sm_dir = os.path.join(root, "mds2-test", "summaries")
+    sm_dir = os.path.join(base, "summaries")
     rows = []
-    for day in DAYS:
-        for hour in range(12):
-            for f_mhz in (3555.0, 3565.0, 3575.0):
+    for day in days:
+        for hour in range(HOURS_PER_DAY):
+            for f_mhz in CHANNELS:
                 rows.append([SENSOR, f_mhz, f"{day} {hour:02d}:00:00+00",
                              round(-60 - rng.random() * 5, 2),
                              round(-70 - rng.random() * 5, 2),
                              round(-75 - rng.random() * 5, 2)])
-    write_csv(os.path.join(sm_dir, "Summaries_test.csv"),
+    write_csv(os.path.join(sm_dir, summaries),
               ["sensor_name", "channel_frequency_mhz", "timestamp",
                "max", "median", "mean"], rows)
     return psd_dir, pfp_dir, sm_dir
+
+
+def make_data(root):
+    """The two-day fixture the other suites build on."""
+    return write_batch(root, DAYS)
 
 
 PROBE = r'''
@@ -114,11 +138,41 @@ if pm.get("has") and pm.get("freqs"):
               f"&t0={pm['t_min']-1}&t1={pm['t_max']+1}&h=200")
     out["pfp_frame"] = [r.status_code, r.mimetype, len(r.data)]
 out["meta_sensors"] = len(c.get("/api/meta").get_json().get("sensors", []))
+# The dBm scale, in both shapes of spectrum.duckdb. build_db.py writes mx as
+# DOUBLE real dBm and compact_db.py rewrites it as SMALLINT dBm*10, and serve.py
+# has to read whichever is on disk -- it once assumed compacted in /api/heatmap
+# and uncompacted in _psd_match, so on any given database one of the two layers
+# was off by a factor of 10 and the legend jumped when zoom crossed between them.
+mm = c.get("/api/meta").get_json()
+se = next((x for x in mm.get("sensors", []) if x["sensor"] == s), None)
+if se:
+    h = c.get(f"/api/heatmap?sensor={s}&t0={se['t_min']-1}&t1={se['t_max']+1}"
+              f"&width=200").get_json()
+    mx = [v for v in (h.get("max") or []) if v is not None]
+    out["summary_dbm"] = [min(mx), max(mx)] if mx else None
+if m.get("has"):
+    r = c.get(f"/api/psd_layer?sensor={s}&t0={m['t_min']-1}&t1={m['t_max']+1}&w=400&h=200")
+    x = json.loads(r.headers["X-Meta"])
+    out["psd_legend"] = [x["vmin"], x["vmax"]]
+out["dbm_div"] = serve.DBM_DIV
 # read after the requests: the schema is detected on first connect
 out["psd_kind"] = serve._psd_kind
 out["pfp_kind"] = serve._pfp_kind
 print("PROBE " + json.dumps(out))
 '''
+
+
+# The fixture writes `max` as -60 - rand*5 real dBm, so the summary layer must
+# report values inside this band. Reading a DOUBLE-dBm database as dBm*10 puts
+# them at about -6.3, and any dBm reading outside plausible RF power is wrong
+# whichever direction it came from.
+def check_dbm_scale(got, shape):
+    s = got.get("summary_dbm")
+    check(f"summary dBm is real dBm on the {shape} spectrum schema",
+          s is not None and -66.0 < s[0] <= s[1] < -59.0, str(s))
+    p = got.get("psd_legend")
+    check(f"PSD legend is real dBm on the {shape} spectrum schema",
+          p is not None and all(-200.0 < v < 0.0 for v in p), str(p))
 
 
 def run(argv, env_extra, cwd=None):
@@ -205,6 +259,14 @@ def main():
         check("build_db builds the summary layer",
               rc == 0 and os.path.exists(env["SPECTRUM_DB"]), out.strip()[-120:])
 
+        # Probe here, before compaction: this is the DOUBLE-dBm shape, and the
+        # only point in the suite where it is served alongside a PSD layer.
+        got, out = probe(dbs, tmp)
+        if got is not None:
+            check("uncompacted spectrum reports scale 1 dBm per unit",
+                  got.get("dbm_div") == 1.0, str(got.get("dbm_div")))
+            check_dbm_scale(got, "uncompacted")
+
         rc, out = run([sys.executable, os.path.join(ING, "compact_db.py"),
                        "--no-swap"], {**env, "ATLAS_DB_DIR": dbs})
         check("--no-swap leaves the build files and the live ones alone",
@@ -250,6 +312,11 @@ def main():
                   got.get("pfp_frame", [0])[0] == 200, str(got.get("pfp_frame")))
             check("the summary layer sees the sensor",
                   got["meta_sensors"] == 1, str(got["meta_sensors"]))
+            check("compacted spectrum reports scale 10 units per dBm",
+                  got.get("dbm_div") == 10.0, str(got.get("dbm_div")))
+            # The same numbers as before compaction: the shape on disk changed,
+            # what the viewer is told must not.
+            check_dbm_scale(got, "compacted")
 
         # ---- failures are loud ----
         empty = os.path.join(tmp, "empty")

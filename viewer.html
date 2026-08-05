@@ -88,13 +88,33 @@
   /* Rotated mode: the scene is rendered for a swapped-axis box and the canvas
      is turned as one piece, so every draw/hit-test path stays untouched --
      Chrome maps pointer offsets back through the transform for us. */
-  #stage.rot #cv { inset: auto; transform: rotate(90deg); transform-origin: center center; }
+  /* -90 (not 90) so logical x=time, left->right old->new, lands on screen
+     y bottom->top: the MOST RECENT time reads at the TOP. The same turn puts
+     logical y=frequency (low at top) onto screen x left->right ascending,
+     which is the way every spectrum plot runs. */
+  #stage.rot #cv { inset: auto; transform: rotate(-90deg); transform-origin: center center; }
   /* Tick labels live on their own UNROTATED layer: canvas glyphs rasterised
      under a rotation lose hinting and read as blurry, so in rotated mode the
      text is drawn axis-aligned here at mapped screen coordinates instead. */
   #labels { position: absolute; inset: 0; pointer-events: none; z-index: 11;
              overflow: hidden; font: 11px ui-sans-serif; }
   #labels span { position: absolute; white-space: nowrap; }
+
+  /* ---- Export menu: a popover of explicit choices, not a bare <select> ---- */
+  #exportGroup { position: relative; }
+  #exportMenu { position: absolute; top: calc(100% + 6px); left: 0; z-index: 40;
+                min-width: 300px; padding: 6px; border-radius: 10px;
+                background: var(--panel, #141822); border: 1px solid var(--line, #262e40);
+                box-shadow: 0 10px 30px rgba(0,0,0,.55); display: grid; gap: 2px; }
+  #exportMenu[hidden] { display: none; }
+  #exportMenu button { display: block; width: 100%; text-align: left; padding: 8px 10px;
+                       border: 0; border-radius: 7px; background: transparent;
+                       color: var(--text, #dde2ea); font: 13px ui-sans-serif; cursor: pointer; }
+  #exportMenu button span { display: block; color: var(--dim, #7a8499); font-size: 11px;
+                            margin-top: 2px; }
+  #exportMenu button:hover, #exportMenu button:focus-visible { background: rgba(255,255,255,.07); }
+  #bandGroup[hidden] { display: none; }
+  #bandw { width: 104px; }
 
   /* ---- Zoom sliders: quiet track, accent knob ---- */
   .zoombar { touch-action: none; }
@@ -172,9 +192,22 @@
     <div class="group"><button id="rotate" aria-pressed="false"
       title="Rotate the plot 90°: time runs down the screen (waterfall style) instead of across">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7M21 3v5h-5"/></svg>Time on Y</button></div>
-    <div class="group"><button id="exportBtn" title="Export the current view + statistics as a PNG image for reports/sharing">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>Export PNG</button></div>
-    <div class="group"><label>Colors</label><select id="cmap" aria-label="Colormap"><option value="inferno">Inferno</option><option value="turbo">Turbo</option></select></div>
+    <div class="group" id="exportGroup"><button id="exportBtn" aria-expanded="false" aria-haspopup="true"
+        title="Export as a PNG with the statistics alongside, for reports and papers">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>Export PNG</button>
+      <div id="exportMenu" role="menu" hidden>
+        <button id="expView" role="menuitem">Current view
+          <span>exactly what is on screen now</span></button>
+        <button id="expFull" role="menuitem">Full time extent
+          <span>the whole recording as one tall strip, 2048 px of time</span></button>
+        <button id="expFullBand" role="menuitem">Full extent, full band
+          <span>whole recording × 3530-3710 MHz, ignoring the current zoom</span></button>
+      </div></div>
+    <div class="group" id="bandGroup" hidden><label for="bandw">Band</label>
+      <input id="bandw" type="range" min="12" max="100" step="1" value="24"
+             aria-label="How much of the screen width the frequency band uses"
+             title="Frequency band width on screen. Narrow = the tall publication strip; drag right to widen."></div>
+    <div class="group"><label>Colors</label><select id="cmap" aria-label="Colormap"><option value="viridis">Viridis</option><option value="fire">Fire</option><option value="hot">Hot</option><option value="inferno">Inferno</option><option value="plasma">Plasma</option><option value="magma">Magma</option><option value="turbo">Turbo</option><option value="greys">Greys</option></select></div>
     <div class="group" id="legend"><span id="lo"></span><canvas id="cbar"></canvas><span id="hi"></span><span id="unit" class="hint">dBm</span></div>
     <div class="group hint">scroll = time zoom · <kbd>Ctrl</kbd>+scroll = freq zoom · drag = pan</div>
   </header>
@@ -226,10 +259,10 @@ const cache = document.createElement('canvas');
 const cctx = cache.getContext('2d');
 
 let DPR = Math.max(1, window.devicePixelRatio || 1);
-// Plot margins (CSS px), in LOGICAL space. Rotated mode swaps which screen
-// edge each one lands on: logical left = screen top, logical bottom = screen
-// left. Dates drawn horizontally need a wide screen-left strip (logical b),
-// and the horizontal frequency numbers only a slim screen-top one (logical l).
+// Plot margins (CSS px), in LOGICAL space. Rotated mode (-90deg) swaps which
+// screen edge each one lands on: logical left = screen BOTTOM, logical bottom
+// = screen RIGHT. Dates drawn horizontally need a wide screen-right strip
+// (logical b); the frequency numbers only a slim screen-bottom one (logical l).
 const PAD_STD = { l: 64, r: 14, t: 10, b: 26 };
 const PAD_ROT = { l: 42, r: 14, t: 10, b: 108 };   // l: room for title row + tick row on screen top
 const PAD = { ...PAD_STD };
@@ -312,33 +345,133 @@ function channelInView(){
 }
 
 // ---- Colormaps (selectable via the Colors dropdown) --------------------
-// Same maths mirrored server-side in serve.py so this client-drawn summary and
-// the server-rendered PSD/PFP PNGs match. 'inferno' = dark→bright (low power
-// dark); 'turbo' = the classic blue-green-yellow-red.
-const INFERNO_ANCHORS = [
-  [0,0,4],[20,11,52],[57,9,98],[95,19,110],[133,33,107],[169,46,94],
-  [203,65,73],[230,93,47],[247,131,17],[252,173,18],[250,205,42],[252,255,164]];
-function buildAnchorLUT(anchors){
-  const seg=anchors.length-1, lut=new Array(256);
-  for (let i=0;i<256;i++){
-    const xs=i/255*seg, k=Math.min(seg-1,Math.floor(xs)), f=xs-k;
-    const a=anchors[k], b=anchors[k+1];
-    lut[i]=[Math.round(a[0]+(b[0]-a[0])*f),Math.round(a[1]+(b[1]-a[1])*f),Math.round(a[2]+(b[2]-a[2])*f)];
-  }
-  return lut;
+// Colormaps: the exact matplotlib 256-entry LUTs, base64 of raw RGB bytes,
+// byte-identical to the copy in serve.py so a client-drawn summary cell and a
+// server-rendered PSD/PFP tile are the same colour for the same dBm. The old
+// 12-anchor inferno and polynomial turbo were off by up to 34 and 251 of 255
+// respectively, which is why they did not look like the reference plots.
+const CMAP_B64 = {
+  viridis:
+    'RAFURAJWRQRXRQVZRgdaRghcRgpdRgteRw1gRw5hRxBjRxFkRxNlSBRnSBZoSBdpSBhqSBpsSBttSBxuSB1vSB9wSCBx'+
+    'SCFzSCN0SCR1SCV2SCZ3SCh4SCl5Ryp6Ryx6Ry17Ry58Ry99RjB+RjJ+RjN/RjSARTWBRTeBRTiCRDmDRDqDRDuEQz2E'+
+    'Qz6FQj+FQkCGQkGGQUKHQUSHQEWIQEaIP0eIP0iJPkmJPkqJPkyKPU2KPU6KPE+KPFCLO1GLO1KLOlOLOlSMOVWMOVaM'+
+    'OFiMOFmMN1qMN1uNNlyNNl2NNV6NNV+NNGCNNGGNM2KNM2ONMmSOMmWOMWaOMWeOMWiOMGmOMGqOL2uOL2yOLm2OLm6O'+
+    'Lm+OLXCOLXGOLHGOLHKOLHOOK3SOK3WOKnaOKneOKniOKXmOKXqOKXuOKHyOKH2OJ36OJ3+OJ4COJoGOJoKOJoKOJYOO'+
+    'JYSOJYWOJIaOJIeOI4iOI4mOI4qNIouNIoyNIo2NIY6NIY+NIZCNIZGMIJKMIJKMIJOMH5SMH5WLH5aLH5eLH5iLH5mK'+
+    'H5qKHpuKHpyJHp2JH56JH5+IH6CIH6GIH6GHH6KHIKOGIKSGIaWFIaaFIqeFIqiEI6mDJKqDJauCJayCJq2BJ62BKK6A'+
+    'Ka9/KrB/LLF+LbJ9LrN8L7R8MbV7MrZ6NLZ5Nbd5N7h4OLl3Orp2O7t1Pbx0P7xzQL1yQr5xRL9wRsBvSMFuSsFtTMJs'+
+    'TsNrUMRqUsVpVMVoVsZnWMdlWshkXMhjXsliYMpgY8tfZcteZ8xcac1bbM1abs5YcM9Xc9BWddBUd9FTetFRfNJQf9NO'+
+    'gdNNhNRLhtVJidVIi9ZGjtZFkNdDk9dBldhAmNg+m9k8ndk7oNo5oto3pds2qNs0qtwyrdwwsN0vst0ttd4ruN4put4o'+
+    'vd8mwN8lwt8jxeAhyOAgyuEfzeEd0OEc0uIb1eIa2OIZ2uMZ3eMY3+MY4uQY5eQZ5+QZ6uUa7OUb7+Uc8eUd9OYe9uYg'+
+    '+OYh++cj/ecl'+
+    '',
+  fire:
+    'AAAABgAADQAAEgAAFgAAGQAAHAAAHwAAIgAAJAAAJgAAKAAAKwAALQAALgAAMAAAMgAANAAANQAANwAAOAAAOgAAOwAA'+
+    'PQAAPgAAQAAAQQAAQwAARAAARgAARwAASQAASgAATAAATQAATwAAUAAAUgAAUwAAVQAAVgAAWAAAWQEAWwEAXQEAXgEA'+
+    'YAEAYQEAYwEAZQEAZgEAaAEAaQEAawEAbQEAbgEAcAEAcQEAcwEAdQEAdgEAeAIAegIAewIAfQIAfwIAgAIAggIAhAIA'+
+    'hQIAhwIAiQIAigIAjAMAjgMAkAMAkQMAkwMAlQMAlgMAmAMAmgMAnAMAnQQAnwQAoQQAogQApAQApgQAqAQAqQQAqwUA'+
+    'rQUArwUAsAUAsgUAtAUAtgYAuAYAuQYAuwYAvQYAvwcAwAcAwgcAxAcAxggAyAgAyQgAywgAzQkAzwkA0QkA0goA1AoA'+
+    '1goA2AsA2gsA2wwA3QwA3w0A4Q0A4w4A5A8A5g8A6BAA6hEA6xMA7RQA7hYA8BgA8RsA8h0A8yAA9SMA9iYA9ikA9ywA'+
+    '+C8A+TIA+TUA+jgA+jsA+z0A+0AA+0MA/EYA/EkA/EsA/U4A/VEA/VMA/VYA/VgA/lsA/l0A/l8A/mIA/mQA/mYA/mgA'+
+    '/msA/m0A/m8A/nEA/nMA/nUA/ncA/nkA/nwA/34A/4AA/4IA/4MA/4UA/4cA/4kA/4sA/40A/48A/5EA/5MA/5QA/5YA'+
+    '/5gA/5oA/5wA/50A/58A/6EA/6MA/6QB/6YB/6gB/6oB/6sB/60B/68B/7AB/7IC/7QC/7UC/7cC/7kC/7oC/7wD/70D'+
+    '/78D/8ED/8IE/8QE/8YE/8cE/8kF/8oF/8wF/84G/88G/9EG/9IH/9QH/9UI/9cI/9kJ/9oJ/9wK/90K/98L/+AL/+IM'+
+    '/+MN/+UO/+YP/+gQ/+oR/+sS/+0U/+4X//Aa//Ee//Mk//Qq//Uy//c7//hH//lT//ti//ty//yD//2V//6o//66//7M'+
+    '//7e//7u////'+
+    '',
+  hot:
+    'CwAADQAAEAAAEgAAFQAAGAAAGgAAHQAAIAAAIgAAJQAAJwAAKgAALQAALwAAMgAANQAANwAAOgAAPAAAPwAAQgAARAAA'+
+    'RwAASgAATAAATwAAUQAAVAAAVwAAWQAAXAAAXwAAYQAAZAAAZgAAaQAAbAAAbgAAcQAAdAAAdgAAeQAAewAAfgAAgQAA'+
+    'gwAAhgAAiQAAiwAAjgAAkAAAkwAAlgAAmAAAmwAAngAAoAAAowAApQAAqAAAqwAArQAAsAAAswAAtQAAuAAAugAAvQAA'+
+    'wAAAwgAAxQAAyAAAygAAzQAAzwAA0gAA1QAA1wAA2gAA3QAA3wAA4gAA5AAA5wAA6gAA7AAA7wAA8gAA9AAA9wAA+QAA'+
+    '/AAA/wAA/wIA/wUA/wgA/woA/w0A/xAA/xIA/xUA/xcA/xoA/x0A/x8A/yIA/yUA/ycA/yoA/ywA/y8A/zIA/zQA/zcA'+
+    '/zoA/zwA/z8A/0EA/0QA/0cA/0kA/0wA/08A/1EA/1QA/1YA/1kA/1wA/14A/2EA/2QA/2YA/2kA/2sA/24A/3EA/3MA'+
+    '/3YA/3kA/3sA/34A/4AA/4MA/4YA/4gA/4sA/44A/5AA/5MA/5UA/5gA/5sA/50A/6AA/6IA/6UA/6gA/6oA/60A/7AA'+
+    '/7IA/7UA/7cA/7oA/70A/78A/8IA/8UA/8cA/8oA/8wA/88A/9IA/9QA/9cA/9oA/9wA/98A/+EA/+QA/+cA/+kA/+wA'+
+    '/+8A//EA//QA//YA//kA//wA//4A//8D//8H//8L//8P//8T//8X//8b//8f//8i//8m//8q//8u//8y//82//86//8+'+
+    '//9C//9G//9K//9O//9S//9W//9a//9e//9h//9l//9p//9t//9x//91//95//99//+B//+F//+J//+N//+R//+V//+Z'+
+    '//+d//+g//+k//+o//+s//+w//+0//+4//+8///A///E///I///M///Q///U///Y///c///f///j///n///r///v///z'+
+    '///3///7////'+
+    '',
+  inferno:
+    'AAAEAQAFAQEGAQEIAgEKAgIMAgIOAwIQBAMSBAMUBQQXBgQZBwUbCAUdCQYfCgciCwckDAgmDQgpDgkrEAktEQowEgoy'+
+    'FAs0FQs3Fgs5GAw8GQw+GwxBHAxDHgxFHwxIIQxKIwxMJAxPJgxRKAtTKQtVKwtXLQtZLwpbMQpcMgpeNApfNglhOAli'+
+    'OQljOwlkPQllPglmQApnQgpoRApoRQppRwtqSQtqSgxrTAxrTQ1sTw1sUQ5sUg5tVA9tVQ9tVxBuWRBuWhFuXBJuXRJu'+
+    'XxNuYRNuYhRuZBVuZRVuZxZuaRZuahdubBhubRhubxlucRluchpudBpudRtudxxteBxteh1tfB1tfR5tfx5sgB9sgiBs'+
+    'hCBrhSFrhyFriCJqiiJqjCNpjSNpjyRpkCVokiVokyZnlSZnlydmmCdmmihlmylknSlknypjoCpjoitioyxhpSxgpi1g'+
+    'qC5fqS5eqy9erTBdrjBcsDFbsTJaszJatDNZtjRYtzVXuTVWujZVvDdUvThTvzlSwDpRwTpQwztPxDxOxj1Nxz5MyD9L'+
+    'ykBKy0FJzEJIzkNHz0RG0EVF0kZE00dD1EhC1UpB10s/2Ew+2U092k4821A73VE63lI431M34FU24VY14lc041kz5Fox'+
+    '5Vww5l0v514u6GAt6WEr6mMq62Qp62Yo7Gcm7Wkl7mok72wj724h8G8g8XEf8XMd8nQc83Yb83gZ9HkY9XsX9X0V9n4U'+
+    '9oAT94IS94QQ+IUP+IcO+IkM+YsL+YwK+Y4J+pAI+pIH+pQH+5YG+5cG+5kG+5sG+50H/J8H/KEI/KMJ/KUK/KYM/KgN'+
+    '/KoP/KwR/K4S/LAU/LIW/LQY+7Ya+7gd+7of+7wh+74j+sAm+sIo+sQq+sYt+ccv+cky+cs1+M03+M8699E999NA9tVD'+
+    '9tdG9dlJ9dtM9N1P9N9T9OFW8+Na8+Vd8uZh8uhl8upp8ext8e1x8e918fF58vJ98vSC8/WG8/aK9PiO9fmS9vqW+Pua'+
+    '+fyd+v2h/P+k'+
+    '',
+  plasma:
+    'DQiHEAeIEweJFgeKGQaMGwaNHQaOIAaPIgaQJAaRJgWRKAWSKgWTLAWULgWVLwWWMQWXMwWXNQSYNwSZOASaOgSaPASb'+
+    'PgScPwScQQSdQwOeRAOeRgOfSAOfSQOgSwOhTAKhTgKiUAKiUQKjUwKjVQKkVgGkWAGkWQGlWwGlXAGmXgGmYAGmYQCn'+
+    'YwCnZACnZgCnZwCoaQCoagCobACobgCobwCocQCocgGodAGodQGodwGoeAGoegKoewKofQOofgOogASogQSngwWnhAWn'+
+    'hgamhwemiAimigmliwqljQuljgykjw2kkQ6jkg+jlBCilRGhlhOhmBSgmRWfmhafnBeenRidnhmdoBqcoRuboh2aox6a'+
+    'pR+ZpiCYpyGXqCKWqiOVqySUrCaUrSeTriiSsCmRsSqQsiuPsyyOtC6NtS+MtjCLtzGKuDKJujOIuzSIvDWHvTeGvjiF'+
+    'vzmEwDqDwTuCwjyBwz2AxD5/xUB+xkF9x0J8yEN7yUR6ykV6y0Z5zEd4zEl3zUp2zkt1z0x00E1z0U5y0k9x01Fx1FJw'+
+    '1VNv1VRu1lVt11Zs2Fdr2Vhq2lpq2ltp21xo3F1n3V5m3l9l3mFk32Jj4GNj4WRi4mVh4mZg42hf5Gle5Wpd5Wtd5mxc'+
+    '525b529a6HBZ6XFY6XJX6nRX63VW63ZV7HdU7XlT7XpS7ntR73xR735Q8H9P8IBO8YFN8YNM8oRL84VL84dK9IhJ9IlI'+
+    '9YtH9YxG9o1F9o9E95BE95FD95NC+JRB+JVA+Zc/+Zg++Zo++ps9+pw8+p47+586+6E5+6I4/KM4/KU3/KY2/Kg1/Kk0'+
+    '/asz/awz/a4y/a8x/bEw/bIv/bQv/bUu/rct/rgs/ros/rsr/r0q/r4q/sAp/cIp/cMo/cUn/cYn/cgn/com/csm/M0l'+
+    '/M4l/NAl/NIl+9Mk+9Uk+9ck+tgk+tok+dwk+d0l+N8l+OEl9+Il9+Ql9uYm9ugm9ekm9esn9O0n8+4n8/An8vIn8fQm'+
+    '8fUl8Pck8Pkh'+
+    '',
+  magma:
+    'AAAEAQAFAQEGAQEIAgEJAgILAgINAwMPAwMSBAQUBQQWBgUYBgUaBwYcCAceCQcgCggiCwkkDAkmDQopDgsrEAstEQwv'+
+    'Eg0xEw00FA42FQ44Fg87GA89GRA/GhBCHBBEHRFHHhFJIBFLIRFOIhFQJBJTJRJVJxJYKRFaKhFcLBFfLRFhLxFjMRFl'+
+    'MxBnNBBpNhBrOBBsOQ9uOw9wPQ9xPw9yQA90Qg91RA92RRB3RxB4SRB4ShB5TBF6ThF7TxJ7URJ8UhN8VBN9VhR9VxV+'+
+    'WRV+WhZ+XBZ/XRd/Xxh/YBiAYhmAZBqAZRqAZxuAaByBahyBax2BbR2Bbh6BcB+Bch+BcyCBdSGBdiGBeCKBeSKCeyOC'+
+    'fCOCfiSCgCWCgSWBgyaBhCaBhieBiCeBiSiBiymBjCmBjiqBkCqBkSuBkyuAlCyAliyAmC2AmS2Amy5/nC5/ni9/oC9/'+
+    'oTB+ozB+pTF+pjF9qDJ9qjN9qzN8rTR8rjR7sDV7sjV7szZ6tTZ6tzd5uDd5ujh4vDl4vTl3vzp3wDp2wjt1xDx1xTx0'+
+    'xz1zyD5zyj5yzD9xzUBxz0Bw0EFv0kJv00Nu1URt1kVs2EVs2UZr20dq3Ehp3klo30po4Exn4k1m405l5E9k5VBk51Jj'+
+    '6FNi6VRi6lZh61dg7Fhg7Vpf7lte711e8F9e8WBd8mJd8mRc82Vc9Gdc9Glc9Wtc9mxc9m5c93Bc93Jc+HRc+HZc+Xhd'+
+    '+Xld+Xtd+n1e+n9e+oFf+4Nf+4Vg+4dh/Ilh/Ipi/Ixj/I5k/JBl/ZJm/ZRn/ZZo/Zhp/Zpq/Ztr/p1s/p9t/qFu/qNv'+
+    '/qVx/qdy/qlz/qp0/qx2/q53/rB4/rJ6/rR7/rZ8/rd+/rl//ruB/r2C/r+E/sGF/sKH/sSI/saK/siM/sqN/syP/s2Q'+
+    '/s+S/tGU/tOV/tWX/teZ/tia/dqc/dye/d6g/eCh/eKj/eOl/eWn/eep/emq/eus/Oyu/O6w/PCy/PK0/PS2/Pa4/Pe5'+
+    '/Pm7/Pu9/P2/'+
+    '',
+  turbo:
+    'MBI7MhVDMxhKNBtRNR5YNiFfNyRmOCdtOSpzOi15Oy+APDKGPTWLPjiRPzuXPz6cQECiQUOnQUasQkmxQku1Q066RFG/'+
+    'RFTDRFbHRVnLRVzPRV7TRmHWRmTaRmbdRmngRmvjR27mR3HpR3PrR3buR3jwR3vyRn30RoD2RoL4RoX6Rof7RYr8RYz9'+
+    'RI/+Q5H+QpT/QZb/QJn/Ppv+PZ7+O6D9OqP8OKX7N6j6Nav4M633Ma/1L7L0LrTyLLfwKrnuKLzrJ77pJcDnI8PkIsXi'+
+    'IMffH8ndHsvaHM3YG9DVGtLSGtTQGdXNGNfKGNnIGNvFGN3CGN7AGOC9GeK7GeO5GuS2HOa0HeeyH+mvIOqsIuuqJeyn'+
+    'J+6kKu+hLPCeL/GbMvKYNfOUOPSRPPWOP/aKQ/eHRviESviATvl9Uvp6Vfp2WftzXfxvYfxsZf1paf1mbf5icf5fdf5c'+
+    'ef5Zff9WgP9ThP9RiP9Oi/9Lj/9Jkv9Hlv5Emf5CnP5An/0/of09pPw8p/w6qfs5rPs4r/o3sfk2tPg2t/c1ufY1vPU0'+
+    'vvQ0wfM0w/E0xvA0yO80y+00zew00Oo00uk11Oc11+U12eQ22+I23eA339834d0349s45dk459c56dU569M57NE67s86'+
+    '78068cs68sk69Mc69cU69sM698E6+L45+bw5+ro5+7g4+7Y3/LM2/LE2/a41/aw0/qkz/qcy/qQx/qEw/p4v/pst/pks'+
+    '/pYr/pMq/pAp/Y0n/Yom/Icl/IQj+4Ei+34h+nsf+Xge+XUd+HIc928a9mwZ9WkY9GYX82MV8mAU8V0T8FsS71gR7VUQ'+
+    '7FMP61AO6k4N6EsM50kM5UcL5EUK4kMK4UEJ3z8I3T0I3DsH2jkH2DcG1jUG1DMF0jEF0C8Fzi0EzCsEyioEyCgDxSYD'+
+    'wyUDwSMCviECvCACuR4Ctx0CtBsBshoBrxgBrBcBqRYBpxQBpBMBoRIBnhABmw8BmA4BlQ0BkgsBjgoBiwkCiAgChQcC'+
+    'gQYCfgUCegQD'+
+    '',
+  greys:
+    'AAAAAQEBAgICAwMDBQUFBgYGBwcHCAgICQkJCgoKDAwMDQ0NDg4ODw8PEBAQERERExMTFBQUFRUVFhYWFxcXGBgYGhoa'+
+    'GxsbHBwcHR0dHh4eHx8fISEhIiIiIyMjJCQkJSUlJycnKCgoKSkpKysrLCwsLi4uLy8vMDAwMjIyMzMzNTU1NjY2ODg4'+
+    'OTk5Ojo6PDw8PT09Pz8/QEBAQUFBQ0NDRERERkZGR0dHSEhISkpKS0tLTU1NTk5OUFBQUVFRUlJSU1NTVFRUVVVVVlZW'+
+    'V1dXWFhYWlpaW1tbXFxcXV1dXl5eX19fYGBgYWFhYmJiY2NjZGRkZWVlZmZmZ2dnaGhoaWlpampqa2trbGxsbW1tbm5u'+
+    'b29vcHBwcXFxcnJyc3NzdXV1dnZ2d3d3eHh4eXl5enp6e3t7fHx8fX19fn5+f39/gYGBgoKCg4ODhISEhYWFhoaGh4eH'+
+    'iIiIiYmJioqKjIyMjY2Njo6Oj4+PkJCQkZGRkpKSk5OTlJSUlZWVl5eXmJiYmZmZmpqanJycnZ2dnp6en5+foKCgoqKi'+
+    'o6OjpKSkpaWlp6enqKioqampqqqqq6urra2trq6ur6+vsLCwsrKys7OztLS0tbW1tra2uLi4ubm5urq6u7u7vb29vr6+'+
+    'vr6+v7+/wMDAwcHBwsLCw8PDxMTExcXFxcXFxsbGx8fHyMjIycnJysrKy8vLzMzMzMzMzc3Nzs7Oz8/P0NDQ0dHR0tLS'+
+    '09PT1NTU1NTU1dXV1tbW19fX2NjY2dnZ2tra2tra29vb3Nzc3Nzc3d3d3t7e39/f39/f4ODg4eHh4eHh4uLi4+Pj5OTk'+
+    '5OTk5eXl5ubm5+fn5+fn6Ojo6enp6enp6urq6+vr7Ozs7Ozs7e3t7u7u7u7u7+/v8PDw8PDw8fHx8fHx8vLy8vLy8/Pz'+
+    '8/Pz9PT09PT09fX19fX19vb29vb29/f39/f39/f3+Pj4+Pj4+fn5+fn5+vr6+vr6+/v7+/v7/Pz8/Pz8/f39/f39/v7+'+
+    '/v7+////////'+
+    '',
+};
+function decodeLUT(b64){
+  const bin = atob(b64), out = new Array(256);
+  for (let i = 0; i < 256; i++) out[i] = [bin.charCodeAt(i*3), bin.charCodeAt(i*3+1), bin.charCodeAt(i*3+2)];
+  return out;
 }
-function buildTurboLUT(){
-  const cl=v=>Math.round(Math.min(255,Math.max(0,v))), lut=new Array(256);
-  for (let i=0;i<256;i++){ const x=i/255;
-    lut[i]=[
-      cl(34.61 + x*(1172.33 + x*(-10793.56 + x*(33300.12 + x*(-38394.49 + x*14825.05))))),
-      cl(23.31 + x*(557.33 + x*(1225.33 + x*(-3574.96 + x*(3520.99 + x*-1300.91))))),
-      cl(27.2 + x*(3211.1 + x*(-15327.97 + x*(27814.0 + x*(-22569.18 + x*6838.66)))))];
-  }
-  return lut;
-}
-const CMAP_LUTS = { inferno: buildAnchorLUT(INFERNO_ANCHORS), turbo: buildTurboLUT() };
-let cmapName = 'inferno';
+const CMAP_LUTS = {};
+for (const k in CMAP_B64) CMAP_LUTS[k] = decodeLUT(CMAP_B64[k]);
+let cmapName = 'viridis';
 try { const s=localStorage.getItem('cmap'); if (s && CMAP_LUTS[s]) cmapName=s; } catch(e){}
 function cmap(x){ return CMAP_LUTS[cmapName][Math.max(0,Math.min(255,Math.floor((x||0)*255)))]; }
 
@@ -377,9 +510,33 @@ function freqRow(freq){
 
 // ---- Rendering (MOMRAN!!!!) --------------------------------------------------------
 let rotated = false;                       // time on Y: scene drawn for a swapped box
+// How much of the screen width the frequency band is allowed to use in rotated
+// mode, as a fraction. A monitoring strip in a paper is TALL and NARROW -- the
+// whole band squeezed into a slim column beside its time axis -- so filling the
+// window edge to edge is the wrong default here. The slider widens it back.
+let bandFrac = 0.24;
+// Rotated mode is drawn for a swapped box, so logical y (frequency) is what
+// lands on screen X: narrowing the band means padding logical top/bottom. The
+// extra all goes on logical top, which is screen LEFT, so the strip stays next
+// to the date labels on the right instead of drifting away from them.
+function applyPad(){
+  Object.assign(PAD, rotated ? PAD_ROT : PAD_STD);
+  if (!rotated) return;
+  const logicalH = stage.clientWidth;          // rotated: logical height = stage width
+  const avail = logicalH - PAD.t - PAD.b;
+  if (avail <= 0) return;
+  const band = Math.max(90, Math.min(avail, bandFrac * avail));
+  // Centre the band TOGETHER WITH its date labels, which live in PAD.b on the
+  // screen's right. Putting all the slack on PAD.t instead pinned the strip
+  // against the right edge with the whole window empty beside it.
+  const labels = PAD.b;
+  PAD.t = Math.max(PAD.t, Math.round((logicalH - band - labels) / 2));
+  PAD.b = Math.max(labels, logicalH - band - PAD.t);
+}
 function syncCanvasSize(){
   const sw0 = stage.clientWidth, sh0 = stage.clientHeight;
   if (sw0 === 0 || sh0 === 0) return false;          // stage not laid out yet
+  applyPad();                                        // band width depends on it
   DPR = Math.max(1, window.devicePixelRatio || 1);
   // Logical (pre-rotation) box: rotated mode renders for the swapped one.
   const sw = rotated ? sh0 : sw0, sh = rotated ? sw0 : sh0;
@@ -479,6 +636,7 @@ function drawCrisp(){
   cctx.clearRect(0,0,cache.width,cache.height);
   cctx.drawImage(cv,0,0);
   cacheView = { t0: view.t0, t1: view.t1, f0: viewF.f0, f1: viewF.f1 };
+  warmSoon();          // settled on a real render: go fetch the layer below it
 }
 
 // Cheap preview: stretch the cached bitmap onto the new time AND freq window.
@@ -543,23 +701,33 @@ function drawAxes(){
   ctx.fillRect(0,0,PAD.l,H); ctx.fillRect(0,H-PAD.b,W,PAD.b);
   // frequency labels
   ctx.fillStyle = COL.label; ctx.font = '11px ui-sans-serif';
-  // Logical (bitmap) point -> screen point. CSS rotate(90deg) about the centre
-  // of a box whose logical height equals the stage width maps (x,y) -> (H-y, x).
-  const L2S = (x,y) => [H - y, x];
+  // Logical (bitmap) point -> screen point. CSS rotate(-90deg) about the
+  // centre of a box whose logical width equals the stage height maps
+  // (x,y) -> (y, W-x): time (logical x) runs UP the screen, newest at top,
+  // and frequency (logical y) runs left->right ascending.
+  const L2S = (x,y) => [y, W - x];
   const out = [];                     // rotated-mode labels, placed as DOM text
   function tickText(txt, x, y, shift){
     if (!rotated){ ctx.fillText(txt, x, y); return; }
-    const [sx, sy] = L2S(x, y);
+    let [sx, sy] = L2S(x, y);
+    // The screen's left edge hosts the vertical zoom slider (~26px wide);
+    // the band-edge frequency label would start underneath it.
+    if (shift === 'translate(0,0)') sx = Math.max(sx, 28);
     out.push({text:txt, sx, sy, shift, color:ctx.fillStyle});
   }
   ctx.textAlign='right'; ctx.textBaseline='middle';
+  // Rotated-mode anchor for the frequency-axis ticks (they land along the
+  // screen bottom): centre each label on its tick, except the two band-edge
+  // ones, which anchor inward so nothing hangs off the screen.
+  const edgeShift = (k, n) => k===0 ? 'translate(0,0)'
+                            : k===n ? 'translate(-100%,0)' : 'translate(-50%,0)';
   let yLabel = 'Frequency (MHz)';
   if (layerMode==='pfp' && pfpView){
-    for (let k=0;k<=5;k++){ const fr=k/5; tickText((fr*pfpFrameMs).toFixed(0), PAD.l-6, PAD.t+fr*plotH(), 'translate(-50%,-100%)'); }  // 0..10 ms
+    for (let k=0;k<=5;k++){ const fr=k/5; tickText((fr*pfpFrameMs).toFixed(0), PAD.l-6, PAD.t+fr*plotH(), edgeShift(k,5)); }  // 0..10 ms
     yLabel = `Frame position (ms) · ${(pfpView.freq/1e6).toFixed(0)} MHz channel`;
   } else {
     const fmin=viewF.f0/1e6, fmax=viewF.f1/1e6, dec = (fmax-fmin) < 20 ? 2 : 0;  // low freq at top
-    for (let k=0;k<=6;k++){ const fr=k/6; tickText((fmin+fr*(fmax-fmin)).toFixed(dec), PAD.l-6, PAD.t+fr*plotH(), 'translate(-50%,-100%)'); }
+    for (let k=0;k<=6;k++){ const fr=k/6; tickText((fmin+fr*(fmax-fmin)).toFixed(dec), PAD.l-6, PAD.t+fr*plotH(), edgeShift(k,6)); }
   }
   if (rotated){                       // axis title: upright on the label layer
     const [sx, sy] = L2S(15, PAD.t+plotH()/2);
@@ -575,7 +743,7 @@ function drawAxes(){
   for (const t of ticks){
     const x = timeToX(t); if (x<PAD.l||x>W-PAD.r) continue;
     ctx.beginPath(); ctx.moveTo(x,PAD.t); ctx.lineTo(x,H-PAD.b); ctx.stroke();
-    tickText(tickLabel(t,step), x, H-PAD.b+5, 'translate(-100%,-50%)');
+    tickText(tickLabel(t,step), x, H-PAD.b+5, 'translate(0,-50%)');
   }
   placeLabels(rotated ? out : []);    // normal mode keeps its labels on canvas
 }
@@ -605,6 +773,65 @@ function cacheGet(url){ const v=tileCache.get(url); if (v){ tileCache.delete(url
 // ~6.6 MB is enough to lose the drawing context on shared graphics.
 function cacheDrop(k){ const v=tileCache.get(k); if (v && v.img && v.img.close) v.img.close(); tileCache.delete(k); }
 function cacheSet(url,v){ tileCache.set(url,v); if (tileCache.size>TILE_CACHE_MAX) cacheDrop(tileCache.keys().next().value); }
+
+// Everything about a tile except which window it covers. Two tiles with the
+// same identity are the same measurement at different zoom, so one can stand in
+// for the other. w/h are deliberately NOT part of it: drawCrisp maps a tile onto
+// its own window whatever its pixel size, so a tile fetched before a resize is
+// still correct after one.
+//
+// The colours have to be read off the tile's own metadata (`v.j`) and not just
+// its URL. The first tile of a layer is requested WITHOUT vmin/vmax -- the
+// server picks the scale and reports it back, and applyPsd/applyPfp then lock to
+// exactly those numbers and spell them out in every later URL. So a URL-only
+// identity makes that first tile unmatchable the instant it is applied, which is
+// every warmed tile: warming happens before any scale exists.
+function tileId(url, v){
+  const u=new URL(url, location.origin), p=u.searchParams, j=v && v.j;
+  const num=(k)=> p.get(k)!=null ? +p.get(k) : (j ? j[k] : null);
+  return {path:u.pathname, sensor:p.get('sensor'), freq:p.get('freq'),
+          cmap:p.get('cmap'), vmin:num('vmin'), vmax:num('vmax')};
+}
+// A request that names no scale is asking the server to choose one, and the
+// viewer adopts whatever comes back -- so any scale already on hand is a valid
+// answer. Only two *named* scales that disagree make tiles incompatible.
+function sameTile(a, b){
+  return a.path===b.path && a.sensor===b.sensor && a.freq===b.freq && a.cmap===b.cmap
+      && (a.vmin==null || b.vmin==null || (a.vmin===b.vmin && a.vmax===b.vmax));
+}
+function tileWin(url){ const p=new URL(url, location.origin).searchParams;
+  return {t0:+p.get('t0'), t1:+p.get('t1'), f0:+p.get('f0'), f1:+p.get('f1')}; }
+// The cache used to answer only the exact URL asked for. Every zoom step makes a
+// new t0/t1, so during a zoom it answered nothing -- each notch was a fresh round
+// trip against a multi-GB database, and crossing into PSD/PFP was always a cold
+// fetch no matter how long the summary had been on screen. Since drawCrisp
+// positions a tile by its own window rather than assuming it matches the view, a
+// tile that CONTAINS the wanted window already draws as a correct picture of it.
+//
+// It is not the SAME picture, though, and that is why a reuse never ends the
+// story. Each column of a tile is a max over its own slice of time, so a wider
+// tile's columns are maxima over wider slices: real data for the right window,
+// but coarser in time and therefore reading a little hotter than the exact tile
+// would. Fine to show instantly, wrong to leave on screen -- so `exact` is
+// reported back and requestData always refetches after a reuse.
+function cacheFind(req){
+  const hit = cacheGet(req.url);
+  if (hit) return {hit, exact:true};
+  if (req.kind!=='psd' && req.kind!=='pfp') return null;   // summary/IQ keep exact-match
+  const id = tileId(req.url), want = tileWin(req.url);
+  let url=null, best=Infinity;
+  for (const [k, v] of tileCache){
+    if (!sameTile(id, tileId(k, v))) continue;
+    const got = tileWin(k);
+    if (!(got.t0 <= want.t0 && got.t1 >= want.t1)) continue;
+    // PFP's Y axis is frame position, not frequency: its URL carries no f0/f1
+    // and its tile is valid at any frequency window.
+    if (req.kind==='psd' && !(got.f0 <= want.f0 && got.f1 >= want.f1)) continue;
+    const s = (got.t1-got.t0) / Math.max(1e-9, want.t1-want.t0);
+    if (s < best){ best=s; url=k; }                 // tightest containing tile
+  }
+  return url ? {hit:cacheGet(url), exact:false} : null;
+}
 
 function iqUrl(w,h){ let u=`/api/iq_layer?id=${enc(iqCap.id)}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&f0=${viewF.f0}&f1=${viewF.f1}&cmap=${cmapName}`;
   if (iqScale) u+=`&vmin=${iqScale.vmin}&vmax=${iqScale.vmax}`; return u; }
@@ -659,16 +886,29 @@ function pfpHint(){
 
 function requestData(){
   schedulePreview();                        // instant, smooth stretch
-  const req=buildReq(), hit=cacheGet(req.url);
-  if (hit){ clearTimeout(fetchTimer); ++fetchSeq; layerNote='';   // instant: cancel debounce + in-flight fetch
+  const req=buildReq(), f=cacheFind(req);
+  let soft=false;
+  if (f){ clearTimeout(fetchTimer); ++fetchSeq; layerNote='';   // instant: cancel debounce + in-flight fetch
+    const hit=f.hit;
     if (req.kind==='summary') applySummary(hit.data);
     else if (req.kind==='psd') applyPsd(hit.j, hit.img);
     else if (req.kind==='iq') applyIq(hit.j, hit.img);
     else applyPfp(hit.j, hit.img, req.ch);
-    setLoading(false); return;
+    setLoading(false);
+    if (f.exact) return;              // this very window, already rendered: done
+    // A reused wider tile: correct data for this window is on screen instantly,
+    // but coarser in time than this window deserves, so fall through and let the
+    // fetch below swap the exact tile in underneath the user.
+    soft=true;
   }
   clearTimeout(fetchTimer);
-  fetchTimer=setTimeout(doFetch, 45);       // shorter debounce → crisp appears sooner
+  // 45ms when there is nothing on screen for this window: the tile is the only
+  // thing the user is waiting for, so ask almost at once. But when `soft` we are
+  // already showing correct data and only want it sharper -- and mid-gesture the
+  // sharp tile would be superseded by the next notch before it even arrived. One
+  // request after the zoom stops beats one per notch, and neither delays
+  // anything the user can see.
+  fetchTimer=setTimeout(()=>doFetch(soft), soft ? 260 : 45);
 }
 // Tiles arrive as raw WebP bytes with the axis metadata in an X-Meta header,
 // no base64/JSON wrapping (~25% fewer bytes) and the browser decodes natively.
@@ -690,8 +930,13 @@ async function fetchTile(url){
     return { j, img };
   } finally { if (inflight === ac) inflight = null; }
 }
-async function doFetch(){
-  const seq=++fetchSeq; setLoading(true);
+async function doFetch(soft){
+  const seq=++fetchSeq;
+  // The bar means "you are waiting on something you cannot see yet". A soft
+  // refine is not that: correct data for this window is already drawn and only
+  // getting sharper, so raising the bar for it reports a wait that is not
+  // happening -- which is the whole complaint about the bar during a scroll.
+  if (!soft) setLoading(true);
   const req=buildReq();
   if (req.kind==='summary'){ layerNote=''; await fetchSummary(seq); return; }
   try{
@@ -731,6 +976,65 @@ async function fetchSummary(seq){
   const j=await (await fetch(sumUrl(w))).json();
   if (seq!==fetchSeq) return;
   applySummary(j); cacheSet(sumUrl(w),{data:j}); setLoading(false);
+}
+
+// ---- Warming the drill layers ------------------------------------------
+// Build a URL for a window other than the one on screen, through the same
+// psdUrl/pfpUrl the real fetch uses. Borrowing the globals for the length of one
+// synchronous call is deliberate: a second set of URL builders is exactly how
+// buildReq and doFetch drifted apart before they were merged.
+function withWindow(t0, t1, fn){
+  const keep={t0:view.t0, t1:view.t1};
+  view.t0=t0; view.t1=t1; clampTimeView();
+  try { return fn(); } finally { view.t0=keep.t0; view.t1=keep.t1; }
+}
+// Fetch the layer BELOW this one before it is asked for, while the browser is
+// idle. Warmed at each layer's own threshold span, which is the widest window
+// that layer is ever shown at -- so the warmed tile contains every view the user
+// can reach by zooming in from here, and cacheFind can answer all of them.
+// Nothing here touches `inflight`: a warm fetch must never abort the tile the
+// user is actually waiting on.
+let warmQueued=false, warming=false, warmAC=null;
+// Switching sensor or mode makes any warm tile in flight worthless -- and on a
+// multi-GB database it is a scan worth several seconds that would otherwise run
+// to completion competing with the tile the user now actually wants.
+function warmCancel(){ if (warmAC){ warmAC.abort(); warmAC=null; } }
+function warmSoon(){
+  if (warmQueued || warming || mode!=='cbrs' || !meta) return;
+  warmQueued=true;
+  const go=()=>{ warmQueued=false; warmDeeper(); };
+  if (window.requestIdleCallback) requestIdleCallback(go, {timeout:1500});
+  else setTimeout(go, 400);
+}
+async function warmDeeper(){
+  if (warming || mode!=='cbrs' || !meta) return;
+  const w=Math.round(plotW()), h=Math.round(plotH());
+  const span=view.t1-view.t0, c=(view.t0+view.t1)/2, want=[];
+  // Two different doors into the PSD layer, and only one of them used to be
+  // warmed. Zooming TIME crosses PSD_THRESHOLD and lands on a 3-day window;
+  // zooming FREQUENCY crosses PSD_FREQ_THRESHOLD and lands on the window
+  // already on screen, which at full span is the most expensive tile there is.
+  // Warm that one at the current window and full band: any frequency zoom from
+  // here is a sub-window of it, so cacheFind answers all of them.
+  if (psdAvail && layerMode==='summary' && (viewF.f1-viewF.f0)>PSD_FREQ_THRESHOLD)
+    want.push(psdUrl(w,h));
+  if (psdAvail && span>PSD_THRESHOLD)
+    want.push(withWindow(c-PSD_THRESHOLD/2, c+PSD_THRESHOLD/2, ()=>psdUrl(w,h)));
+  // Only once the frequency window is down to one channel: above that
+  // nearestChannelHz is a guess, and warming the wrong channel buys nothing.
+  if (pfpAvail && (viewF.f1-viewF.f0)<=ONE_CHANNEL && channelInView() && span>PFP_TIME_THRESHOLD)
+    want.push(withWindow(c-PFP_TIME_THRESHOLD/2, c+PFP_TIME_THRESHOLD/2,
+                         ()=>pfpUrl(nearestChannelHz(),w,h)));
+  const url=want.find(u=>!tileCache.has(u));     // .has, not cacheGet: don't disturb the LRU
+  if (!url) return;
+  warming=true;
+  const ac = warmAC = new AbortController();
+  try{
+    const r=await fetch(url, {signal: ac.signal});
+    if (r.ok) cacheSet(url, {j:JSON.parse(r.headers.get('X-Meta')),
+                             img:await createImageBitmap(await r.blob())});
+  }catch(e){ /* a tile nobody asked for yet is not worth reporting */ }
+  finally{ warming=false; if (warmAC===ac) warmAC=null; }
 }
 
 function autoScale(){
@@ -930,7 +1234,8 @@ function setFreqZoom(z){
   sl.addEventListener('keydown', e=>{                     // keyboard-operable slider
     const z=vZoomOf();
     if (e.shiftKey && (e.key==='ArrowUp' || e.key==='ArrowDown')){   // pan 10% of span
-      if (rotated){ const d=(view.t1-view.t0)*0.1*(e.key==='ArrowUp'?-1:1);
+      // Rotated screen runs newest-at-top, so ArrowUp pans toward LATER time.
+      if (rotated){ const d=(view.t1-view.t0)*0.1*(e.key==='ArrowUp'?1:-1);
         view.t0+=d; view.t1+=d; clampTimeView(); layoutSliders(); requestData(); }
       else { const d=(viewF.f1-viewF.f0)*0.1*(e.key==='ArrowUp'?-1:1);
         viewF.f0+=d; viewF.f1+=d; onFreqChange(); }
@@ -1014,6 +1319,7 @@ document.querySelectorAll('[data-stat]').forEach(b=>b.addEventListener('click', 
 }));
 // ---- Source/mode switcher: CBRS monitoring <-> independent IQ captures ----
 function clearLayers(){ psdImg=null; psdView=null; pfpImg=null; pfpView=null; iqImg=null; iqView=null; cacheView=null;
+  warmCancel();
   for (const k of [...tileCache.keys()]) cacheDrop(k); }
 async function enterIqMode(id){
   const j = await (await fetch('/api/iq_meta?id='+enc(id))).json();
@@ -1052,6 +1358,7 @@ document.getElementById('sensor').addEventListener('change', async e=>{
   meta.tmin=s.t_min; meta.tmax=s.t_max; view={t0:s.t_min,t1:s.t_max}; cacheView=null;
   psdImg=null; psdView=null; pfpImg=null; pfpView=null; layerMode='summary'; resetFreq(); layoutTimeSlider();
   psdScale=null; pfpScale={}; summaryLock={};        // recompute locked colours for the new sensor
+  warmCancel();                  // the old sensor's prefetch is now dead weight
   requestData();                                     // paint new sensor's summary now
   checkPsd(); checkPfp();                             // availability flags load in parallel
 });
@@ -1060,17 +1367,21 @@ document.getElementById('reset').addEventListener('click', ()=>{
 });
 
 // ---- Export: current view + key stats -> a single shareable PNG ---------
-function exportPNG(){
-  if (!meta || !cv.width) return null;
+// `supplied` = an already-composed heatmap bitmap (the full-extent strip);
+// `ov` overrides the window/layer facts the table reports, because those come
+// from the bitmap that was rendered, not from whatever is on screen.
+function exportPNG(supplied, ov){
+  if (!meta || (!supplied && !cv.width)) return null;
+  ov = ov || {};
   // In rotated mode the plot lives across two layers -- the turned heatmap
   // canvas and the upright label canvas -- so flatten them into one bitmap in
   // screen orientation, or the export would come out unlabelled.
-  let src = cv;
-  if (rotated){
+  let src = supplied || cv;
+  if (!supplied && rotated){
     const f=document.createElement('canvas');
     f.width=cv.height; f.height=cv.width;              // screen orientation
     const fg=f.getContext('2d');
-    fg.translate(f.width/2, f.height/2); fg.rotate(Math.PI/2);
+    fg.translate(f.width/2, f.height/2); fg.rotate(-Math.PI/2);   // match the CSS turn
     fg.drawImage(cv, -cv.width/2, -cv.height/2);
     fg.setTransform(DPR,0,0,DPR,0,0);
     fg.font='11px ui-sans-serif'; fg.textBaseline='middle';
@@ -1078,34 +1389,53 @@ function exportPNG(){
       fg.fillStyle=L.color;
       fg.textAlign = L.shift.startsWith('translate(-100%') ? 'right'
                    : L.shift.startsWith('translate(-50%') ? 'center' : 'left';
-      fg.fillText(L.text, L.sx, L.shift.endsWith('-100%)') ? L.sy-5 : L.sy);
+      // DOM anchors by the span's box; canvas by the baseline. translate(..,0)
+      // hangs the text below the point, translate(..,-100%) sits it above.
+      fg.fillText(L.text, L.sx,
+                  L.shift.endsWith(',0)') ? L.sy+6 :
+                  L.shift.endsWith('-100%)') ? L.sy-5 : L.sy);
     }
     src = f;
   }
   const M=26, W=1320;
-  const hmW=W-2*M, hmH=Math.round(hmW * src.height/src.width);
-  const lo=document.getElementById('lo').textContent, hi=document.getElementById('hi').textContent,
-        unit=document.getElementById('unit').textContent;
-  const layerName = layerMode==='iq' ? 'IQ capture STFT spectrogram'
-                  : layerMode==='pfp' ? 'PFP frame (~18 µs, folded 10 ms frame)'
-                  : layerMode==='psd' ? 'PSD (2250 bins @ 80 kHz)'
+  // A supplied strip is rendered at the size it is meant to be read at, so fit
+  // it inside the page width WITHOUT enlarging: blowing a 420 px strip up to
+  // 1268 only softens every column it took the trouble to render sharply.
+  const avail = W - 2*M;
+  const scale = supplied ? Math.min(1, avail / src.width) : avail / src.width;
+  const hmW = Math.round(src.width * scale), hmH = Math.round(src.height * scale);
+  const hmX = M + Math.round((avail - hmW) / 2);
+  const unit=document.getElementById('unit').textContent;
+  const lo = (ov.vmin !== undefined && ov.vmin !== null) ? ov.vmin.toFixed(0)
+           : document.getElementById('lo').textContent;
+  const hi = (ov.vmax !== undefined && ov.vmax !== null) ? ov.vmax.toFixed(0)
+           : document.getElementById('hi').textContent;
+  const lk = ov.kind || layerMode;
+  const layerName = lk==='iq' ? 'IQ capture STFT spectrogram'
+                  : lk==='pfp' ? 'PFP frame (~18 µs, folded 10 ms frame)'
+                  : lk==='psd' ? 'PSD (2250 bins @ 80 kHz)'
                   : 'Summary (channel power, ~90 s sweeps)';
+  const et0 = ov.t0 !== undefined ? ov.t0 : view.t0;
+  const et1 = ov.t1 !== undefined ? ov.t1 : view.t1;
+  const ef0 = ov.f0 !== undefined ? ov.f0 : viewF.f0;
+  const ef1 = ov.f1 !== undefined ? ov.f1 : viewF.f1;
   const rows=[];
   const srcName = (mode==='iq' && iqCap) ? iqCap.name : sensor;
   rows.push([mode==='iq' ? 'Capture' : 'Sensor', srcName]);
   if (mode==='iq' && iqCap) rows.push(['Capture params',
     (iqCap.fc/1e6).toFixed(3)+' MHz centre · '+(iqCap.fs/1e6).toFixed(2)+' Msps · '+iqCap.duration.toFixed(2)+' s · '+iqCap.dataset]);
-  rows.push(['Layer', layerName + (layerMode==='summary' ? '   ·   statistic: '+stat : '')]);
-  rows.push(['Time window (UTC)', fmtTs(view.t0)+'   →   '+fmtTs(view.t1)]);
-  rows.push(['Time span', fmtSpan(view.t1-view.t0)]);
-  if (layerMode==='pfp' && pfpView){
+  rows.push(['Layer', layerName + (lk==='summary' ? '   ·   statistic: '+stat : '')]);
+  if (ov.note) rows.push(['Extent', ov.note]);
+  rows.push(['Time window (UTC)', fmtTs(et0)+'   →   '+fmtTs(et1)]);
+  rows.push(['Time span', fmtSpan(et1-et0)]);
+  if (!supplied && layerMode==='pfp' && pfpView){
     rows.push(['Channel', (pfpView.freq/1e6).toFixed(0)+' MHz']);
     rows.push(['Frame structure', pfpView.npos+' pts over '+pfpFrameMs+' ms  (~'+(pfpFrameMs*1000/pfpView.npos).toFixed(1)+' µs/pt)']);
     rows.push(['Captures in view', String(pfpView.ncap)]);
   } else {
-    rows.push(['Frequency window', (viewF.f0/1e6).toFixed(3)+' MHz   →   '+(viewF.f1/1e6).toFixed(3)+' MHz']);
-    if (layerMode==='psd' && psdView) rows.push(['Captures in view', psdView.ncap+'  (× 2250 freq bins)']);
-    else if (data) rows.push(['Detail level', data.level+'   ('+data.count.toLocaleString()+' cells)']);
+    rows.push(['Frequency window', (ef0/1e6).toFixed(3)+' MHz   →   '+(ef1/1e6).toFixed(3)+' MHz']);
+    if (!supplied && layerMode==='psd' && psdView) rows.push(['Captures in view', psdView.ncap+'  (× 2250 freq bins)']);
+    else if (!supplied && data) rows.push(['Detail level', data.level+'   ('+data.count.toLocaleString()+' cells)']);
   }
   rows.push(['Colour scale', lo+'  …  '+hi+'  '+unit]);
   rows.push(['Colormap', cmapName.charAt(0).toUpperCase()+cmapName.slice(1)]);
@@ -1125,8 +1455,8 @@ function exportPNG(){
   g.fillText(layerName, M, y+32);
   y += titleH+14;
   g.imageSmoothingEnabled=true; g.imageSmoothingQuality='high';
-  g.drawImage(src, M, y, hmW, hmH);
-  g.strokeStyle='#262e40'; g.lineWidth=1; g.strokeRect(M+0.5, y+0.5, hmW, hmH);
+  g.drawImage(src, hmX, y, hmW, hmH);
+  g.strokeStyle='#262e40'; g.lineWidth=1; g.strokeRect(hmX+0.5, y+0.5, hmW, hmH);
   y += hmH+16;
   const cb=document.getElementById('cbar'), lgW=240;
   g.drawImage(cb, M, y, lgW, 14); g.strokeRect(M+0.5, y+0.5, lgW, 14);
@@ -1146,20 +1476,161 @@ function exportPNG(){
   }
   // attribution, bottom-right, aligned with the last ("Exported") row
   g.fillStyle='#7a8499'; g.font='13px ui-sans-serif'; g.textAlign='right';
-  g.fillText('@Jimmy Lu 2026', W-M, y-rowH/2);
+  g.fillText('Jimmy Lu 2026', W-M, y-rowH/2);
   g.textAlign='left';
-  const fn = 'spectrum_'+srcName.replace(/[^A-Za-z0-9-]/g,'')+'_'+new Date().toISOString().replace(/[:T]/g,'-').slice(0,19)+'.png';
+  const fn = 'spectrum_'+srcName.replace(/[^A-Za-z0-9-]/g,'')+'_'+(ov.suffix?ov.suffix+'_':'')+new Date().toISOString().replace(/[:T]/g,'-').slice(0,19)+'.png';
   c.toBlob(b=>{ if(!b) return; const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=fn; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),5000); }, 'image/png');
   return c;
 }
-document.getElementById('exportBtn').addEventListener('click', exportPNG);
+// ---- Export: choose what gets exported, not just when -------------------
+// A view on screen is bounded by the window; a figure for a paper usually wants
+// the WHOLE recording. Both are the same composition (heatmap + colour bar +
+// the statistics table), so only the bitmap handed to it differs.
+function withBand(f0, f1, fn){
+  const keep = {f0: viewF.f0, f1: viewF.f1};
+  viewF.f0 = f0; viewF.f1 = f1;
+  try { return fn(); } finally { viewF.f0 = keep.f0; viewF.f1 = keep.f1; }
+}
+// One layer, one window, at a pixel size of our choosing, drawn as a tall strip
+// with time down the long axis and the most recent at the top -- the same
+// orientation as Time-on-Y, so an exported figure matches what was on screen.
+async function renderStrip(t0, t1, f0, f1, stripW, stripH){
+  const tileW = Math.min(2048, Math.max(256, Math.round(stripH / 1)));   // time samples
+  const tileH = Math.max(256, Math.round(stripW * 3));                   // freq rows
+  let url = null, kind = null;
+  if (psdAvail){
+    kind = 'psd';
+    url = withWindow(t0, t1, () => withBand(f0, f1, () => psdUrl(tileW, tileH)));
+  } else if (pfpAvail && channelInView()){
+    kind = 'pfp';
+    const ch = nearestChannelHz();
+    url = withWindow(t0, t1, () => pfpUrl(ch, tileW, tileH));
+  }
+  const M = {l: 8, r: 92, t: 10, b: 46};
+  const c = document.createElement('canvas');
+  c.width = stripW + M.l + M.r; c.height = stripH + M.t + M.b;
+  const g = c.getContext('2d');
+  g.fillStyle = COL.chrome; g.fillRect(0, 0, c.width, c.height);
+  g.fillStyle = COL.plotBg; g.fillRect(M.l, M.t, stripW, stripH);
+
+  let drewLo = f0, drewHi = f1, note = '', vlo = null, vhi = null;
+  if (url){
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('the ' + kind.toUpperCase() + ' layer could not render '
+                               + 'this window: HTTP ' + r.status);
+    const j = JSON.parse(r.headers.get('X-Meta'));
+    const img = await createImageBitmap(await r.blob());
+    vlo = j.vmin; vhi = j.vmax;      // the scale THIS tile was coloured with
+    if (kind === 'psd'){ drewLo = j.fmin; drewHi = j.fmax; }
+    else note = (j.freq/1e6).toFixed(0) + ' MHz channel · frame position 0-'
+                + (j.frame_ms || pfpFrameMs) + ' ms';
+    g.save();
+    g.beginPath(); g.rect(M.l, M.t, stripW, stripH); g.clip();
+    g.imageSmoothingEnabled = false;
+    // rotate(-90deg): the tile's time axis (its x) goes UP the strip, newest at
+    // the top; its frequency axis (its y) goes across, low on the left.
+    g.translate(M.l + stripW/2, M.t + stripH/2);
+    g.rotate(-Math.PI/2);
+    g.drawImage(img, -stripH/2, -stripW/2, stripH, stripW);
+    g.restore();
+    img.close && img.close();
+  } else {
+    g.fillStyle = COL.dim; g.font = '13px ui-sans-serif'; g.textAlign = 'center';
+    g.fillText('no deep layer available for this sensor', c.width/2, M.t + stripH/2);
+    g.textAlign = 'left';
+  }
+
+  // axes: dates down the right edge, MHz across the bottom
+  g.font = '11px ui-sans-serif'; g.textBaseline = 'middle';
+  g.strokeStyle = COL.grid; g.lineWidth = 1;
+  const span = t1 - t0, nT = Math.max(2, Math.min(24, Math.round(stripH / 110)));
+  g.fillStyle = COL.label; g.textAlign = 'left';
+  for (let k = 0; k <= nT; k++){
+    const fr = k / nT, t = t0 + fr * span;
+    const y = M.t + stripH - fr * stripH;          // newest at the TOP
+    g.beginPath(); g.moveTo(M.l, y); g.lineTo(M.l + stripW, y); g.stroke();
+    g.fillText(fmtTs(t).slice(0, 16), M.l + stripW + 7, y);
+  }
+  g.textAlign = 'center'; g.textBaseline = 'top';
+  const dec = (drewHi - drewLo) < 20e6 ? 2 : 0;
+  for (let k = 0; k <= 4; k++){
+    const fr = k / 4, x = M.l + fr * stripW;
+    g.fillStyle = COL.label;
+    g.fillText(((drewLo + fr*(drewHi-drewLo))/1e6).toFixed(dec),
+               Math.max(M.l + 14, Math.min(M.l + stripW - 14, x)), M.t + stripH + 6);
+  }
+  g.fillStyle = COL.dim;
+  g.fillText(note || 'Frequency (MHz)', M.l + stripW/2, M.t + stripH + 24);
+  g.strokeStyle = '#262e40'; g.strokeRect(M.l + 0.5, M.t + 0.5, stripW, stripH);
+  return {canvas: c, kind, t0, t1, f0: drewLo, f1: drewHi, vmin: vlo, vmax: vhi};
+}
+
+let exportBusy = false;
+async function exportFullExtent(fullBand){
+  if (exportBusy || !meta) return;
+  exportBusy = true;
+  const btn = document.getElementById('exportBtn');
+  const label = btn.lastChild;
+  const was = label.textContent;
+  label.textContent = ' Rendering…';
+  try {
+    const f0 = fullBand ? BAND_F0 : viewF.f0, f1 = fullBand ? BAND_F1 : viewF.f1;
+    const strip = await renderStrip(meta.tmin, meta.tmax, f0, f1, 420, 2048);
+    exportPNG(strip.canvas, {
+      t0: strip.t0, t1: strip.t1, f0: strip.f0, f1: strip.f1,
+      vmin: strip.vmin, vmax: strip.vmax,
+      kind: strip.kind, suffix: 'fullextent',
+      note: 'Full recording, ' + (fullBand ? 'full band' : 'current band')
+            + ' · 2048 px of time',
+    });
+  } catch (e){
+    console.error('full-extent export:', e);
+    layerNote = ' · export failed: ' + e.message;
+    updateReadout();
+  } finally {
+    label.textContent = was; exportBusy = false;
+  }
+}
+
+(function(){
+  const grp = document.getElementById('exportGroup');
+  const btn = document.getElementById('exportBtn');
+  const menu = document.getElementById('exportMenu');
+  const close = () => { menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); };
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    menu.hidden = !menu.hidden;
+    btn.setAttribute('aria-expanded', String(!menu.hidden));
+  });
+  document.addEventListener('click', e => { if (!grp.contains(e.target)) close(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+  document.getElementById('expView').addEventListener('click', () => { close(); exportPNG(); });
+  document.getElementById('expFull').addEventListener('click', () => { close(); exportFullExtent(false); });
+  document.getElementById('expFullBand').addEventListener('click', () => { close(); exportFullExtent(true); });
+})();
+document.getElementById('bandw').addEventListener('input', e => {
+  bandFrac = Math.max(0.05, Math.min(1, (+e.target.value) / 100));
+  resize();
+});
 document.getElementById('rotate').addEventListener('click', e=>{
   rotated = !rotated;
-  Object.assign(PAD, rotated ? PAD_ROT : PAD_STD);
+  applyPad();
+  document.getElementById('bandGroup').hidden = !rotated;
   stage.classList.toggle('rot', rotated);
   e.currentTarget.setAttribute('aria-pressed', String(rotated));
   e.currentTarget.classList.toggle('active', rotated);
+  if (rotated && meta){
+    // Entering Time-on-Y opens on the WHOLE recording: the full time extent
+    // down the long axis and the full band across, one tall strip, so the
+    // shape of the entire dataset is visible before any zooming. Both axes
+    // reset on purpose -- arriving here from a channel-zoomed view with only
+    // an 8 MHz sliver showing is not "the entire recording".
+    view.t0 = meta.tmin; view.t1 = meta.tmax; clampTimeView();
+    resetFreq();
+  }
+  layoutSliders();
   resize();                       // re-render the scene for the swapped box
+  if (rotated) requestData();     // fetch the full-span window just adopted
 });
 document.getElementById('cmap').addEventListener('change', e=>{
   cmapName = e.target.value;

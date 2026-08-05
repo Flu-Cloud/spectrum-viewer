@@ -287,7 +287,18 @@ def main():
             real_errors = [e for e in errors if "favicon" not in e.lower()]
             check("no JavaScript error anywhere in the session",
                   not real_errors, "; ".join(real_errors[:3]))
-            real_bad = [r for r in bad_requests if "favicon" not in r.lower()]
+            # A cancelled TILE request is intended behaviour, not a failure: the
+            # viewer aborts a superseded tile on purpose (see fetchTile) so the
+            # one the user is waiting for is not queued behind stale ones, and it
+            # drops a prefetch that a sensor change made pointless. Only tile
+            # endpoints may abort, and only aborts are forgiven -- a 4xx/5xx, a
+            # refused connection, or an aborted page load still fails here.
+            def excused(r):
+                return ("net::ERR_ABORTED" in r
+                        and any(e in r for e in ("/api/psd_layer", "/api/pfp_frame",
+                                                 "/api/iq_layer")))
+            real_bad = [r for r in bad_requests
+                        if "favicon" not in r.lower() and not excused(r)]
             check("no request failed anywhere in the session",
                   not real_bad, "; ".join(real_bad[:3]))
             browser.close()

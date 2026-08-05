@@ -8,7 +8,8 @@ coarsest stored level that still fills the plot, renders it to a WebP tile
 and streams the bytes directly (metadata rides in the X-Meta header).
 
 Storage (built by build_db.py / *_ingest.py, then compact_db.py):
-    spectrum.duckdb  summaries; dBm stored as SMALLINT dBm*10
+    spectrum.duckdb  summaries; dBm as DOUBLE, or SMALLINT dBm*10 once
+                     compact_db.py has run (see _dbm_div -- both are served)
     psd.duckdb       psd_chunk: zlib blobs of 256 consecutive int8 spectra
     pfp.duckdb       pfp_chunk: zlib blobs of 1024 consecutive int8 frames
     iq.duckdb        iq_stft: int8 STFT pyramid per capture (iq_ingest.py)
@@ -18,6 +19,7 @@ Storage (built by build_db.py / *_ingest.py, then compact_db.py):
 
 """
 
+import base64
 import gzip
 import io
 import json
@@ -113,6 +115,34 @@ if os.path.exists(DB_PATH):
 else:
     con = None
     freqs = []          # no channel summaries; the PSD layer carries its own axis
+
+
+def _dbm_div():
+    """What the summary tables store per dBm: 1 for dBm, 10 for dBm*10.
+
+    spectrum.duckdb exists in two shapes. build_db.py writes mx/md/mn as DOUBLE
+    real dBm; compact_db.py rewrites them as SMALLINT dBm*10 (lossless at the
+    0.1 dBm the API rounds to anyway). serve.py reads both, so the scale has to
+    come off the file instead of being assumed -- and it was assumed twice, in
+    opposite directions: /api/heatmap always divided by 10, while _psd_match
+    never did. On any one database exactly one of them was therefore wrong by a
+    factor of 10, which is what put a -980 dBm PSD legend next to a summary
+    reading -98, and made the two layers jump when zoom crossed between them.
+    """
+    if con is None:
+        return 1.0
+    for tbl in ("lvl_h1", "lvl_m10", "lvl_d1", "raw"):
+        try:
+            r = con.execute("SELECT data_type FROM duckdb_columns() WHERE "
+                            "table_name=? AND column_name='mx'", [tbl]).fetchone()
+        except Exception:
+            continue
+        if r:
+            return 10.0 if "INT" in r[0].upper() else 1.0
+    return 1.0
+
+
+DBM_DIV = _dbm_div()
 # `summary` tells the viewer whether the top layer exists at all. Without it,
 # PSD is the zoomed-out view rather than something to fall back FROM.
 _META = {"sensors": _cbrs_sensors(), "freqs": freqs, "summary": con is not None}
@@ -127,11 +157,146 @@ if con is None:
 
 
 # ---- Colormaps + tile encoding (mirrored in viewer.html) ---------------
-CMAP_ANCHORS = np.array([
-    [0, 0, 4], [20, 11, 52], [57, 9, 98], [95, 19, 110], [133, 33, 107],
-    [169, 46, 94], [203, 65, 73], [230, 93, 47], [247, 131, 17],
-    [252, 173, 18], [250, 205, 42], [252, 255, 164],
-], dtype=np.float64)
+# The exact matplotlib 256-entry lookup tables, base64 of raw RGB bytes.
+#
+# These used to be approximations: inferno as 12 anchor colours linearly
+# interpolated, turbo as a 5th-order polynomial fit. Measured against
+# matplotlib, inferno was off by up to 34/255 (44 of its 256 entries wrong by
+# more than 8) and turbo by up to 251/255 on 235 of 256 entries -- so a tile
+# could not be compared against the NASCTN reference plots, which are drawn
+# with the real thing. A LUT is 768 bytes; there is no reason to approximate it.
+#
+# Greys_r (dark = low) is included because the SEA day plots draw PSD in it, and
+# viridis/plasma/magma because the published figures use those for the summary
+# and PFP panels. `fire` is colorcet CET-L4 and `hot` is matplotlib's: both are
+# monotonic in lightness with no purple anywhere, which is what a hot-spectrogram
+# ramp is usually wanted for -- inferno spends its lower half in purple, and
+# turbo peaks in brightness at index 156 and then DARKENS to (122,4,3), so the
+# strongest signals come out dimmer than mid ones. Both of those are faithful to
+# the originals; they are just poor choices for this, so better ones are offered.
+CMAP_B64 = {
+    "viridis":
+        "RAFURAJWRQRXRQVZRgdaRghcRgpdRgteRw1gRw5hRxBjRxFkRxNlSBRnSBZoSBdpSBhqSBpsSBttSBxuSB1vSB9wSCBx"
+        "SCFzSCN0SCR1SCV2SCZ3SCh4SCl5Ryp6Ryx6Ry17Ry58Ry99RjB+RjJ+RjN/RjSARTWBRTeBRTiCRDmDRDqDRDuEQz2E"
+        "Qz6FQj+FQkCGQkGGQUKHQUSHQEWIQEaIP0eIP0iJPkmJPkqJPkyKPU2KPU6KPE+KPFCLO1GLO1KLOlOLOlSMOVWMOVaM"
+        "OFiMOFmMN1qMN1uNNlyNNl2NNV6NNV+NNGCNNGGNM2KNM2ONMmSOMmWOMWaOMWeOMWiOMGmOMGqOL2uOL2yOLm2OLm6O"
+        "Lm+OLXCOLXGOLHGOLHKOLHOOK3SOK3WOKnaOKneOKniOKXmOKXqOKXuOKHyOKH2OJ36OJ3+OJ4COJoGOJoKOJoKOJYOO"
+        "JYSOJYWOJIaOJIeOI4iOI4mOI4qNIouNIoyNIo2NIY6NIY+NIZCNIZGMIJKMIJKMIJOMH5SMH5WLH5aLH5eLH5iLH5mK"
+        "H5qKHpuKHpyJHp2JH56JH5+IH6CIH6GIH6GHH6KHIKOGIKSGIaWFIaaFIqeFIqiEI6mDJKqDJauCJayCJq2BJ62BKK6A"
+        "Ka9/KrB/LLF+LbJ9LrN8L7R8MbV7MrZ6NLZ5Nbd5N7h4OLl3Orp2O7t1Pbx0P7xzQL1yQr5xRL9wRsBvSMFuSsFtTMJs"
+        "TsNrUMRqUsVpVMVoVsZnWMdlWshkXMhjXsliYMpgY8tfZcteZ8xcac1bbM1abs5YcM9Xc9BWddBUd9FTetFRfNJQf9NO"
+        "gdNNhNRLhtVJidVIi9ZGjtZFkNdDk9dBldhAmNg+m9k8ndk7oNo5oto3pds2qNs0qtwyrdwwsN0vst0ttd4ruN4put4o"
+        "vd8mwN8lwt8jxeAhyOAgyuEfzeEd0OEc0uIb1eIa2OIZ2uMZ3eMY3+MY4uQY5eQZ5+QZ6uUa7OUb7+Uc8eUd9OYe9uYg"
+        "+OYh++cj/ecl"
+        ,
+    "fire":
+        "AAAABgAADQAAEgAAFgAAGQAAHAAAHwAAIgAAJAAAJgAAKAAAKwAALQAALgAAMAAAMgAANAAANQAANwAAOAAAOgAAOwAA"
+        "PQAAPgAAQAAAQQAAQwAARAAARgAARwAASQAASgAATAAATQAATwAAUAAAUgAAUwAAVQAAVgAAWAAAWQEAWwEAXQEAXgEA"
+        "YAEAYQEAYwEAZQEAZgEAaAEAaQEAawEAbQEAbgEAcAEAcQEAcwEAdQEAdgEAeAIAegIAewIAfQIAfwIAgAIAggIAhAIA"
+        "hQIAhwIAiQIAigIAjAMAjgMAkAMAkQMAkwMAlQMAlgMAmAMAmgMAnAMAnQQAnwQAoQQAogQApAQApgQAqAQAqQQAqwUA"
+        "rQUArwUAsAUAsgUAtAUAtgYAuAYAuQYAuwYAvQYAvwcAwAcAwgcAxAcAxggAyAgAyQgAywgAzQkAzwkA0QkA0goA1AoA"
+        "1goA2AsA2gsA2wwA3QwA3w0A4Q0A4w4A5A8A5g8A6BAA6hEA6xMA7RQA7hYA8BgA8RsA8h0A8yAA9SMA9iYA9ikA9ywA"
+        "+C8A+TIA+TUA+jgA+jsA+z0A+0AA+0MA/EYA/EkA/EsA/U4A/VEA/VMA/VYA/VgA/lsA/l0A/l8A/mIA/mQA/mYA/mgA"
+        "/msA/m0A/m8A/nEA/nMA/nUA/ncA/nkA/nwA/34A/4AA/4IA/4MA/4UA/4cA/4kA/4sA/40A/48A/5EA/5MA/5QA/5YA"
+        "/5gA/5oA/5wA/50A/58A/6EA/6MA/6QB/6YB/6gB/6oB/6sB/60B/68B/7AB/7IC/7QC/7UC/7cC/7kC/7oC/7wD/70D"
+        "/78D/8ED/8IE/8QE/8YE/8cE/8kF/8oF/8wF/84G/88G/9EG/9IH/9QH/9UI/9cI/9kJ/9oJ/9wK/90K/98L/+AL/+IM"
+        "/+MN/+UO/+YP/+gQ/+oR/+sS/+0U/+4X//Aa//Ee//Mk//Qq//Uy//c7//hH//lT//ti//ty//yD//2V//6o//66//7M"
+        "//7e//7u////"
+        ,
+    "hot":
+        "CwAADQAAEAAAEgAAFQAAGAAAGgAAHQAAIAAAIgAAJQAAJwAAKgAALQAALwAAMgAANQAANwAAOgAAPAAAPwAAQgAARAAA"
+        "RwAASgAATAAATwAAUQAAVAAAVwAAWQAAXAAAXwAAYQAAZAAAZgAAaQAAbAAAbgAAcQAAdAAAdgAAeQAAewAAfgAAgQAA"
+        "gwAAhgAAiQAAiwAAjgAAkAAAkwAAlgAAmAAAmwAAngAAoAAAowAApQAAqAAAqwAArQAAsAAAswAAtQAAuAAAugAAvQAA"
+        "wAAAwgAAxQAAyAAAygAAzQAAzwAA0gAA1QAA1wAA2gAA3QAA3wAA4gAA5AAA5wAA6gAA7AAA7wAA8gAA9AAA9wAA+QAA"
+        "/AAA/wAA/wIA/wUA/wgA/woA/w0A/xAA/xIA/xUA/xcA/xoA/x0A/x8A/yIA/yUA/ycA/yoA/ywA/y8A/zIA/zQA/zcA"
+        "/zoA/zwA/z8A/0EA/0QA/0cA/0kA/0wA/08A/1EA/1QA/1YA/1kA/1wA/14A/2EA/2QA/2YA/2kA/2sA/24A/3EA/3MA"
+        "/3YA/3kA/3sA/34A/4AA/4MA/4YA/4gA/4sA/44A/5AA/5MA/5UA/5gA/5sA/50A/6AA/6IA/6UA/6gA/6oA/60A/7AA"
+        "/7IA/7UA/7cA/7oA/70A/78A/8IA/8UA/8cA/8oA/8wA/88A/9IA/9QA/9cA/9oA/9wA/98A/+EA/+QA/+cA/+kA/+wA"
+        "/+8A//EA//QA//YA//kA//wA//4A//8D//8H//8L//8P//8T//8X//8b//8f//8i//8m//8q//8u//8y//82//86//8+"
+        "//9C//9G//9K//9O//9S//9W//9a//9e//9h//9l//9p//9t//9x//91//95//99//+B//+F//+J//+N//+R//+V//+Z"
+        "//+d//+g//+k//+o//+s//+w//+0//+4//+8///A///E///I///M///Q///U///Y///c///f///j///n///r///v///z"
+        "///3///7////"
+        ,
+    "inferno":
+        "AAAEAQAFAQEGAQEIAgEKAgIMAgIOAwIQBAMSBAMUBQQXBgQZBwUbCAUdCQYfCgciCwckDAgmDQgpDgkrEAktEQowEgoy"
+        "FAs0FQs3Fgs5GAw8GQw+GwxBHAxDHgxFHwxIIQxKIwxMJAxPJgxRKAtTKQtVKwtXLQtZLwpbMQpcMgpeNApfNglhOAli"
+        "OQljOwlkPQllPglmQApnQgpoRApoRQppRwtqSQtqSgxrTAxrTQ1sTw1sUQ5sUg5tVA9tVQ9tVxBuWRBuWhFuXBJuXRJu"
+        "XxNuYRNuYhRuZBVuZRVuZxZuaRZuahdubBhubRhubxlucRluchpudBpudRtudxxteBxteh1tfB1tfR5tfx5sgB9sgiBs"
+        "hCBrhSFrhyFriCJqiiJqjCNpjSNpjyRpkCVokiVokyZnlSZnlydmmCdmmihlmylknSlknypjoCpjoitioyxhpSxgpi1g"
+        "qC5fqS5eqy9erTBdrjBcsDFbsTJaszJatDNZtjRYtzVXuTVWujZVvDdUvThTvzlSwDpRwTpQwztPxDxOxj1Nxz5MyD9L"
+        "ykBKy0FJzEJIzkNHz0RG0EVF0kZE00dD1EhC1UpB10s/2Ew+2U092k4821A73VE63lI431M34FU24VY14lc041kz5Fox"
+        "5Vww5l0v514u6GAt6WEr6mMq62Qp62Yo7Gcm7Wkl7mok72wj724h8G8g8XEf8XMd8nQc83Yb83gZ9HkY9XsX9X0V9n4U"
+        "9oAT94IS94QQ+IUP+IcO+IkM+YsL+YwK+Y4J+pAI+pIH+pQH+5YG+5cG+5kG+5sG+50H/J8H/KEI/KMJ/KUK/KYM/KgN"
+        "/KoP/KwR/K4S/LAU/LIW/LQY+7Ya+7gd+7of+7wh+74j+sAm+sIo+sQq+sYt+ccv+cky+cs1+M03+M8699E999NA9tVD"
+        "9tdG9dlJ9dtM9N1P9N9T9OFW8+Na8+Vd8uZh8uhl8upp8ext8e1x8e918fF58vJ98vSC8/WG8/aK9PiO9fmS9vqW+Pua"
+        "+fyd+v2h/P+k"
+        ,
+    "plasma":
+        "DQiHEAeIEweJFgeKGQaMGwaNHQaOIAaPIgaQJAaRJgWRKAWSKgWTLAWULgWVLwWWMQWXMwWXNQSYNwSZOASaOgSaPASb"
+        "PgScPwScQQSdQwOeRAOeRgOfSAOfSQOgSwOhTAKhTgKiUAKiUQKjUwKjVQKkVgGkWAGkWQGlWwGlXAGmXgGmYAGmYQCn"
+        "YwCnZACnZgCnZwCoaQCoagCobACobgCobwCocQCocgGodAGodQGodwGoeAGoegKoewKofQOofgOogASogQSngwWnhAWn"
+        "hgamhwemiAimigmliwqljQuljgykjw2kkQ6jkg+jlBCilRGhlhOhmBSgmRWfmhafnBeenRidnhmdoBqcoRuboh2aox6a"
+        "pR+ZpiCYpyGXqCKWqiOVqySUrCaUrSeTriiSsCmRsSqQsiuPsyyOtC6NtS+MtjCLtzGKuDKJujOIuzSIvDWHvTeGvjiF"
+        "vzmEwDqDwTuCwjyBwz2AxD5/xUB+xkF9x0J8yEN7yUR6ykV6y0Z5zEd4zEl3zUp2zkt1z0x00E1z0U5y0k9x01Fx1FJw"
+        "1VNv1VRu1lVt11Zs2Fdr2Vhq2lpq2ltp21xo3F1n3V5m3l9l3mFk32Jj4GNj4WRi4mVh4mZg42hf5Gle5Wpd5Wtd5mxc"
+        "525b529a6HBZ6XFY6XJX6nRX63VW63ZV7HdU7XlT7XpS7ntR73xR735Q8H9P8IBO8YFN8YNM8oRL84VL84dK9IhJ9IlI"
+        "9YtH9YxG9o1F9o9E95BE95FD95NC+JRB+JVA+Zc/+Zg++Zo++ps9+pw8+p47+586+6E5+6I4/KM4/KU3/KY2/Kg1/Kk0"
+        "/asz/awz/a4y/a8x/bEw/bIv/bQv/bUu/rct/rgs/ros/rsr/r0q/r4q/sAp/cIp/cMo/cUn/cYn/cgn/com/csm/M0l"
+        "/M4l/NAl/NIl+9Mk+9Uk+9ck+tgk+tok+dwk+d0l+N8l+OEl9+Il9+Ql9uYm9ugm9ekm9esn9O0n8+4n8/An8vIn8fQm"
+        "8fUl8Pck8Pkh"
+        ,
+    "magma":
+        "AAAEAQAFAQEGAQEIAgEJAgILAgINAwMPAwMSBAQUBQQWBgUYBgUaBwYcCAceCQcgCggiCwkkDAkmDQopDgsrEAstEQwv"
+        "Eg0xEw00FA42FQ44Fg87GA89GRA/GhBCHBBEHRFHHhFJIBFLIRFOIhFQJBJTJRJVJxJYKRFaKhFcLBFfLRFhLxFjMRFl"
+        "MxBnNBBpNhBrOBBsOQ9uOw9wPQ9xPw9yQA90Qg91RA92RRB3RxB4SRB4ShB5TBF6ThF7TxJ7URJ8UhN8VBN9VhR9VxV+"
+        "WRV+WhZ+XBZ/XRd/Xxh/YBiAYhmAZBqAZRqAZxuAaByBahyBax2BbR2Bbh6BcB+Bch+BcyCBdSGBdiGBeCKBeSKCeyOC"
+        "fCOCfiSCgCWCgSWBgyaBhCaBhieBiCeBiSiBiymBjCmBjiqBkCqBkSuBkyuAlCyAliyAmC2AmS2Amy5/nC5/ni9/oC9/"
+        "oTB+ozB+pTF+pjF9qDJ9qjN9qzN8rTR8rjR7sDV7sjV7szZ6tTZ6tzd5uDd5ujh4vDl4vTl3vzp3wDp2wjt1xDx1xTx0"
+        "xz1zyD5zyj5yzD9xzUBxz0Bw0EFv0kJv00Nu1URt1kVs2EVs2UZr20dq3Ehp3klo30po4Exn4k1m405l5E9k5VBk51Jj"
+        "6FNi6VRi6lZh61dg7Fhg7Vpf7lte711e8F9e8WBd8mJd8mRc82Vc9Gdc9Glc9Wtc9mxc9m5c93Bc93Jc+HRc+HZc+Xhd"
+        "+Xld+Xtd+n1e+n9e+oFf+4Nf+4Vg+4dh/Ilh/Ipi/Ixj/I5k/JBl/ZJm/ZRn/ZZo/Zhp/Zpq/Ztr/p1s/p9t/qFu/qNv"
+        "/qVx/qdy/qlz/qp0/qx2/q53/rB4/rJ6/rR7/rZ8/rd+/rl//ruB/r2C/r+E/sGF/sKH/sSI/saK/siM/sqN/syP/s2Q"
+        "/s+S/tGU/tOV/tWX/teZ/tia/dqc/dye/d6g/eCh/eKj/eOl/eWn/eep/emq/eus/Oyu/O6w/PCy/PK0/PS2/Pa4/Pe5"
+        "/Pm7/Pu9/P2/"
+        ,
+    "turbo":
+        "MBI7MhVDMxhKNBtRNR5YNiFfNyRmOCdtOSpzOi15Oy+APDKGPTWLPjiRPzuXPz6cQECiQUOnQUasQkmxQku1Q066RFG/"
+        "RFTDRFbHRVnLRVzPRV7TRmHWRmTaRmbdRmngRmvjR27mR3HpR3PrR3buR3jwR3vyRn30RoD2RoL4RoX6Rof7RYr8RYz9"
+        "RI/+Q5H+QpT/QZb/QJn/Ppv+PZ7+O6D9OqP8OKX7N6j6Nav4M633Ma/1L7L0LrTyLLfwKrnuKLzrJ77pJcDnI8PkIsXi"
+        "IMffH8ndHsvaHM3YG9DVGtLSGtTQGdXNGNfKGNnIGNvFGN3CGN7AGOC9GeK7GeO5GuS2HOa0HeeyH+mvIOqsIuuqJeyn"
+        "J+6kKu+hLPCeL/GbMvKYNfOUOPSRPPWOP/aKQ/eHRviESviATvl9Uvp6Vfp2WftzXfxvYfxsZf1paf1mbf5icf5fdf5c"
+        "ef5Zff9WgP9ThP9RiP9Oi/9Lj/9Jkv9Hlv5Emf5CnP5An/0/of09pPw8p/w6qfs5rPs4r/o3sfk2tPg2t/c1ufY1vPU0"
+        "vvQ0wfM0w/E0xvA0yO80y+00zew00Oo00uk11Oc11+U12eQ22+I23eA339834d0349s45dk459c56dU569M57NE67s86"
+        "78068cs68sk69Mc69cU69sM698E6+L45+bw5+ro5+7g4+7Y3/LM2/LE2/a41/aw0/qkz/qcy/qQx/qEw/p4v/pst/pks"
+        "/pYr/pMq/pAp/Y0n/Yom/Icl/IQj+4Ei+34h+nsf+Xge+XUd+HIc928a9mwZ9WkY9GYX82MV8mAU8V0T8FsS71gR7VUQ"
+        "7FMP61AO6k4N6EsM50kM5UcL5EUK4kMK4UEJ3z8I3T0I3DsH2jkH2DcG1jUG1DMF0jEF0C8Fzi0EzCsEyioEyCgDxSYD"
+        "wyUDwSMCviECvCACuR4Ctx0CtBsBshoBrxgBrBcBqRYBpxQBpBMBoRIBnhABmw8BmA4BlQ0BkgsBjgoBiwkCiAgChQcC"
+        "gQYCfgUCegQD"
+        ,
+    "greys":
+        "AAAAAQEBAgICAwMDBQUFBgYGBwcHCAgICQkJCgoKDAwMDQ0NDg4ODw8PEBAQERERExMTFBQUFRUVFhYWFxcXGBgYGhoa"
+        "GxsbHBwcHR0dHh4eHx8fISEhIiIiIyMjJCQkJSUlJycnKCgoKSkpKysrLCwsLi4uLy8vMDAwMjIyMzMzNTU1NjY2ODg4"
+        "OTk5Ojo6PDw8PT09Pz8/QEBAQUFBQ0NDRERERkZGR0dHSEhISkpKS0tLTU1NTk5OUFBQUVFRUlJSU1NTVFRUVVVVVlZW"
+        "V1dXWFhYWlpaW1tbXFxcXV1dXl5eX19fYGBgYWFhYmJiY2NjZGRkZWVlZmZmZ2dnaGhoaWlpampqa2trbGxsbW1tbm5u"
+        "b29vcHBwcXFxcnJyc3NzdXV1dnZ2d3d3eHh4eXl5enp6e3t7fHx8fX19fn5+f39/gYGBgoKCg4ODhISEhYWFhoaGh4eH"
+        "iIiIiYmJioqKjIyMjY2Njo6Oj4+PkJCQkZGRkpKSk5OTlJSUlZWVl5eXmJiYmZmZmpqanJycnZ2dnp6en5+foKCgoqKi"
+        "o6OjpKSkpaWlp6enqKioqampqqqqq6urra2trq6ur6+vsLCwsrKys7OztLS0tbW1tra2uLi4ubm5urq6u7u7vb29vr6+"
+        "vr6+v7+/wMDAwcHBwsLCw8PDxMTExcXFxcXFxsbGx8fHyMjIycnJysrKy8vLzMzMzMzMzc3Nzs7Oz8/P0NDQ0dHR0tLS"
+        "09PT1NTU1NTU1dXV1tbW19fX2NjY2dnZ2tra2tra29vb3Nzc3Nzc3d3d3t7e39/f39/f4ODg4eHh4eHh4uLi4+Pj5OTk"
+        "5OTk5eXl5ubm5+fn5+fn6Ojo6enp6enp6urq6+vr7Ozs7Ozs7e3t7u7u7u7u7+/v8PDw8PDw8fHx8fHx8vLy8vLy8/Pz"
+        "8/Pz9PT09PT09fX19fX19vb29vb29/f39/f39/f3+Pj4+Pj4+fn5+fn5+vr6+vr6+/v7+/v7/Pz8/Pz8/f39/f39/v7+"
+        "/v7+////////"
+        ,
+}
+
+
+def _load_luts():
+    return {k: np.frombuffer(base64.b64decode(v), np.uint8).reshape(256, 3)
+            for k, v in CMAP_B64.items()}
+
+
+LUTS = _load_luts()
+DEFAULT_CMAP = "viridis"
 
 
 class BadRequest(Exception):
@@ -175,27 +340,14 @@ def _locked_scale():
     return None if lo is None or hi is None else (lo, hi)
 
 
-def _build_lut(anchors):
-    seg = len(anchors) - 1
-    xs = np.linspace(0, seg, 256)
-    k = np.clip(np.floor(xs).astype(int), 0, seg - 1)
-    f = (xs - k)[:, None]
-    return np.clip(anchors[k] + (anchors[k + 1] - anchors[k]) * f, 0, 255).astype(np.uint8)
 
 
-def _turbo_lut():
-    x = np.linspace(0, 1, 256)
-    r = 34.61 + x*(1172.33 + x*(-10793.56 + x*(33300.12 + x*(-38394.49 + x*14825.05))))
-    g = 23.31 + x*(557.33 + x*(1225.33 + x*(-3574.96 + x*(3520.99 + x*-1300.91))))
-    b = 27.2 + x*(3211.1 + x*(-15327.97 + x*(27814.0 + x*(-22569.18 + x*6838.66))))
-    return np.clip(np.stack([r, g, b], axis=1), 0, 255).astype(np.uint8)
 
 
-LUTS = {"inferno": _build_lut(CMAP_ANCHORS), "turbo": _turbo_lut()}
 
 
-def _colorize(mat, vmin, vmax, cmap="inferno"):
-    lut = LUTS.get(cmap, LUTS["inferno"])
+def _colorize(mat, vmin, vmax, cmap=DEFAULT_CMAP):
+    lut = LUTS.get(cmap, LUTS[DEFAULT_CMAP])
     idx = np.clip((mat - vmin) / max(vmax - vmin, 1e-6) * 255, 0, 255)
     nan = ~np.isfinite(mat)
     idx[nan] = 0
@@ -208,9 +360,13 @@ def _tile(rgb, meta):
     """WebP tile bytes + metadata in the X-Meta header (no base64/JSON body:
     ~25% fewer bytes and the browser decodes the image natively)."""
     buf = io.BytesIO()
-    # q80/method=4: visually identical to lossless for spectrograms and ~7x
-    # faster to encode than method=6; encode speed dominates felt zoom latency.
-    Image.fromarray(rgb, "RGB").save(buf, format="WEBP", quality=80, method=4)
+    # Encoding the tile, not reading the database, is what a zoomed-in request
+    # spends its time on: a 5-minute window holding two captures still has to
+    # encode the full 2400x560 image, and at method=4 that was 94 ms of a 151 ms
+    # request. method=2 produces a byte-for-byte identical 14.1 KB on real frame
+    # tiles in 32 ms -- the extra effort levels above 2 buy nothing here because
+    # a spectrogram has little for the predictor to exploit. Measured on HU.
+    Image.fromarray(rgb, "RGB").save(buf, format="WEBP", quality=80, method=2)
     resp = Response(buf.getvalue(), mimetype="image/webp")
     resp.headers["X-Meta"] = json.dumps(meta)
     resp.headers["Cache-Control"] = "public, max-age=86400"
@@ -344,7 +500,21 @@ class _Grid:
             pad = (-nb) % fb
             if pad:                                    # pad < fb, so no group
                 b = np.pad(b, ((0, 0), (0, pad)))      # is padding-only
-            b = b.reshape(b.shape[0], b.shape[1] // fb, fb).max(axis=2)
+            # reshape(...).max(axis=2) is the obvious way to pool, but is ~10x
+            # slower than either alternative below on this uint8 shape -- numpy's
+            # generic reduce over a newly-introduced small axis does not vectorize
+            # well here. fb is almost always small (NF=2250 bins pooled onto a few
+            # hundred pixel rows), where a handful of strided elementwise max()
+            # calls beats reduceat; fb only gets large when h itself is tiny (a
+            # sliver of a plot), where reduceat wins instead. Both are exact,
+            # verified byte-for-byte against the reshape form on real data.
+            if fb <= 16:
+                pooled = b[:, 0::fb]
+                for k in range(1, fb):
+                    pooled = np.maximum(pooled, b[:, k::fb])
+                b = pooled
+            else:
+                b = np.maximum.reduceat(b, np.arange(0, b.shape[1], fb), axis=1)
         img = qmin + (b.T.astype(np.float32) / 255.0) * (qmax - qmin) + offset
         if self.filled.any():
             # Sample-and-hold: stretch every capture until the next one, so a
@@ -392,13 +562,15 @@ def heatmap():
         ORDER BY t
     """, [sensor, t0, t1]).fetchall()
 
-    # Columnar payload; dBm stored as SMALLINT dBm*10 -> /10 restores 0.1 dBm.
+    # Columnar payload, in real dBm. DBM_DIV is 10 on a compacted database (dBm
+    # stored as SMALLINT dBm*10) and 1 on the shape the ingest writes -- read off
+    # the file, not assumed; see _dbm_div.
     freq, t, mx, md, mn = [], [], [], [], []
     for r in rows:
         freq.append(r[0]); t.append(int(r[1]))
-        mx.append(None if r[2] is None else r[2] / 10.0)
-        md.append(None if r[3] is None else r[3] / 10.0)
-        mn.append(None if r[4] is None else r[4] / 10.0)
+        mx.append(None if r[2] is None else r[2] / DBM_DIV)
+        md.append(None if r[3] is None else r[3] / DBM_DIV)
+        mn.append(None if r[4] is None else r[4] / DBM_DIV)
     return _gz(jsonify({
         "level": tbl, "bucket": bucket, "count": len(rows),
         "freq": freq, "t": t, "max": mx, "median": md, "mean": mn,
@@ -417,6 +589,10 @@ PSD_DBM_OFFSET = 70.0
 _psd_con = None
 _psd_scale_cache = {}   # sensor -> (vmin, vmax) sampled across the whole range
 _psd_kind = None        # 'chunk' | 'rows' | None
+# Coarse-time PSD levels (bucket seconds, finest first) if ingest/build_psd_levels.py
+# has been run. Empty = no pyramid; every window is read from the captures, which
+# is what always happened and is why a very wide one took many seconds.
+_psd_lvls = []
 _psd_init = threading.Lock()
 
 
@@ -462,6 +638,19 @@ def psd_conn():
         if _psd_kind == "rows":
             print("[serve] psd.duckdb is the uncompacted row schema; serving it "
                   "directly. Run ingest/compact_db.py to shrink it.")
+        global _psd_lvls
+        if "psd_lvl" in t:
+            try:
+                _psd_lvls = sorted(r[0] for r in con.execute(
+                    "SELECT DISTINCT bucket FROM psd_lvl").fetchall())
+            except Exception:
+                _psd_lvls = []
+        if _psd_lvls:
+            print("[serve] PSD coarse levels available: "
+                  + ", ".join(f"{b}s" for b in _psd_lvls))
+        else:
+            print("[serve] no PSD coarse levels; very wide PSD windows will be "
+                  "slow. Build them with ingest/build_psd_levels.py.")
     return _psd_con
 
 
@@ -560,9 +749,13 @@ def _psd_match(c, sensor, qmin, qmax):
     if m is not None:
         return m or None                    # () = known no-match, cached
     try:
+        # /DBM_DIV for the same reason /api/heatmap does it: this is the scale the
+        # PSD layer is being matched ONTO, so it has to be the dBm the summary
+        # layer actually draws. Reading it raw off a compacted database made every
+        # matched PSD value, and the legend derived from it, 10x too large.
         s = np.array([r[0] for r in con.cursor().execute(
             "SELECT mx FROM lvl_h1 WHERE sensor=? AND mx IS NOT NULL",
-            [sensor]).fetchall()], np.float32)
+            [sensor]).fetchall()], np.float32) / DBM_DIV
     except Exception as e:
         print(f"[serve] colour match off for {sensor}: {e}")
         s = np.empty(0)
@@ -577,6 +770,64 @@ def _psd_match(c, sensor, qmin, qmax):
     m = (pq, sq, float(np.percentile(s, 2)), float(np.percentile(s, 98)))
     _match_cache[sensor] = m
     return m
+
+
+def _apply_match(img, match, qmin, qmax, offset):
+    """Remap img (dBm) onto the summary's dBm ramp -- same numbers as
+    np.interp(img, match[0], match[1]), by a faster path.
+
+    img comes from an int8-quantized, max-pooled grid, so however large the
+    tile is it only ever holds the 256 values that quantization allows (plus
+    NaN in gap columns). np.interp does a binary search per pixel to place
+    each of those into the 65-point match curve; building that mapping once
+    for the 256 possible inputs and gathering by index gets the identical
+    number without repeating the search millions of times. Verified
+    byte-for-byte equal to np.interp on real PSD tiles, gaps included.
+    """
+    v = np.arange(256, dtype=np.float64)
+    lut = np.interp(qmin + (v / 255.0) * (qmax - qmin) + offset,
+                    match[0], match[1]).astype(np.float32)
+    finite = np.isfinite(img)
+    idx = np.zeros(img.shape, dtype=np.uint8)
+    if finite.any():
+        scaled = (img[finite] - offset - qmin) * (255.0 / (qmax - qmin))
+        idx[finite] = np.clip(np.round(scaled), 0, 255).astype(np.uint8)
+    out = lut[idx]
+    out[~finite] = np.nan
+    return out
+
+
+def _pfp_nearest(c, sensor, freq, t1, npos):
+    """The one frame to hold when the window itself is empty.
+
+    The PSD layer has had this since the deep-zoom work; the frame layer needs
+    it more, not less. A sweep dwells on each channel once every ~90 s, so any
+    window shorter than that -- which is most of the frame layer's useful range
+    -- can easily contain no capture for the channel on screen at all. Without a
+    frame to hold, that window renders as nothing and zooming in far enough
+    turns the layer blank rather than steady.
+    """
+    if _pfp_kind == "chunk":
+        row = c.execute("SELECT n, times, frames FROM pfp_chunk WHERE sensor=? "
+                        "AND freq=? AND t0<? ORDER BY t0 DESC LIMIT 1",
+                        [sensor, freq, t1]).fetchone()
+        if row is None:
+            row = c.execute("SELECT n, times, frames FROM pfp_chunk WHERE "
+                            "sensor=? AND freq=? ORDER BY t0 LIMIT 1",
+                            [sensor, freq]).fetchone()
+        if row is None:
+            return None
+        ts, frames = _unpack([row], npos)
+        i = max(0, int(np.searchsorted(ts, t1)) - 1)
+        return frames[i:i + 1]
+    row = c.execute("SELECT t, frame FROM pfp WHERE sensor=? AND freq=? AND t<? "
+                    "ORDER BY t DESC LIMIT 1", [sensor, freq, t1]).fetchone()
+    if row is None:
+        row = c.execute("SELECT t, frame FROM pfp WHERE sensor=? AND freq=? "
+                        "ORDER BY t LIMIT 1", [sensor, freq]).fetchone()
+    if row is None:
+        return None
+    return _unpack_rows([row], npos)[1]
 
 
 def _psd_count(c, sensor, t0, t1):
@@ -623,6 +874,80 @@ _PWIN_CACHE, _PWIN_MAX = {}, 4
 _pwin_lock = threading.Lock()
 
 
+def _pick_psd_level(span, cols, ncap):
+    """Which coarse bucket to draw this window from, or None for the captures.
+
+    Two guards, both learned the hard way by measuring against a no-thinning
+    render of the same window:
+
+    * A bucket must be no wider than a pixel column, so a column is built from
+      whole buckets rather than a fraction of one.
+    * The capture path must be one that would THIN. Below about three weeks it
+      reads every capture and is therefore exactly right, so a level there
+      could only ever make the answer worse, however fast it is.
+
+    Where both hold, the level is both faster and closer to the true max than
+    reading one capture in N -- which is the only reason to prefer it.
+    """
+    if not _psd_lvls or cols <= 0 or span <= 0:
+        return None
+    if _stride_for(ncap, cols) <= 1:
+        return None                       # captures are exact here; leave them
+    col = span / cols
+    usable = [b for b in _psd_lvls if b <= col]
+    return max(usable) if usable else None
+
+
+def _fill_from_levels(grid, rows, t0, t1, lvl, cols, ncap):
+    """Pool coarse level rows onto the grid's columns.
+
+    Every column takes the max of every bucket that OVERLAPS it, not just the
+    one whose centre happens to land in it. Placing by centre looked right and
+    measured badly -- 0.9 dB mean and 31 dB worst case against a no-thinning
+    render -- because the rest of a straddling bucket's time was credited to a
+    neighbouring column, so structure slid sideways by up to half a column.
+    Overlap assignment can only ever over-include (a column's edges may carry
+    part of the adjacent bucket, the same way the summary pyramid's cells do)
+    and never moves or drops anything.
+    """
+    # One join + one frombuffer, not one frombuffer per row: at the finest level
+    # a wide window is tens of thousands of 2250-byte rows, and building that
+    # many little arrays and stacking them cost more than the query.
+    ts = np.fromiter((r[0] for r in rows), np.float64, len(rows))
+    mat = np.frombuffer(b"".join(r[1] for r in rows),
+                        np.uint8).reshape(len(rows), NF)
+    span = max(t1 - t0, 1e-9)
+    col_w = span / cols
+
+    def put(ci, m):
+        ok = (ci >= 0) & (ci < cols)
+        if not ok.any():
+            return
+        ci, m = ci[ok], m[ok]
+        # rows arrive ORDER BY t, so the column index is already non-decreasing
+        # and reduceat can group in place; only sort if that ever stops holding.
+        if ci.size > 1 and np.any(np.diff(ci) < 0):
+            order = np.argsort(ci, kind="stable")
+            ci, m = ci[order], m[order]
+        starts = np.flatnonzero(np.r_[True, ci[1:] != ci[:-1]])
+        pooled = np.maximum.reduceat(m, starts, axis=0)
+        uniq = ci[starts]
+        grid.buf[uniq] = np.maximum(grid.buf[uniq], pooled)
+        grid.filled[uniq] = True
+
+    first = np.floor((ts - t0) / col_w).astype(np.int64)
+    last = np.floor((ts + lvl - 1e-9 - t0) / col_w).astype(np.int64)
+    for k in range(int(math.ceil(lvl / col_w)) + 1):
+        step = first + k
+        sel = step <= last
+        if not sel.any():
+            break
+        put(step[sel], mat[sel])
+    # The readout says how many captures are behind the picture; that is still
+    # the capture count, not the number of level rows it was summarised into.
+    grid.ncap = ncap
+
+
 def _psd_window(c, sensor, t0, t1, cols, fi0, fi1):
     """Spectra in [t0,t1), max-pooled onto `cols` uniform time bins.
 
@@ -641,7 +966,29 @@ def _psd_window(c, sensor, t0, t1, cols, fi0, fi1):
     if hit is not None:
         return _pwin_slice(hit[0], fi0, fi1), hit[1]
     grid = _Grid(t0, t1, cols, NF)
-    stride = _stride_for(_psd_count(c, sensor, t0, t1), cols)
+
+    # A coarse level, when one is no wider than a pixel column. Reading a few
+    # thousand 2250-byte rows instead of inflating every chunk in range is what
+    # takes a full-span window from ~18 s to well under one, and it is also the
+    # more faithful answer: the level row is the max over EVERY capture in its
+    # bucket, where the capture path below keeps only every Nth one at these
+    # widths. Sound because the layer is a max -- see build_psd_levels.py.
+    ncap = _psd_count(c, sensor, t0, t1)       # metadata only, no BLOBs read
+    lvl = _pick_psd_level(t1 - t0, cols, ncap)
+    if lvl is not None:
+        rows = c.execute("SELECT t, smax FROM psd_lvl WHERE sensor=? AND bucket=? "
+                         "AND t>=? AND t<? ORDER BY t",
+                         [sensor, lvl, t0 - lvl, t1]).fetchall()
+        if rows:
+            _fill_from_levels(grid, rows, t0, t1, lvl, cols, ncap)
+            gap = not grid.filled.all()
+            with _pwin_lock:
+                _PWIN_CACHE[key] = (grid, gap)
+                while len(_PWIN_CACHE) > _PWIN_MAX:
+                    _PWIN_CACHE.pop(next(iter(_PWIN_CACHE)))
+            return _pwin_slice(grid, fi0, fi1), gap
+
+    stride = _stride_for(ncap, cols)
 
     if _psd_kind == "chunk":
         cur = c.execute("SELECT t0, n, times, specs FROM psd_chunk WHERE sensor=? "
@@ -751,7 +1098,7 @@ def psd_layer():
     img = grid.image(qmin, qmax, H, PSD_DBM_OFFSET)   # (nF, cols); row 0 = low f
     match = _psd_match(cur, sensor, qmin, qmax)
     if match is not None:                 # remap onto the summary's dBm ramp
-        img = np.interp(img, match[0], match[1]).astype(np.float32)
+        img = _apply_match(img, match, qmin, qmax, PSD_DBM_OFFSET)
     locked = _locked_scale()
     if locked:
         vmin, vmax = locked
@@ -898,13 +1245,23 @@ def pfp_frame():
                                 np.uint8).reshape(len(rows), npos)
             grid.add(ts, mat)
     if not grid.filled.any():
-        return jsonify({"error": "no pfp in window"}), 404
+        # Nothing for this channel inside the window: hold the frame that was
+        # last measured before it, exactly as the PSD layer does, so zooming
+        # past the ~90 s sweep interval goes steady rather than blank.
+        held = _pfp_nearest(q, sensor, ch, t1, npos)
+        if held is None:
+            return jsonify({"error": "no pfp in window"}), 404
+        grid.add(np.array([t0], np.float64), held)
     img = grid.image(qmin, qmax, H)        # (nrows, cols); row 0 = frame start
     locked = _locked_scale()
     if locked:
         vmin, vmax = locked
     else:
-        seen = img[np.isfinite(img)]       # ignore the empty (gap) columns
+        # Every 8th finite value, not all 1.3M of them: two exact percentiles
+        # cost 9 ms of partitioning per request and the 2nd/98th of a tile this
+        # size are the same numbers either way (checked on HU: -88.59/-87.18
+        # both ways). The gap columns stay excluded.
+        seen = img[np.isfinite(img)][::8]
         vmin = float(np.percentile(seen, 2)); vmax = float(np.percentile(seen, 98))
     return _tile(_colorize(img, vmin, vmax, request.args.get("cmap", "inferno")), {
         "t0": t0, "t1": t1, "ncap": int(grid.ncap),

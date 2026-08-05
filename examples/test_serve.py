@@ -31,7 +31,20 @@ import test_atlas as TA                                       # noqa: E402
 import test_ingest as TI                                      # noqa: E402
 
 failed = 0
-CMAPS = ("inferno", "turbo", "not-a-colormap")   # unknown must fall back, not fail
+CMAPS = ("inferno", "viridis", "plasma", "magma", "turbo", "greys",
+         "not-a-colormap")                       # unknown must fall back, not fail
+# Reference values sampled from matplotlib's own LUTs at index 0/128/255
+# (Greys_r for 'greys'). The colormaps used to be approximations -- a 12-anchor
+# inferno and a polynomial turbo, off by up to 34 and 251 of 255 -- so a tile
+# could not be laid beside a NASCTN reference plot. Pin them.
+CMAP_REF = {
+    "viridis": ((68, 1, 84), (33, 145, 140), (253, 231, 37)),
+    "inferno": ((0, 0, 4), (188, 55, 84), (252, 255, 164)),
+    "plasma":  ((13, 8, 135), (204, 71, 120), (240, 249, 33)),
+    "magma":   ((0, 0, 4), (183, 55, 121), (252, 253, 191)),
+    "turbo":   ((48, 18, 59), (164, 252, 60), (122, 4, 3)),
+    "greys":   ((0, 0, 0), (151, 151, 151), (255, 255, 255)),
+}
 
 
 def check(name, ok, detail=""):
@@ -122,6 +135,74 @@ def main():
               f"{r.status_code}, {len(r.data)} bytes")
         check("GET / is served no-store, so a stale viewer cannot linger",
               "no-store" in r.headers.get("Cache-Control", ""))
+
+        # ---- the colormaps are the real ones, on both sides of the wire ----
+        # A tile is only comparable to a published NASCTN figure if the ramp is
+        # matplotlib's actual LUT, and only self-consistent if the client-drawn
+        # summary uses the identical bytes. Check the server's table against
+        # known matplotlib values, then that viewer.html carries the same
+        # base64 blobs.
+        bad = []
+        for name, (c0, c128, c255) in CMAP_REF.items():
+            lut = serve.LUTS.get(name)
+            if lut is None:
+                bad.append(f"{name}: missing"); continue
+            for i, want in ((0, c0), (128, c128), (255, c255)):
+                got = tuple(int(v) for v in lut[i])
+                if got != want:
+                    bad.append(f"{name}[{i}] {got} != matplotlib {want}")
+        check("every colormap is matplotlib's exact 256-entry LUT",
+              not bad, "; ".join(bad[:3]))
+
+        # ---- the PSD coarse-level guards ----
+        # A level may only be used where it is BOTH fast and at least as true as
+        # reading the captures. Both guards were added after measuring a level
+        # against a no-thinning render and finding it worse; pin them.
+        saved = serve._psd_lvls
+        try:
+            serve._psd_lvls = [600, 3600, 21600]
+            cols = 2644
+            big = 10_000_000          # forces stride > 1
+            checks = [
+                ("no levels on disk -> captures", [], 200*86400, big, None),
+                ("captures already exact -> captures", [600], 200*86400, 10, None),
+                ("no bucket fits a narrow column", [3600], 3*86400, big, None),
+                ("coarsest bucket that fits wins", [600, 3600, 21600],
+                 200*86400, big, 3600),
+                ("finer level when the coarse one is too wide",
+                 [600, 3600], 60*86400, big, 600),
+            ]
+            bad = []
+            for name, lvls, span, ncap, want in checks:
+                serve._psd_lvls = lvls
+                got = serve._pick_psd_level(span, cols, ncap)
+                if got != want:
+                    bad.append(f"{name}: got {got}, want {want}")
+            check("PSD level choice obeys both guards", not bad, "; ".join(bad))
+
+            # overlap assignment: every column a bucket touches gets it, and
+            # nothing lands in a column the bucket never covered.
+            serve._psd_lvls = [600]
+            g = serve._Grid(0.0, 6000.0, 10, serve.NF)   # 10 cols x 600 s each
+            rows = [(1200, bytes([7]) * serve.NF), (1800, bytes([9]) * serve.NF)]
+            serve._fill_from_levels(g, rows, 0.0, 6000.0, 600, 10, 123)
+            filled = [i for i in range(10) if g.filled[i]]
+            vals = [int(g.buf[i][0]) for i in range(10)]
+            ok = (filled == [2, 3] and vals[2] == 7 and vals[3] == 9
+                  and g.ncap == 123)
+            check("coarse rows land only in the columns they cover",
+                  ok, f"filled={filled} vals={vals[:5]} ncap={g.ncap}")
+        finally:
+            serve._psd_lvls = saved
+
+        import base64                                          # noqa: E402
+        page = c.get("/").data.decode("utf8", "replace")
+        missing = [n for n in CMAP_REF
+                   if base64.b64encode(serve.LUTS[n].tobytes()).decode()[:64] not in
+                   page.replace("'+\n", "").replace("'", "").replace("\n", "")
+                   .replace(" ", "")]
+        check("viewer.html carries the same colormap bytes as the server",
+              not missing, "not found in the page: " + ", ".join(missing))
         r = c.get("/api/meta")
         m = r.get_json()
         names = [s.get("sensor") for s in (m.get("sensors") or [])]
@@ -232,6 +313,21 @@ def main():
                   f"&t0={pt0}&t1={pt1}")
         check("pfp_frame for a channel that does not exist answers cleanly",
               r.status_code in (200, 404), str(r.status_code))
+
+        # A sweep dwells on each channel about once every 90 s, so most of the
+        # frame layer's useful zoom range is windows holding no capture for the
+        # channel on screen. Those must hold the last measured frame, the way
+        # the PSD layer does -- answering 404 turns deep zoom blank.
+        mid = (pt0 + pt1) / 2
+        blanked = []
+        for span in (30.0, 1.0, 0.1):
+            rr = c.get(f"/api/pfp_frame?sensor={sensor}&freq={freq}"
+                       f"&t0={mid - span / 2}&t1={mid + span / 2}&w=900&h=300")
+            ok, why = tile_ok(rr)
+            if not ok:
+                blanked.append(f"{span}s: {why}")
+        check("pfp_frame holds the last frame below the sweep interval",
+              not blanked, "; ".join(blanked))
 
         # ---- IQ layer: the source dropdown plus both zoom axes ----
         cap = caps[0]
