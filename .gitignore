@@ -43,3 +43,6 @@ desktop.ini
 
 # Local copy of the CBRS source CSVs (default SEA_DATA_ROOT)
 SEA-DATA/
+
+# Quarantine for cleanup moves (empty this folder to really delete)
+_to_delete/
