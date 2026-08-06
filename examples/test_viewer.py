@@ -95,6 +95,76 @@ def build(tmp):
     return dbs, env
 
 
+def summary_reuse_checks(page, check, settle):
+    """Zooming the summary layer must paint from what is already on hand.
+
+    The tile layers reuse a cached window that CONTAINS the wanted one, so a
+    zoom draws correct-but-coarser data immediately and refines underneath. The
+    summary layer was exact-match only, which made it the one layer with no
+    instant paint: every notch, and every zoom-out crossing back from PSD, sat
+    on the stretched preview until the network answered -- measured at 302 ms
+    against 23 ms once the reuse existed.
+
+    Skipped unless this fixture actually has a summary layer to zoom.
+    """
+    if not page.evaluate("summaryAvail === true"):
+        return
+    # This fixture spans less than PSD_THRESHOLD, so every window in it belongs
+    # to the PSD layer and zooming can never reach the summary -- the check would
+    # skip silently and test nothing. Switching the deeper layer off for the
+    # duration is what makes buildReq choose the summary, which is the path under
+    # test; the layer flag is restored afterwards.
+    page.evaluate("() => { window.__psdWas = psdAvail; psdAvail = false; }")
+    try:
+        _summary_reuse_body(page, check, settle)
+    finally:
+        page.evaluate("() => { psdAvail = window.__psdWas; }")
+        settle()
+
+
+def _summary_reuse_body(page, check, settle):
+    # A wide window first, so there is something in the cache to reuse, then a
+    # window strictly inside it.
+    page.evaluate("""async () => {
+        view.t0 = meta.tmin; view.t1 = meta.tmax;
+        clampTimeView(); layoutSliders(); requestData();
+        for (let i=0;i<150 && !(layerMode==='summary' && data); i++)
+            await new Promise(r=>setTimeout(r,100));
+    }""")
+    settle()
+    if not page.evaluate("layerMode==='summary' && !!data"):
+        check("zooming the summary paints instantly from a wider cached window",
+              False, "could not reach the summary layer to test it")
+        return
+    # What separates a reuse from "the stale picture is still up" is NOT that
+    # something is drawn -- something always is. It is that the viewer stops
+    # reporting a wait: on a reuse requestData calls setLoading(false) and the
+    # follow-up refine is soft, so the bar is never raised. Without the reuse the
+    # same gesture raises it and the user waits on the network. A first version of
+    # this check asserted only "layerMode is summary and data is set", which is
+    # true either way -- it passed with the reuse removed.
+    got = page.evaluate("""async () => {
+        window.__load = [];
+        const realSet = window.setLoading;
+        window.setLoading = function(on){ window.__load.push(!!on); return realSet.apply(this, arguments); };
+        const t0 = performance.now();
+        const c = (view.t0+view.t1)/2, s = (view.t1-view.t0)*0.45;   // strictly inside
+        view.t0 = c-s/2; view.t1 = c+s/2;
+        clampTimeView(); layoutSliders(); requestData();
+        const sync = {ms: Math.round(performance.now()-t0),
+                      drawn: layerMode==='summary' && !!data,
+                      calls: window.__load.slice()};
+        await new Promise(r => setTimeout(r, 900));      // let the refine happen
+        sync.callsAfter = window.__load.slice();
+        window.setLoading = realSet;
+        return sync;
+    }""")
+    waited = any(got["callsAfter"])
+    check("zooming the summary paints instantly from a wider cached window",
+          got["drawn"] and got["ms"] < 150 and not waited,
+          f"{got['ms']} ms, loading raised: {waited} (setLoading calls: {got['callsAfter']})")
+
+
 def warm_checks(page, check, settle):
     """Idle prefetching must stay quiet, especially when a warm cannot succeed.
 
@@ -446,6 +516,7 @@ def main():
                       tiles_drawn() > 0)
 
             zone_checks(page, check, settle)
+            summary_reuse_checks(page, check, settle)
             warm_checks(page, check, settle)
 
             reset = page.locator("#reset")

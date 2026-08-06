@@ -824,7 +824,27 @@ function tileWin(url){ const p=new URL(url, location.origin).searchParams;
 function cacheFind(req){
   const hit = cacheGet(req.url);
   if (hit) return {hit, exact:true};
-  if (req.kind!=='psd' && req.kind!=='pfp') return null;   // summary/IQ keep exact-match
+  if (req.kind==='summary'){
+    // A summary payload draws every cell at its own timestamp and clips to the
+    // plot area, so one covering a WIDER window is already a correct picture of
+    // this one -- coarser in time, because its buckets are wider, exactly like a
+    // reused tile. Without this the summary layer was the only one with no
+    // instant paint: every zoom notch, and every zoom-out that crossed back from
+    // PSD, sat on the stretched preview until the network answered.
+    const swant = tileWin(req.url), sid = tileId(req.url);
+    let surl=null, sbest=Infinity;
+    for (const [k, v] of tileCache){
+      if (!v || !v.data) continue;                  // tiles hold img/j, not data
+      const kid = tileId(k, v);
+      if (kid.path!==sid.path || kid.sensor!==sid.sensor) continue;
+      const got = tileWin(k);
+      if (!(got.t0 <= swant.t0 && got.t1 >= swant.t1)) continue;
+      const s = (got.t1-got.t0) / Math.max(1e-9, swant.t1-swant.t0);
+      if (s < sbest){ sbest=s; surl=k; }            // tightest containing window
+    }
+    return surl ? {hit:cacheGet(surl), exact:false} : null;
+  }
+  if (req.kind!=='psd' && req.kind!=='pfp') return null;   // IQ keeps exact-match
   const id = tileId(req.url), want = tileWin(req.url);
   let url=null, best=Infinity;
   for (const [k, v] of tileCache){
@@ -916,6 +936,7 @@ function pfpHint(){
 
 function requestData(){
   schedulePreview();                        // instant, smooth stretch
+  warmAbort();       // the user is waiting on something now; stop speculating
   const req=buildReq(), f=cacheFind(req);
   let soft=false;
   if (f){ clearTimeout(fetchTimer); ++fetchSeq; layerNote='';   // instant: cancel debounce + in-flight fetch
@@ -1001,11 +1022,28 @@ async function fetchPsdOrSummary(seq){
   }
   await fetchSummary(seq);
 }
+// The summary shares `inflight` with the tile layers, and that is the whole
+// point. It used to be a bare fetch with no AbortController, so it opted out of
+// the one-request-at-a-time discipline the comment above fetchTile explains:
+// zooming out is a burst of windows, only the last is ever drawn, and every
+// superseded /api/heatmap kept running -- a server-side scan each, holding
+// sockets from the browser's six per origin, so the window the user actually
+// stopped on queued behind the ones they had already left. Aborting is also what
+// makes the summary the thing that cancels a PSD tile and vice versa: crossing
+// the threshold in either direction should abandon the layer being left.
 async function fetchSummary(seq){
-  const w=Math.round(plotW());
-  const j=await (await fetch(sumUrl(w))).json();
-  if (seq!==fetchSeq) return;
-  applySummary(j); cacheSet(sumUrl(w),{data:j}); setLoading(false);
+  const w=Math.round(plotW()), url=sumUrl(w);
+  if (inflight) inflight.abort();
+  const ac = inflight = new AbortController();
+  try{
+    const j = await (await fetch(url, {signal: ac.signal})).json();
+    if (seq!==fetchSeq) return;
+    applySummary(j); cacheSet(url,{data:j}); setLoading(false);
+  }catch(e){
+    if (e.name==='AbortError' || seq!==fetchSeq) return;   // superseded, not failed
+    console.warn('summary layer:', e.message);
+    layerNote=' · summary unavailable: '+e.message; setLoading(false); updateReadout();
+  }finally{ if (inflight===ac) inflight=null; }
 }
 
 // ---- Warming the drill layers ------------------------------------------
@@ -1037,7 +1075,17 @@ const WARM_FAILED_MAX = 64;
 // Switching sensor or mode makes any warm tile in flight worthless -- and on a
 // multi-GB database it is a scan worth several seconds that would otherwise run
 // to completion competing with the tile the user now actually wants.
-function warmCancel(){ if (warmAC){ warmAC.abort(); warmAC=null; } warmFailed.clear(); }
+// Abort a warm in flight WITHOUT forgetting which URLs failed. A warm is a full
+// window scan on a multi-GB database; while it runs it holds one of the browser's
+// six sockets per origin and a share of the server, so leaving it going while the
+// user is waiting on a real tile is the same queueing problem `inflight` exists to
+// prevent -- it just was not covered, because a warm is nobody's foreground
+// request until the moment the user navigates. The chain re-arms itself off the
+// next settled render, so nothing is lost by dropping it here.
+function warmAbort(){ if (warmAC){ warmAC.abort(); warmAC=null; } }
+// Sensor or mode change: also forget the failure memo, since a different sensor's
+// URLs are different URLs and a fresh start is what the user asked for.
+function warmCancel(){ warmAbort(); warmFailed.clear(); }
 function warmSoon(){
   if (warmQueued || warming || mode!=='cbrs' || !meta) return;
   warmQueued=true;
