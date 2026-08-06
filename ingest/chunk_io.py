@@ -60,6 +60,46 @@ def schema_of(connection, base):
     return "empty"
 
 
+def stored_times(connection, base, sensor, kind):
+    """Every capture instant stored for this sensor, as epoch seconds.
+
+    One read for the whole sensor, so callers can test many candidate files
+    against it without a query each.
+    """
+    chunk, rows, _n, _k = LAYOUT[base]
+    if kind == "rows":
+        return np.array([r[0] for r in connection.execute(
+            f"SELECT t FROM {rows} WHERE sensor=?", [sensor]).fetchall()],
+            dtype=np.float64)
+    if kind != "chunk":
+        return np.empty(0, np.float64)
+    parts = []
+    for (blob,) in connection.execute(
+            f"SELECT times FROM {chunk} WHERE sensor=?", [sensor]).fetchall():
+        ts = np.frombuffer(zlib.decompress(blob), dtype=np.float64)
+        if ts.size:
+            parts.append(ts)
+    return np.concatenate(parts) if parts else np.empty(0, np.float64)
+
+
+def already_have(stored_ms, t):
+    """Is this exact capture instant already stored? (milliseconds, as a set.)
+
+    The resume test this replaces asked "does the database hold any capture on
+    the day this file is NAMED for", and that is not the same question. A CBRS
+    export runs from just after midnight to just after the NEXT midnight -- the
+    real ones end at 00:00:22 on day D+1 -- so ingesting day D always put a
+    capture into day D+1 and marked D+1 complete. Day D+1's file was then
+    skipped in full, silently: measured on three real days, 2,349 captures
+    became 1,584, a third of the data gone, exit code 0.
+
+    A file's OWN first capture is an exact fingerprint instead: it is present
+    only if that file was actually read. Compared in integer milliseconds so the
+    float64 round trip cannot make an equal instant look different.
+    """
+    return int(round(t * 1000)) in stored_ms
+
+
 def existing_days(connection, base, sensor, kind):
     """UTC dates ('YYYY-MM-DD') this sensor already has stored, either shape.
 

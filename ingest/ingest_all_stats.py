@@ -1,7 +1,7 @@
 """ingest_all_stats.py -- pull median and mean PSD for all 10 SEA sensors,
 then build coarse levels and compact. One command instead of ~22.
 
-    cd C:\\Users\\pipyt\\ATLAS
+    cd C:\\Users\\you\\ATLAS
     python ingest\\ingest_all_stats.py
 
 Safe to re-run: psd_ingest.py skips days it already has, so a partial or
@@ -18,13 +18,13 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT_REPO = os.path.dirname(HERE)
 
-# The 10 SEA sensors, from the Box folder manifest built earlier this session
-# (manifest.json -> "psd" keys). Pass --sensors to override or subset.
+# The 10 SEA sensors of the NASCTN CBRS deployment (NIST TN 2359).
+# Pass --sensors to override or subset.
 SENSORS = ["GMM", "Catalina-Directional", "Catalina-Omni", "Midway", "HU",
            "NIT", "CBBT-Directional", "CBBT-Omni", "PtLoma-Directional",
            "PtLoma-Omni"]
 STATS = ["median", "mean"]
-DEFAULT_BOX_ROOT = r"C:\Users\pipyt\Box\SEA-DATA"
+DEFAULT_BOX_ROOT = os.environ.get("SEA_DATA_ROOT") or r"C:\Users\you\Box\SEA-DATA"
 
 
 def run(args, label):

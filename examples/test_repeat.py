@@ -17,9 +17,7 @@ Nothing here touches the real databases: it all happens in a temporary
 directory via the SPECTRUM_DB / PSD_DB / PFP_DB / ATLAS_DB_DIR overrides.
 """
 
-import json
 import os
-import subprocess
 import sys
 import tempfile
 
@@ -163,6 +161,70 @@ def renders(dbs, tmp, label):
     return got
 
 
+def case_midnight_straddle(tmp):
+    """An export whose last capture lands just after midnight.
+
+    Every real CBRS export does this -- 2025-07-09_HU_max.csv runs 00:02:39 on
+    the 9th through 00:00:22 on the 10th. The resume test used to ask "does the
+    database hold any capture on the day this file is NAMED for", so reading day
+    D put one capture into day D+1 and marked D+1 complete; D+1's file was then
+    skipped whole. Measured on three real days: 2,349 captures became 1,584, a
+    third of the data gone, exit code 0.
+
+    Nothing else in this suite has a straddle -- write_batch keeps every capture
+    inside its own day -- which is exactly why the bug survived a suite named
+    for repeatable ingest.
+    """
+    import numpy as np
+    src = os.path.join(tmp, "straddle_src")
+    dbs = os.path.join(tmp, "straddle_dbs")
+    os.makedirs(src, exist_ok=True); os.makedirs(dbs, exist_ok=True)
+    env = {"PSD_DB": os.path.join(dbs, "psd.duckdb"), "ATLAS_DB_DIR": dbs}
+    NF = 2250
+    days = ["2024-07-01", "2024-07-02", "2024-07-03"]
+    per_day = 5
+
+    def write(day):
+        # four captures inside the day, then one just past midnight, the way the
+        # real exports end.
+        stamps = [f"{day} {h:02d}:10:00.000000+00:00" for h in (0, 6, 12, 18)]
+        nxt = str(np.datetime64(day, "D") + 1)
+        stamps.append(f"{nxt} 00:00:22.440000+00:00")
+        rows = ["sweep_timestamp," + ",".join(str(3530040000.0 + 80000.0 * i)
+                                              for i in range(NF))]
+        for k, st in enumerate(stamps):
+            rows.append(st + "," + ",".join(f"{-140.0 + k * 0.1:.1f}" for _ in range(NF)))
+        with open(os.path.join(src, f"{day}_STRAD_max.csv"), "w") as f:
+            f.write("\n".join(rows) + "\n")
+
+    def stored():
+        return counts(dbs)["psd"].get("psd_chunk") or counts(dbs)["psd"].get("psd") or 0
+
+    write(days[0])
+    run([sys.executable, os.path.join(ING, "psd_ingest.py"), "STRAD",
+         "--root", src], env)
+    run([sys.executable, os.path.join(ING, "compact_db.py")], env)
+    first = stored()
+    check("a straddling export ingests completely", first == per_day,
+          f"{first} captures, expected {per_day}")
+
+    for d in days[1:]:
+        write(d)
+    run([sys.executable, os.path.join(ING, "psd_ingest.py"), "STRAD",
+         "--root", src], env)
+    after = stored()
+    check("the days after a straddling export are NOT skipped",
+          after == per_day * len(days),
+          f"{after} captures, expected {per_day * len(days)}")
+
+    # and re-running once more must add nothing at all
+    run([sys.executable, os.path.join(ING, "psd_ingest.py"), "STRAD",
+         "--root", src], env)
+    again = stored()
+    check("re-running a straddling set duplicates nothing", again == after,
+          f"{after} -> {again} captures")
+
+
 def main():
     print("repeatable ingest test\n")
     tmp = tempfile.mkdtemp(prefix="atlas-repeat-test-")
@@ -284,6 +346,8 @@ def main():
     same, why = decoded_match(dbs, ref)
     check("appending gives the same stored data as compacting in one pass",
           same, why)
+
+    case_midnight_straddle(tmp)
 
     print()
     if failed:

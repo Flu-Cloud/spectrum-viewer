@@ -72,6 +72,39 @@ def sample_of(root, limit=8):
     return out
 
 
+def first_capture_time(path):
+    """Epoch seconds of an export's FIRST capture, or None if unreadable.
+
+    Reads two lines, not the file: the resume check runs once per candidate day
+    and a real export is 12 MB. numpy parses the ISO stamp, which covers the
+    real exports' "2025-07-09 00:02:39.258000+00:00" and the "...T00:00:00"
+    form the fixtures use; anything else returns None and the caller falls back
+    to the older, coarser test rather than guessing.
+    """
+    try:
+        with open(path, "r", errors="replace") as f:
+            f.readline()                       # header
+            row = f.readline()
+    except OSError:
+        return None
+    stamp = row.split(",", 1)[0].strip()
+    if not stamp:
+        return None
+    # numpy wants a 'T' and no space before the offset, and treats a bare stamp
+    # as UTC -- which is what these exports are.
+    s = stamp.replace(" ", "T").rstrip("Z")
+    # Drop an explicit offset: numpy warns that it cannot represent one, and
+    # these exports are UTC (the +00:00 the real files carry).
+    if "+" in s[10:]:
+        s = s[:10] + s[10:].split("+")[0]
+    elif s[10:].count("-"):
+        s = s[:10] + s[10:].rsplit("-", 1)[0]
+    try:
+        return float(np.datetime64(s, "us").astype("int64")) / 1e6
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
 def no_data(root, stat, name_re, pattern, label):
     """Explain an empty discovery instead of silently ingesting nothing.
 

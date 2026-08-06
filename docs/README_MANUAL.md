@@ -82,6 +82,8 @@ Nothing touches the databases beside `serve.py`.
 | `examples/verify.py` | the install: version, imports, demo database, endpoints |
 | `examples/test_fetch.py` | downloading: every source form, host policy, resume, checksums, and the HTTP 403 that bot protection causes |
 | `examples/test_ingest.py` | the CBRS path end to end, compacted and uncompacted |
+| `examples/test_repeat.py` | re-running the ingest as new exports arrive: additive, idempotent, and correct across the midnight boundary a real export straddles |
+| `examples/test_ingest_all.py` | `ingest_all.py` over an unfamiliar folder, and every way a re-run used to destroy data |
 | `examples/test_atlas.py` | `atlas.py get` on every kind of data, and a record taken from id to rendered tile |
 | `examples/test_cli.py` | every subcommand, flag and prompt input, and the menu in each of its states with every choice pressed |
 | `examples/test_serve.py` | every endpoint, and every control the viewer drives through them |
@@ -251,7 +253,7 @@ needs. Keep the list somewhere else with `ATLAS_DATASETS=/path/to/my.json`.
 | Variable | Effect |
 |---|---|
 | `ATLAS_DOWNLOAD_DIR` | where `get` downloads to (default `./downloads`) — point it at a bigger disk |
-| `ATLAS_DB_DIR` | where all four `.duckdb` files live (`atlas.py`, `serve.py` and every ingest read it) |
+| `ATLAS_DB_DIR` | where the `.duckdb` files live (`atlas.py`, `serve.py` and every ingest read it) |
 | `SPECTRUM_DB` / `PSD_DB` / `PFP_DB` / `IQ_DB` | the path of one database |
 | `ATLAS_DATASETS` | your own dataset list instead of `datasets.json` |
 | `ATLAS_USER_AGENT` | User-Agent for downloads, if a host or proxy wants a specific one |
@@ -265,19 +267,43 @@ needs. Keep the list somewhere else with `ATLAS_DATASETS=/path/to/my.json`.
 
 | Script | Builds | Notes |
 |--------|--------|-------|
+| `ingest/ingest_all.py` | everything | **one command for a whole folder**: every layer, then compaction and the coarse index. `--dry-run` prints the plan, `--dest` writes elsewhere |
 | `ingest/fetch.py` | (downloads) | a record from NIST or anywhere else. `--list` summarises by folder, `--tree` shows structure, `--filter` narrows |
-| `ingest/build_db.py` | `spectrum.duckdb` | summaries + pyramid levels |
-| `ingest/psd_ingest.py` | `psd.duckdb` | PSD `max`. `--list` shows what is on disk |
-| `ingest/pfp_ingest.py` | `pfp.duckdb` | PFP `max_peak` |
+| `ingest/build_db.py` | `spectrum.duckdb` | summaries + pyramid levels. Takes `--csv-dir` (not `--root`) and does not read `$SEA_DATA_ROOT` |
+| `ingest/psd_ingest.py` | `psd.duckdb`, `psd_median.duckdb`, `psd_mean.duckdb` | one statistic per run: `--stat max` (default), `median`, `mean`. `--list` shows what is on disk |
+| `ingest/pfp_ingest.py` | `pfp.duckdb` | PFP `max_peak`. One statistic per sensor only -- the table has no statistic column |
 | `ingest/iq_ingest.py` | `iq.duckdb` | STFT pyramid (SigMF/TDMS/npy) |
+| `ingest/build_psd_levels.py` | coarse PSD index | makes zoomed-out PSD windows fast. `--stat` per statistic; re-run to top up |
 | `ingest/compact_db.py` | smaller files | optional; the server reads either schema |
-| `examples/make_sample.py` | all four | synthetic data, no download. `--iq` / `--cbrs` for one side, `--force` to replace |
+| `ingest/ingest_all_stats.py` | median + mean | loops `psd_ingest --stat` over many sensors from a local export folder |
+| `ingest/recompress_chunks.py` | smaller files | one-off migration: re-zlib chunks already compacted at a lower level |
+| `examples/make_sample.py` | all four demo layers | synthetic data, no download. `--iq` / `--cbrs` for one side, `--force` to replace |
 
 Each ingest finds its own source files by name, searched recursively, so the
-download layout does not have to match anything. `--root` defaults to
-`$SEA_DATA_ROOT`, else `./SEA-DATA`. A NIST record id, `ark:`, DOI, landing
-URL or direct file URL all work as a `fetch.py` source; non-NIST hosts are
-allowed with a warning (`--nist-only` to refuse, `--allow-host` to permit one).
+download layout does not have to match anything. For `psd_ingest.py`,
+`pfp_ingest.py` and `atlas.py`, `--root` defaults to `$SEA_DATA_ROOT`, else
+`./SEA-DATA`. A NIST record id, `ark:`, DOI, landing URL or direct file URL all
+work as a `fetch.py` source; non-NIST hosts are allowed with a warning
+(`--nist-only` to refuse, `--allow-host` to permit one).
+
+**The three PSD statistics.** The viewer's SHOW buttons read `max`, `median` and
+`mean`, and each one is its own database file beside `psd.duckdb`
+(`psd_median.duckdb`, `psd_mean.duckdb`) with the identical schema -- so adding
+them changes nothing about an install that only has max. A statistic appears in
+the viewer when its file exists and holds the sensor; otherwise the button stays
+off and the layer stays on max rather than silently showing max under a median
+label. To build them, once per statistic:
+
+```bash
+python ingest/psd_ingest.py <sensor> --stat median --root <exports>
+python ingest/psd_ingest.py <sensor> --stat mean   --root <exports>
+python ingest/compact_db.py                 # optional, smaller files
+python ingest/build_psd_levels.py --stat median   # fast zoomed-out windows
+python ingest/build_psd_levels.py --stat mean
+```
+
+`ingest/ingest_all.py <folder>` does all of that for every sensor and statistic
+it finds, in one pass, and is safe to re-run when new exports arrive.
 
 ```bash
 python ingest/fetch.py mds2-3177 --list

@@ -25,7 +25,6 @@ import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -443,7 +442,6 @@ def main():
             if iq_opt:
                 page.select_option("#source", label=iq_opt)
                 settle()
-            before = tiles_drawn()
 
             # #sensor is deliberately disabled in IQ mode (a capture has no
             # sensor), so only work the controls the current mode enables.
@@ -552,16 +550,26 @@ def main():
             real_errors = [e for e in errors if "favicon" not in e.lower()]
             check("no JavaScript error anywhere in the session",
                   not real_errors, "; ".join(real_errors[:3]))
-            # A cancelled TILE request is intended behaviour, not a failure: the
-            # viewer aborts a superseded tile on purpose (see fetchTile) so the
-            # one the user is waiting for is not queued behind stale ones, and it
-            # drops a prefetch that a sensor change made pointless. Only tile
-            # endpoints may abort, and only aborts are forgiven -- a 4xx/5xx, a
-            # refused connection, or an aborted page load still fails here.
+            # A cancelled DATA request is intended behaviour, not a failure: the
+            # viewer aborts a superseded one on purpose (see fetchTile) so the one
+            # the user is waiting for is not queued behind stale ones, and it
+            # drops a prefetch that a sensor change made pointless.
+            #
+            # /api/heatmap belongs on this list now and did not before. The
+            # summary layer used to fetch without an AbortController, which is
+            # exactly why zooming it was slow: every superseded window ran to
+            # completion, a server scan each, holding sockets from the browser's
+            # six per origin. It shares `inflight` with the tile layers now, so a
+            # zoom burst legitimately aborts the windows the user has left. This
+            # check caught that change as a failure the first time it ran -- the
+            # right response was to widen the list, not to stop aborting.
+            #
+            # Only aborts are forgiven, and only for these data endpoints: a
+            # 4xx/5xx, a refused connection, or an aborted page load still fails.
             def excused(r):
                 return ("net::ERR_ABORTED" in r
                         and any(e in r for e in ("/api/psd_layer", "/api/pfp_frame",
-                                                 "/api/iq_layer")))
+                                                 "/api/iq_layer", "/api/heatmap")))
             real_bad = [r for r in bad_requests
                         if "favicon" not in r.lower() and not excused(r)]
             check("no request failed anywhere in the session",

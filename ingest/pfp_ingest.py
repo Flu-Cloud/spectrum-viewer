@@ -141,8 +141,21 @@ def main():
     # the days this run is actually skipping rather than every day the sensor has
     # in the table -- `existing` spans days that are not under this --root at
     # all, which is how "1 day(s) on disk / 2 day(s) already ingested" came about.
+    # Tested against each file's OWN first capture, not the day its name
+    # carries: a CBRS export runs past the next midnight, so the day-name test
+    # marked day D+1 complete as soon as day D was read and then skipped D+1
+    # whole. Falls back to the day test when a stamp will not parse, since the
+    # append has no per-day delete and a wrong "not ingested" duplicates rows.
+    stored_ms = {int(round(t * 1000)) for t in
+                 chunk_io.stored_times(connection, "pfp", sensor, kind)}
     existing = chunk_io.existing_days(connection, "pfp", sensor, kind)
-    skipping = sum(1 for d in days if d in existing)
+
+    def have(d):
+        first = cbrs_files.first_capture_time(by_day[d])
+        return (d in existing) if first is None else \
+            chunk_io.already_have(stored_ms, first)
+
+    skipping = sum(1 for d in days if have(d))
     if skipping:
         print(f"  resuming: {skipping} of {len(days)} day(s) already "
               f"ingested, skipping those")
@@ -156,7 +169,7 @@ def main():
     # per channel, and closing per day would leave a chunk table of stubs.
     apps = {}
     for i, day in enumerate(days, 1):
-        if day in existing:
+        if have(day):
             done += 1
             continue
         path = by_day[day]

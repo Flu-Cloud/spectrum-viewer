@@ -154,8 +154,25 @@ def main():
     # captures are all early UTC morning then never matches its own filename, so
     # it is re-read and inserted again on every resume (duplicate rows), while a
     # day that does match can be reported skipped without ever being compared.
+    # Which days are already in: tested against each file's OWN first capture,
+    # not against the day its name carries. A CBRS export runs from just after
+    # midnight to just after the NEXT one, so the day-name test marked day D+1
+    # complete as soon as day D was read, and D+1 was then skipped whole --
+    # measured on real exports as a third of the captures silently missing.
+    # Falls back to the day test for a file whose stamp will not parse, which
+    # keeps the old behaviour rather than risking duplicate rows (the append has
+    # no per-day delete).
+    stored_ms = {int(round(t * 1000)) for t in
+                 chunk_io.stored_times(connection, "psd", sensor, kind)}
     existing = chunk_io.existing_days(connection, "psd", sensor, kind)
-    todo = [d for d in days if d not in existing]
+    todo = []
+    for d in days:
+        first = cbrs_files.first_capture_time(by_day[d])
+        if first is None:
+            if d not in existing:
+                todo.append(d)
+        elif not chunk_io.already_have(stored_ms, first):
+            todo.append(d)
     # Count the days this run is actually skipping, not every day the sensor
     # has in the DB: `existing` spans the whole table, including days that are
     # not under this --root at all. Reporting len(existing) is how "1 day on

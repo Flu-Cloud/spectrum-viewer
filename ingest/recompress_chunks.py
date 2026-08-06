@@ -160,6 +160,17 @@ def swap_in(name):
     live = os.path.join(DB_DIR, f"{name}.duckdb")
     if not os.path.exists(built):
         return False
+    # The same backstop compact_db.py carries: never trade data for no data. A
+    # build file with zero rows looks "complete" to every per-unit check, and
+    # swapping one in silently empties a live database. This function is
+    # compact_db.swap_in with the guard missing, which is precisely how it got
+    # fixed in one copy and not the other -- so it is imported, not restated.
+    sys.path.insert(0, HERE)
+    from compact_db import _keeps_data
+    if not _keeps_data(built, live):
+        log(f"  REFUSING to swap {name}_z9.duckdb in: it holds no data and "
+            f"{name}.duckdb does. Leaving the live database untouched.")
+        return False
     bak = live + ".bak"
     try:
         if os.path.exists(live):
