@@ -16,6 +16,8 @@ What each one covers:
     test_ingest.py  the CBRS path end to end, compacted and uncompacted
     test_repeat.py  re-running the ingest months later: additive, idempotent,
                     and safe on an already-compacted database
+    test_ingest_all.py  the one-command ingest over an unfamiliar folder, and
+                    every way a re-run used to destroy data
     test_atlas.py   `atlas.py get` on every kind of data, including a record
                     downloaded and ingested through to a rendered tile
     test_cli.py     every command, flag, prompt input and menu choice
@@ -40,6 +42,7 @@ SUITES = [
     ("test_fetch.py", "downloading, including the 403 path"),
     ("test_ingest.py", "the CBRS ingest path"),
     ("test_repeat.py", "re-running the ingest as new data arrives"),
+    ("test_ingest_all.py", "one command over any folder, and re-running it"),
     ("test_atlas.py", "atlas.py get, on data and on records"),
     ("test_cli.py", "every command, flag and menu choice"),
     ("test_serve.py", "every endpoint and viewer control"),

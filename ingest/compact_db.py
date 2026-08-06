@@ -72,6 +72,17 @@ def compact_spectrum():
     src_p = os.path.join(DB_DIR, "spectrum.duckdb")
     if _missing(src_p):
         return False
+    # This rewrite multiplies every dBm by 10 into a SMALLINT, and it had NO
+    # guard against running twice. Measured over three consecutive runs:
+    # -85.9 dBm -> -859 (correct) -> -8590, which serve.py then reads back as
+    # -859.0 dBm because it takes the scale off the column type and the type is
+    # still SMALLINT -- so nothing anywhere notices -- and then an
+    # OutOfRangeException that aborts the run before psd and pfp are reached.
+    # Two runs was enough to lose the original: swap_in overwrites the .bak.
+    if _spectrum_is_scaled(src_p):
+        log("  skip: spectrum.duckdb is already compacted (dBm*10 SMALLINT)")
+        return False
+    _drop_stale_build("spectrum", scaled=True)
     dst = duckdb.connect(os.path.join(DB_DIR, "spectrum_c.duckdb"))
     dst.execute("CREATE TABLE IF NOT EXISTS done (k VARCHAR)")
     dst.execute(f"ATTACH '{src_p}' AS s (READ_ONLY)")
@@ -96,6 +107,130 @@ def compact_spectrum():
     dst.close()
     log("spectrum_c.duckdb complete")
     return True
+
+
+def _spectrum_is_scaled(path):
+    """True when the summary table already stores dBm*10 as an integer.
+
+    The same test serve.py makes (serve._dbm_div): the scale is a property of
+    the column type, so it can be read off the file instead of assumed.
+    """
+    try:
+        c = duckdb.connect(path, read_only=True)
+    except Exception:                                      # noqa: BLE001
+        return False
+    try:
+        for tbl in ("lvl_h1", "lvl_m10", "lvl_d1", "raw"):
+            r = c.execute("SELECT data_type FROM duckdb_columns() WHERE "
+                          "table_name=? AND column_name='mx'", [tbl]).fetchone()
+            if r:
+                return "INT" in r[0].upper()
+        return False
+    except Exception:                                      # noqa: BLE001
+        return False
+    finally:
+        c.close()
+
+
+def _drop_stale_build(name, scaled=False, rows_table=None):
+    """Remove a leftover <name>_c.duckdb that the live database has moved past.
+
+    The build file carries a `done` table so an interrupted compaction can
+    resume. That is only meaningful while the live database is still the shape
+    the build file was started from. Once the live database has been compacted
+    and then ADDED TO -- which is the normal monthly cycle -- an old build file
+    is a time machine: `done` makes compaction skip every sensor it already has,
+    declare itself complete, and swap months of newer data away. Measured: 800
+    captures back to 300, and a sensor left with chunks but no meta row.
+
+    A build file is left alone only when it could still be a legitimate resume.
+    """
+    built = os.path.join(DB_DIR, f"{name}_c.duckdb")
+    if not os.path.exists(built):
+        return
+    live = os.path.join(DB_DIR, f"{name}.duckdb")
+    if not os.path.exists(live):
+        return
+    stale = _spectrum_is_scaled(live) if scaled else _live_moved_on(live, rows_table)
+    if stale:
+        try:
+            os.remove(built)
+            log(f"  removed a stale {name}_c.duckdb (the live database has moved "
+                f"past it; a resume would have rolled data back)")
+        except OSError as e:
+            log(f"  WARNING: {name}_c.duckdb looks stale but could not be "
+                f"removed: {e}. Delete it before compacting.")
+
+
+def _live_moved_on(live, rows_table):
+    """True when the live database is already in the chunk shape."""
+    try:
+        c = duckdb.connect(live, read_only=True)
+    except Exception:                                      # noqa: BLE001
+        return False
+    try:
+        tables = _tables(c)
+        if rows_table not in tables:
+            return True
+        return c.execute(f"SELECT count(*) FROM {rows_table}").fetchone()[0] == 0
+    except Exception:                                      # noqa: BLE001
+        return False
+    finally:
+        c.close()
+
+
+def _mixed_shape(connection, rows_table, chunk_table, label):
+    """True when BOTH shapes hold data -- refuse rather than guess.
+
+    Compaction reads sensors from the ROW table only and copies nothing from the
+    chunk table, so compacting this state writes a file containing only the
+    row-derived sensors and drops every chunked one. Measured: 1280 captures and
+    their meta row destroyed. The emptiness backstop cannot see it, because the
+    output is not empty. Nothing in the current pipeline creates this shape, but
+    a hand-merged or legacy database looks exactly like it.
+    """
+    tables = _tables(connection)
+    if rows_table not in tables or chunk_table not in tables:
+        return False
+    rows = connection.execute(f"SELECT count(*) FROM {rows_table}").fetchone()[0]
+    chunks = connection.execute(f"SELECT count(*) FROM {chunk_table}").fetchone()[0]
+    if rows and chunks:
+        log(f"  REFUSING to compact {label}: it holds data in BOTH the "
+            f"{rows_table} ({rows:,} rows) and {chunk_table} ({chunks:,} chunks) "
+            f"shapes. Compaction reads only {rows_table} and would drop the "
+            f"chunked data. Ingest into a fresh database instead.")
+        return True
+    return False
+
+
+def _already_compact(connection, rows_table, label):
+    """True when there is nothing to compact -- so don't.
+
+    Two ways a database is already done, and the second one caused real data
+    loss before it was handled:
+
+    1. The row table is gone. `SELECT DISTINCT sensor FROM <rows>` then raised a
+       bare CatalogException and took the whole run down with it, including the
+       databases it had not reached yet.
+
+    2. The row table EXISTS BUT IS EMPTY. Ingesting into an already-compacted
+       database leaves exactly that: the ingest appends chunks and the row table
+       stays behind with zero rows. Compaction then read no sensors, wrote a
+       perfectly valid _c file containing nothing, and swapped it over the real
+       chunks -- silently emptying the database. Measured: 72 captures to 0.
+
+    The rule that covers both is simply "no rows to compact means no
+    compaction". Compacting nothing can never do anything but harm.
+    """
+    tables = _tables(connection)
+    if rows_table not in tables:
+        log(f"  skip: {label} is already compacted")
+        return True
+    n = connection.execute(f"SELECT count(*) FROM {rows_table}").fetchone()[0]
+    if n == 0:
+        log(f"  skip: {label} has an empty {rows_table} table -- already compacted")
+        return True
+    return False
 
 
 def _tables(connection):
@@ -149,6 +284,15 @@ def compact_psd(name="psd"):
     src_p = os.path.join(DB_DIR, f"{name}.duckdb")
     if _missing(src_p):
         return False
+    src = duckdb.connect(src_p, read_only=True)
+    if _mixed_shape(src, "psd", "psd_chunk", f"{name}.duckdb"):
+        src.close()
+        return False
+    if _already_compact(src, "psd", f"{name}.duckdb"):
+        src.close()
+        return False        # nothing was verified, so nothing may be swapped
+    src.close()
+    _drop_stale_build(name, rows_table="psd")
     src = duckdb.connect(src_p, read_only=True)
     dst = duckdb.connect(os.path.join(DB_DIR, f"{name}_c.duckdb"))
     _prep(dst, """CREATE TABLE IF NOT EXISTS psd_chunk (
@@ -214,6 +358,15 @@ def compact_pfp():
     if _missing(src_p):
         return False
     src = duckdb.connect(src_p, read_only=True)
+    if _mixed_shape(src, "pfp", "pfp_chunk", "pfp.duckdb"):
+        src.close()
+        return False
+    if _already_compact(src, "pfp", "pfp.duckdb"):
+        src.close()
+        return False        # nothing was verified, so nothing may be swapped
+    src.close()
+    _drop_stale_build("pfp", rows_table="pfp")
+    src = duckdb.connect(src_p, read_only=True)
     dst = duckdb.connect(os.path.join(DB_DIR, "pfp_c.duckdb"))
     _prep(dst, """CREATE TABLE IF NOT EXISTS pfp_chunk (
         sensor VARCHAR, freq DOUBLE, t0 DOUBLE, t1 DOUBLE, n INT, times BLOB, frames BLOB)""")
@@ -267,6 +420,41 @@ def compact_pfp():
     return True
 
 
+def _payload_rows(path):
+    """Total rows across the data tables of one database, or None if unreadable.
+
+    Deliberately counts the DATA tables only (chunks and rows), not psd_lvl or
+    the resume bookkeeping: a build file can legitimately carry a pyramid
+    forward while holding no captures, and that is exactly the case worth
+    catching.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        c = duckdb.connect(path, read_only=True)
+    except Exception:                                      # noqa: BLE001
+        return None
+    try:
+        tables = _tables(c)
+        total = 0
+        for t in ("psd_chunk", "psd", "pfp_chunk", "pfp", "raw", "iq_stft"):
+            if t in tables:
+                total += c.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+        return total
+    except Exception:                                      # noqa: BLE001
+        return None
+    finally:
+        c.close()
+
+
+def _keeps_data(built, live):
+    """False only when the build file is empty and the live database is not."""
+    b, l = _payload_rows(built), _payload_rows(live)
+    if b is None or l is None:
+        return True            # cannot tell; the per-sensor checks still applied
+    return not (b == 0 and l > 0)
+
+
 def swap_in(name):
     """Move <name>_c.duckdb onto <name>.duckdb, keeping a .bak of the original.
 
@@ -277,6 +465,17 @@ def swap_in(name):
     built = os.path.join(DB_DIR, f"{name}_c.duckdb")
     live = os.path.join(DB_DIR, f"{name}.duckdb")
     if not os.path.exists(built):
+        return False
+    # Never trade data for no data. The per-sensor row-count checks above verify
+    # what was copied, but they say nothing when NOTHING was copied: a build file
+    # with zero rows is "complete" by that standard, and swapping it in silently
+    # emptied a live database (the empty-rows case in _already_compact). This is
+    # the backstop for that whole class of mistake, wherever it comes from.
+    if not _keeps_data(built, live):
+        log(f"  REFUSING to swap {name}_c.duckdb in: it holds no data and "
+            f"{name}.duckdb does. Leaving the live database untouched.")
+        log(f"    The build file is kept at {os.path.basename(built)} if you want "
+            f"to look at it.")
         return False
     bak = live + ".bak"
     try:
