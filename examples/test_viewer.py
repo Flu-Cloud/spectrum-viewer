@@ -95,6 +95,60 @@ def build(tmp):
     return dbs, env
 
 
+def warm_checks(page, check, settle):
+    """Idle prefetching must stay quiet, especially when a warm cannot succeed.
+
+    The prefetch re-arms itself so a queue of several tiles drains without
+    waiting for the user's next move. Re-arming on "work remains" rather than on
+    progress turns any warm that can never land -- a statistic answering 404, a
+    server restart, a dropped connection -- into an unbounded request storm on a
+    page nobody is touching: measured at 468 requests in 8 idle seconds, each one
+    a full window scan. A bound on idle traffic is the only thing that catches
+    this; no functional check does, because every picture is still correct.
+    """
+    # Count ATTEMPTS inside the patched fetch, not HTTP requests seen by the
+    # browser. A first version of this test watched page.on("request") while
+    # rejecting synchronously -- so the metric was structurally zero and the
+    # check passed on the storming code it was written to catch. What is being
+    # measured is how many times the warm loop tries, whether or not a request
+    # ever leaves the process.
+    #
+    # It also has to be a state with something TO warm: on a fixture holding
+    # only psd.duckdb, inside the PSD layer, at a span under the threshold, the
+    # warm queue is legitimately empty and nothing would be attempted however
+    # broken the loop was. Advertising the sibling statistics puts two real
+    # candidates in the queue; they are what the loop must stop retrying.
+    state = page.evaluate("""() => {
+        window.__warmTries = 0;
+        window.__realFetch = window.fetch;
+        window.fetch = (u, o) => {
+            if (typeof u === 'string' && u.includes('/api/psd_layer')){
+                window.__warmTries++;
+                return Promise.reject(new Error('induced warm failure'));
+            }
+            return window.__realFetch(u, o);
+        };
+        window.__statsWas = psdStats;
+        psdStats = ['max','median','mean'];      // give the queue real candidates
+        warmCancel(); drawCrisp();               // arm the chain
+        return {layer: layerMode, mode};
+    }""")
+    try:
+        settle()
+        page.evaluate("window.__warmTries = 0;")
+        page.wait_for_timeout(6000)                            # idle, no input
+        n = page.evaluate("window.__warmTries")
+        check("idle prefetching does not storm when a warm keeps failing",
+              n < 25, f"{n} warm attempt(s) in 6 idle seconds "
+                      f"(layer={state['layer']})")
+    finally:
+        page.evaluate("""() => {
+            if (window.__realFetch) window.fetch = window.__realFetch;
+            if (window.__statsWas) psdStats = window.__statsWas;
+        }""")
+        settle()
+
+
 def zone_checks(page, check, settle):
     """The zoom bars must show WHERE zooming hands off to a deeper layer.
 
@@ -392,6 +446,7 @@ def main():
                       tiles_drawn() > 0)
 
             zone_checks(page, check, settle)
+            warm_checks(page, check, settle)
 
             reset = page.locator("#reset")
             if reset.count():

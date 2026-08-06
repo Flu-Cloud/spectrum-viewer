@@ -98,6 +98,12 @@ def compact_spectrum():
     return True
 
 
+def _tables(connection):
+    """Table names in an open database, for optional-table checks."""
+    return {r[0] for r in connection.execute(
+        "SELECT table_name FROM information_schema.tables").fetchall()}
+
+
 def _copy_meta(dst, src_path, table, rows_table=None):
     """Copy <table> across, dropping rows for sensors with no data behind them.
 
@@ -178,6 +184,22 @@ def compact_psd(name="psd"):
             continue
         dst.execute("INSERT INTO done VALUES (?)", [s])
         log(f"  psd {s}: {total} spectra in {time.time()-t0:.0f}s")
+    # Carry the coarse pyramid across. psd_lvl is bucketed spectra keyed by
+    # sensor and time -- it describes the same measurements whichever on-disk
+    # shape holds them, so compaction has no reason to invalidate it. It used to
+    # be dropped silently: build the levels and then compact (the order
+    # ingest_all_stats.py used) and every level row was discarded, leaving wide
+    # windows to the slow capture path with nothing on screen to say why. Copying
+    # it makes the two steps order-independent, which is the real fix -- a
+    # pipeline should not have a correct order you can only learn by measuring.
+    for t in ("psd_lvl", "psd_lvl_done"):
+        if t in _tables(src):
+            dst.execute(f"DROP TABLE IF EXISTS {t}")
+            dst.execute(f"ATTACH '{src_p}' AS lsrc (READ_ONLY)")
+            dst.execute(f"CREATE TABLE {t} AS SELECT * FROM lsrc.{t}")
+            dst.execute("DETACH lsrc")
+            n = dst.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+            log(f"  {name} {t}: carried {n:,} row(s) across")
     src.close(); dst.close()
     if bad:
         log(f"{name}_c.duckdb INCOMPLETE for {', '.join(bad)}; not swapping it in")

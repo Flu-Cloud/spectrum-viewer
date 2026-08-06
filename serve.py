@@ -673,6 +673,7 @@ def psd_connection(stat="max"):
         # as the entry exists without taking the lock, so the dict value must
         # already be complete when it becomes visible.
         _psd_dbs[stat] = {"connection": connection, "kind": kind, "levels": levels}
+        _scale_stat_budgets()      # the stat-keyed caches share their slots
         if stat == "max":
             # Mirrors kept for the tests and tooling that read these directly;
             # they always describe the max database, the one that always existed.
@@ -705,8 +706,14 @@ def psd_stats_available(sensor=None):
             continue
         if sensor is not None:
             try:
+                # A null time range means the ingest for this statistic read no
+                # files: the row exists, the data does not. Offering it lit up a
+                # SHOW button whose tiles come back empty, so require a real
+                # range -- the same test /api/psd_meta applies before it
+                # advertises the layer at all.
                 row = connection.cursor().execute(
-                    "SELECT 1 FROM psd_meta WHERE sensor=? LIMIT 1",
+                    "SELECT 1 FROM psd_meta WHERE sensor=? "
+                    "AND t_min IS NOT NULL AND t_max IS NOT NULL LIMIT 1",
                     [sensor]).fetchone()
             except Exception:
                 row = None
@@ -938,12 +945,28 @@ def _psd_nearest(c, sensor, t1, kind=None):
     return _unpack_rows([row], NF)[1]
 
 
-# Full-band window grids, keyed by (sensor, t0, t1, cols). A frequency zoom
+# Full-band window grids, keyed by (stat, sensor, t0, t1, cols). A frequency zoom
 # keeps the time window fixed, so every band slice of the same window can be
 # cut from one already-pooled grid instead of re-reading and re-inflating
 # every chunk (the whole cost of a wide tile). One grid is cols x NF uint8
 # (~7 MB); four of them bound the cache well under 30 MB.
-_PWIN_CACHE, _PWIN_MAX = {}, 4
+#
+# Four was one statistic's budget. The key gained `stat` when median and mean
+# arrived, so the three databases -- same sensors, same windows -- now share
+# these slots: toggling statistic at two windows exhausted the cache and every
+# toggle re-read and re-pooled a window that had already been pooled. Slots are
+# allotted per statistic ON DISK instead, which keeps the behaviour above true
+# for whichever one is on screen and leaves a max-only install at exactly the
+# four it always had.
+#
+# The honest ceiling, since the "well under 30 MB" above describes one
+# statistic at typical widths: an entry is cols x NF bytes, so 2.7 MB at a
+# 1200-column tile and 9.2 MB at MAX_TILE_COLS (4096). Three statistics at
+# three slots each is 9 entries -- ~25 MB typical, ~83 MB if every one of them
+# is a full-width export. Three rather than four per statistic keeps that
+# worst case near where it was.
+_PWIN_PER_STAT = 3
+_PWIN_CACHE, _PWIN_MAX = {}, _PWIN_PER_STAT
 _pwin_lock = threading.Lock()
 
 
@@ -984,9 +1007,41 @@ def _pick_psd_level(span, cols, ncap, levels=None):
 # no RAM and survive a restart. This is the fallback that makes that build step
 # optional rather than required.
 MEM_BUCKET = 3600
-_MEM_MAX = 3                      # sensors held; ~22 MB per sensor-year
-_memlvl = {}                      # sensor -> dict | 'building' | 'failed'
+# Entries held, keyed (stat, sensor); ~22 MB per sensor-year. Three was three
+# SENSORS when max was the only statistic. Now one sensor viewed in all three
+# statistics fills the whole budget on its own, so a second sensor evicted the
+# first's finished index and any return to it rebuilt from scratch. Sized per
+# statistic present on disk instead, which leaves a max-only install at 3.
+#
+# Two per statistic, not three: at 22 MB per sensor-year an entry is far and
+# away the most expensive thing cached here, and this index only exists at all
+# when the on-disk pyramid is missing -- build_psd_levels.py makes the whole
+# subsystem moot. Six entries is ~130 MB per year of data on a three-statistic
+# set, against ~66 MB before.
+_MEM_PER_STAT = 2
+_MEM_MAX = _MEM_PER_STAT
+_memlvl = {}              # (stat, sensor) -> dict | 'queued' | 'building' | 'failed'
+_mem_queue = []           # (stat, sensor) waiting, in arrival order
+_mem_workers = 0          # live build threads; see _memlvl_worker
 _mem_lock = threading.Lock()
+
+
+def _scale_stat_budgets():
+    """Re-size the stat-keyed caches to the statistics actually on disk.
+
+    Called whenever a statistic's database is opened for the first time, which
+    is the only moment the count can change. Never shrinks below the historical
+    single-statistic budget.
+    """
+    global _PWIN_MAX, _MEM_MAX
+    n = max(1, sum(1 for s in PSD_LAYER_STATS if os.path.exists(psd_db_path(s))))
+    # Never below the budgets a max-only install has always had (4 and 3): the
+    # per-statistic allotments are smaller than those, so plain multiplication
+    # SHRANK the single-statistic case -- three sensors' worth of in-RAM index
+    # became two, and returning to the first rebuilt it from scratch. Growing
+    # the multi-statistic case must not cost the installs that never changed.
+    _PWIN_MAX = max(_PWIN_PER_STAT * n, 4)
+    _MEM_MAX = max(_MEM_PER_STAT * n, 3)
 
 
 # The build is a background convenience, never a reason for a request the user IS
@@ -1048,12 +1103,7 @@ def _memlvl_build(sensor, stat="max"):
                  "t1": float((ks[-1] + 1) * MEM_BUCKET)}
         with _mem_lock:
             _memlvl[(stat, sensor)] = built
-            while len(_memlvl) > _MEM_MAX:
-                for k in list(_memlvl):
-                    if k != (stat, sensor):
-                        _memlvl.pop(k); break
-                else:
-                    break
+            _memlvl_evict(keep=(stat, sensor))
         print(f"[serve] coarse PSD {stat} index for {sensor} ready in RAM "
               f"({len(ks)} x {MEM_BUCKET}s buckets). ingest/build_psd_levels.py "
               f"stores this on disk instead, so it survives a restart.")
@@ -1061,19 +1111,141 @@ def _memlvl_build(sensor, stat="max"):
         print(f"[serve] could not build the in-RAM PSD {stat} index for {sensor}: {e}")
         with _mem_lock:
             _memlvl[(stat, sensor)] = "failed"
+            _memlvl_evict()
 
 
-def memlvl_warm(sensor, stat="max"):
-    """Start the background build once per (stat, sensor). Cheap to call often."""
+# How many indexes may build at once. MEM_THROTTLE caps ONE build near 60% of a
+# core, measured on a two-core box; three statistics warmed together ran three of
+# those at once and spent the whole margin the throttle exists to protect. But
+# forcing them strictly one at a time is worse where there are cores to spare:
+# the third statistic's index then lands three build-times later, and measured on
+# this fixture that turned a warm 477 ms median tile back into a cold 3.2 s one.
+# So: one build per spare core, never more than there are statistics, never fewer
+# than one. A two-core box serialises (the calibration the throttle assumes); an
+# eight-core workstation builds all three at once and still leaves five cores to
+# the tile path. ATLAS_INDEX_WORKERS overrides it.
+def _index_workers():
+    try:
+        n = int(os.environ.get("ATLAS_INDEX_WORKERS", "0"))
+    except ValueError:
+        n = 0
+    if n > 0:
+        return n
+    return max(1, min(len(PSD_LAYER_STATS), (os.cpu_count() or 2) - 1))
+
+
+def _memlvl_evict(keep=None):
+    """Trim _memlvl to _MEM_MAX. Call with _mem_lock held.
+
+    Never evicts the entry a build is working on: memlvl_warm's only guard is
+    membership, so dropping it mid-build lets the next warm queue the same work
+    again. A "queued" entry IS evictable -- nothing has been spent on it, and
+    dropping it just means the capture path answers that window instead.
+
+    Runs on the failure paths too, not only on success. Sitting on the success
+    path alone, a run of failures (a database briefly write-locked by an ingest,
+    say) filled the dict past its cap with 'failed' markers that nothing would
+    ever clear.
+    """
+    while len(_memlvl) > _MEM_MAX:
+        victim = next((k for k, v in _memlvl.items()
+                       if k != keep and v != "building"), None)
+        if victim is None:
+            return
+        _memlvl.pop(victim)
+        if victim in _mem_queue:          # dropped before it ever started
+            _mem_queue.remove(victim)
+
+
+def _memlvl_worker():
+    """Drain the queue, one build at a time per worker, then retire.
+
+    Both `finally` blocks are load-bearing, and a harness that kills a build
+    thread outright proved it: the count is what memlvl_warm tops the pool up
+    against, so leaking it by even one leaves the pool permanently short -- and
+    a thread that dies inside a build leaks it. Same for the entry it was
+    building: left saying "building" it is never evicted and never retried, so
+    that (stat, sensor) has no in-RAM index for the life of the process.
+    """
+    global _mem_workers
+    try:
+        while True:
+            with _mem_lock:
+                while _mem_queue:
+                    key = _mem_queue.pop(0)
+                    if _memlvl.get(key) == "queued":
+                        break
+                else:
+                    return
+                _memlvl[key] = "building"
+            stat, sensor = key
+            try:
+                _memlvl_build(sensor, stat)
+            except Exception as e:          # noqa: BLE001
+                # One bad build must not end the worker. Letting it propagate
+                # killed the thread and stranded everything still queued behind
+                # it until some unrelated later request happened to top the pool
+                # up -- measured with a harness that fails one build in five.
+                print(f"[serve] PSD index build for {sensor}/{stat} failed: {e}")
+            finally:
+                with _mem_lock:
+                    if _memlvl.get(key) == "building":
+                        _memlvl[key] = "failed"     # died without a verdict
+                    _memlvl_evict()
+    finally:
+        # Under the lock, so a warm racing this either sees the lower count and
+        # starts a replacement, or enqueues before the check and is picked up by
+        # the top-up. No window where a queued build is orphaned.
+        with _mem_lock:
+            _mem_workers -= 1
+
+
+def memlvl_warm(sensor, stat="max", urgent=False):
+    """Queue the background build once per (stat, sensor). Cheap to call often.
+
+    `urgent` means a tile for this statistic is being drawn right now, so its
+    index is what matters soonest: it goes to the front of the queue. Without
+    this, a statistic the user has actually switched to waited behind whatever
+    page load happened to queue first.
+    """
+    global _mem_workers
     connection_s, kind_s, levels_s = psd_stat_info(stat)
     if not sensor or connection_s is None or kind_s is None or levels_s:
         return                        # on-disk levels present: nothing to do
+    key = (stat, sensor)
+    start = 0
     with _mem_lock:
-        if (stat, sensor) in _memlvl:
-            return
-        _memlvl[(stat, sensor)] = "building"
-    threading.Thread(target=_memlvl_build, args=(sensor, stat), daemon=True,
-                     name=f"psdlvl-{stat}-{sensor}").start()
+        if key in _memlvl:
+            if urgent and _memlvl.get(key) == "queued" and _mem_queue and _mem_queue[0] != key:
+                _mem_queue.remove(key)          # already waiting: jump the queue
+                _mem_queue.insert(0, key)
+        elif len(_mem_queue) < _MEM_MAX:
+            _memlvl[key] = "queued"
+            _mem_queue.insert(0, key) if urgent else _mem_queue.append(key)
+        # else: more waiting than we would keep. The capture path answers
+        # correctly, just slower.
+        #
+        # Top the pool up even when nothing was queued THIS call. Checking the
+        # worker count only after a successful enqueue meant workers that died
+        # with a full queue could never be replaced: every later call bailed at
+        # the capacity check, so the queue never drained and never fell below the
+        # cap. A build thread can die that way on a BaseException, or on
+        # Thread.start() failing under thread exhaustion.
+        if _mem_queue:
+            want = min(_index_workers(), len(_mem_queue) + 1)
+            start = max(0, want - _mem_workers)
+            _mem_workers += start
+    # Started outside the lock so a start() failure cannot hold it, and so a slow
+    # thread launch never blocks a request. A failed start is undone here and
+    # recovered by the top-up on the next call.
+    for _ in range(start):
+        try:
+            threading.Thread(target=_memlvl_worker, daemon=True,
+                             name="psdlvl").start()
+        except RuntimeError as e:      # out of threads: degrade, never 500
+            with _mem_lock:
+                _mem_workers -= 1
+            print(f"[serve] could not start a PSD index worker: {e}")
 
 
 def memlvl_ready(sensor, t0, t1, stat="max"):
@@ -1322,19 +1494,37 @@ def psd_meta():
     # The viewer calls this on page load and on every sensor change, which is the
     # earliest moment we know which sensor matters -- so the coarse index starts
     # building while the user is still looking at the summary layer.
-    memlvl_warm(sensor, stat)
+    #
+    # EVERY statistic this sensor has, not just the requested one. The viewer
+    # asks without a stat, which resolved to max, so a median or mean database
+    # missing its on-disk levels started its index only when the user first
+    # clicked that button -- the one moment it competes with the tile they are
+    # waiting for. memlvl_warm returns immediately when the on-disk pyramid is
+    # there, so on a properly built set this loop costs nothing.
+    stats_here = psd_stats_available(sensor)
     row = database.cursor().execute("SELECT f0, df, nf, t_min, t_max FROM psd_meta WHERE sensor=?",
                              [sensor]).fetchone()
+    # Deliberately NOT falling back to a sibling statistic's time range when
+    # max's is null. Tried it; examples/test_ingest.py caught why it is wrong: a
+    # max database that is an empty stub while median holds real data would
+    # advertise the layer, the viewer would enable it with max still selected,
+    # and every tile would come back empty -- exactly the silent "layer never
+    # draws" failure the null-range check below exists to prevent.
     # An ingest that read no files leaves a meta row with a null time range.
     # Never advertise a layer whose backing rows are not actually there.
     if not row or row[3] is None or row[4] is None:
         return jsonify({"has": False})
     f0, df, nf, tmin, tmax = row
+    # Only once the layer is known to be real: warming a statistic for a sensor
+    # whose layer is about to be reported absent is background work for a picture
+    # nobody will ask for.
+    for s in stats_here:
+        memlvl_warm(sensor, s)
     # `stats`: every statistic that has a database holding THIS sensor, so the
     # viewer can light up exactly the SHOW buttons that will actually answer.
     return jsonify({"has": True, "fmin": f0, "fmax": f0 + (nf - 1) * df,
                     "t_min": tmin, "t_max": tmax,
-                    "stats": psd_stats_available(sensor)})
+                    "stats": stats_here})
 
 
 @app.route("/api/psd_layer")
@@ -1357,7 +1547,9 @@ def psd_layer():
     database, kind, levels = psd_stat_info(stat)
     if database is None or kind is None:
         return jsonify({"error": f"psd {stat} layer not ready"}), 503
-    memlvl_warm(sensor, stat)
+    # urgent: this statistic is being drawn now, so its index outranks anything
+    # a page load queued speculatively.
+    memlvl_warm(sensor, stat, urgent=True)
     W = max(1, _num("w", 1200, int))
     cursor = database.cursor()
     grid, gap = _psd_window(cursor, sensor, t0, t1, _grid_cols(W), fi0, fi1,

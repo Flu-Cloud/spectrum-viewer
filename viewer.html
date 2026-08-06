@@ -858,8 +858,11 @@ function pfpSeedScale(){
 function pfpUrl(ch,w,h){ let u=`/api/pfp_frame?sensor=${enc(sensor)}&freq=${ch}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&cmap=${cmapName}`;
   if (!pfpScale[ch]){ const s=pfpSeedScale(); if (s) pfpScale[ch]=s; }
   if (pfpScale[ch]) u+=`&vmin=${pfpScale[ch].vmin}&vmax=${pfpScale[ch].vmax}`; return u; }
-function psdUrl(w,h){ let u=`/api/psd_layer?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&f0=${viewF.f0}&f1=${viewF.f1}&cmap=${cmapName}&stat=${stat}`;
-  if (psdScale[stat]) u+=`&vmin=${psdScale[stat].vmin}&vmax=${psdScale[stat].vmax}`; return u; }
+// `st` names a statistic other than the selected one, for warming siblings.
+// Omitted it means the selected one, so every existing caller is unchanged.
+function psdUrl(w,h,st){ const s=st||stat;
+  let u=`/api/psd_layer?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&w=${w}&h=${h}&f0=${viewF.f0}&f1=${viewF.f1}&cmap=${cmapName}&stat=${s}`;
+  if (psdScale[s]) u+=`&vmin=${psdScale[s].vmin}&vmax=${psdScale[s].vmax}`; return u; }
 function sumUrl(w){ return `/api/heatmap?sensor=${enc(sensor)}&t0=${view.t0}&t1=${view.t1}&width=${w}`; }
 
 function applyIq(j, im){ iqImg=im; iqView=j; layerMode='iq'; if(!iqScale) iqScale={vmin:j.vmin,vmax:j.vmax};
@@ -1022,10 +1025,19 @@ function withWindow(t0, t1, fn){
 // Nothing here touches `inflight`: a warm fetch must never abort the tile the
 // user is actually waiting on.
 let warmQueued=false, warming=false, warmAC=null;
+// URLs a warm asked for and did not get. Without this, the re-arm below spins:
+// a warm that can never land (a sibling statistic answering 404, a server
+// restart mid-session, a dropped connection) leaves its URL uncached forever, so
+// "work remains" stays true and the next idle period tries the identical URL
+// again -- measured at ~60 requests a second on an idle page, each one a full
+// window scan. Remembered per URL, which includes the window, so one bad window
+// never stops the others. Cleared whenever the warm queue itself is abandoned.
+const warmFailed = new Set();
+const WARM_FAILED_MAX = 64;
 // Switching sensor or mode makes any warm tile in flight worthless -- and on a
 // multi-GB database it is a scan worth several seconds that would otherwise run
 // to completion competing with the tile the user now actually wants.
-function warmCancel(){ if (warmAC){ warmAC.abort(); warmAC=null; } }
+function warmCancel(){ if (warmAC){ warmAC.abort(); warmAC=null; } warmFailed.clear(); }
 function warmSoon(){
   if (warmQueued || warming || mode!=='cbrs' || !meta) return;
   warmQueued=true;
@@ -1052,16 +1064,46 @@ async function warmDeeper(){
   if (pfpAvail && (viewF.f1-viewF.f0)<=ONE_CHANNEL && channelInView() && span>PFP_TIME_THRESHOLD)
     want.push(withWindow(c-PFP_TIME_THRESHOLD/2, c+PFP_TIME_THRESHOLD/2,
                          ()=>pfpUrl(nearestChannelHz(),w,h)));
-  const url=want.find(u=>!tileCache.has(u));     // .has, not cacheGet: don't disturb the LRU
+  // The SHOW buttons change statistic without changing the view. In the summary
+  // layer that is free -- /api/heatmap returns max, median and mean in one
+  // payload -- but each PSD statistic is its own database, so the same click was
+  // a cold round trip every time: measured 641 ms on a 150-day fixture, with the
+  // PREVIOUS statistic's picture left on screen for all of it. Warm the siblings
+  // for the window already on screen and the click lands on cacheFind and paints
+  // at once, the way it does one layer up. Same idle budget as everything else
+  // here: one tile per pass, skipped entirely if already cached.
+  if (psdAvail && layerMode==='psd')
+    for (const s of psdStats) if (s!==stat) want.push(psdUrl(w,h,s));
+  const pending = u => !tileCache.has(u) && !warmFailed.has(u);
+  const url=want.find(pending);     // .has, not cacheGet: don't disturb the LRU
   if (!url) return;
   warming=true;
   const ac = warmAC = new AbortController();
+  let landed=false;
   try{
     const r=await fetch(url, {signal: ac.signal});
-    if (r.ok) cacheSet(url, {j:JSON.parse(r.headers.get('X-Meta')),
-                             img:await createImageBitmap(await r.blob())});
+    if (r.ok){ cacheSet(url, {j:JSON.parse(r.headers.get('X-Meta')),
+                              img:await createImageBitmap(await r.blob())});
+               // "the tile is now cached", not merely "the response was OK":
+               // re-arming on the latter would retry forever if a warm could
+               // ever land without its URL ending up in the cache.
+               landed = tileCache.has(url); }
   }catch(e){ /* a tile nobody asked for yet is not worth reporting */ }
-  finally{ warming=false; if (warmAC===ac) warmAC=null; }
+  finally{
+    warming=false; if (warmAC===ac) warmAC=null;
+    // One warm per pass keeps the idle callback short, so a queue of several
+    // (two sibling statistics, or a sibling behind a layer) needs re-arming or
+    // everything after the first waits for the user's next render.
+    //
+    // Re-arm on PROGRESS, never on "work remains": the latter cannot tell a
+    // queue being worked through from a URL that will fail every time, and so
+    // turns one broken warm into an unbounded request storm on an idle page.
+    if (!ac.signal.aborted && !landed){
+      if (warmFailed.size >= WARM_FAILED_MAX) warmFailed.clear();
+      warmFailed.add(url);
+    }
+    if (landed && !ac.signal.aborted && want.some(pending)) warmSoon();
+  }
 }
 
 function autoScale(){

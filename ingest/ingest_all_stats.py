@@ -64,9 +64,15 @@ def main():
             print()
 
     if not args.skip_levels:
+        # Compact first, then build the pyramid on the compacted file: levels
+        # built over the row schema used to be thrown away by compaction, and
+        # building them afterwards is cheaper anyway (fewer, larger reads).
+        # compact_db.py now carries psd_lvl across either way, so this order is
+        # belt and braces rather than the only thing standing between you and a
+        # silently slow viewer.
+        run([compact_py], "compact_db")
         for stat in stats:
             run([levels_py, "--stat", stat], f"build_psd_levels --stat {stat}")
-        run([compact_py], "compact_db")
 
     failed = [k for k, ok in results.items() if not ok]
     print("\n" + "=" * 66)
