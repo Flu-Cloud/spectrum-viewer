@@ -240,8 +240,11 @@ def write_pfp(dirpath):
 
 def db_dir():
     """Where serve.py will look. Same resolution serve.py, atlas.py and
-    verify.py use, so the demo cannot land somewhere the server never reads."""
-    return os.environ.get("ATLAS_DB_DIR") or ROOT
+    verify.py use, so the demo cannot land somewhere the server never reads --
+    including the abspath, without which a relative ATLAS_DB_DIR resolves against
+    whatever directory each step is run from and the demo builds one half of
+    itself into a folder the server never opens."""
+    return os.path.abspath(os.environ.get("ATLAS_DB_DIR") or ROOT)
 
 
 def db_path(name, var):
@@ -330,7 +333,7 @@ def main():
            "PFP_DB": db_path("pfp.duckdb", "PFP_DB")}
 
     if want_cbrs and not args.force:
-        # build_db.py deletes spectrum.duckdb outright, and psd/pfp would merge
+        # build_db.py REPLACES spectrum.duckdb wholesale, and psd/pfp would merge
         # demo sensors into real ones. Neither is acceptable to do silently to
         # someone who has spent hours downloading the real thing.
         clash = existing_cbrs()
@@ -338,7 +341,7 @@ def main():
             print("These CBRS databases already exist:", file=sys.stderr)
             for p in clash:
                 print(f"  {p}", file=sys.stderr)
-            print("\nNot overwriting them: building the demo on top would delete\n"
+            print("\nNot overwriting them: building the demo on top would replace\n"
                   "spectrum.duckdb and merge demo sensors into psd/pfp.\n"
                   "  python examples/make_sample.py --force   # replace them\n"
                   "  python examples/make_sample.py --iq      # leave them alone",

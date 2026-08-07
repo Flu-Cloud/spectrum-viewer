@@ -1,7 +1,5 @@
 """serve.py: Flask backend for the spectrum viewer.
 
-linkedin.com/in/jimmy-lu-/
-
 One canvas, three continuous CBRS layers (summary -> PSD -> PFP) plus the
 independent IQ-capture mode. For any requested window the server picks the
 coarsest stored level that still fills the plot, renders it to a WebP tile
@@ -10,9 +8,9 @@ and streams the bytes directly (metadata rides in the X-Meta header).
 Storage (built by build_db.py / *_ingest.py, then compact_db.py):
     spectrum.duckdb  summaries; dBm as DOUBLE, or SMALLINT dBm*10 once
                      compact_db.py has run (see _dbm_div -- both are served)
-    psd.duckdb       psd_chunk: zlib blobs of 256 consecutive int8 spectra
-    pfp.duckdb       pfp_chunk: zlib blobs of 1024 consecutive int8 frames
-    iq.duckdb        iq_stft: int8 STFT pyramid per capture (iq_ingest.py)
+    psd.duckdb       psd_chunk: zlib blobs of 256 consecutive uint8 spectra
+    pfp.duckdb       pfp_chunk: zlib blobs of 1024 consecutive uint8 frames
+    iq.duckdb        iq_stft: uint8 STFT pyramid per capture (iq_ingest.py)
 
     cd /path/to/spectrum-viewer
     py serve.py            # http://127.0.0.1:8090
@@ -629,7 +627,7 @@ def heatmap():
     }))
 
 
-# ---- PSD continuous layer (chunked int8 spectra, zlib) -----------------
+# ---- PSD continuous layer (chunked uint8 spectra, zlib) ----------------
 PSD_DB = os.environ.get("PSD_DB") or os.path.join(DB_DIR, "psd.duckdb")
 F0 = 3530040000.0     # first PSD bin (Hz)
 DF = 80000.0          # bin spacing (Hz)
@@ -685,8 +683,15 @@ def psd_db_path(stat):
 
 def psd_connection(stat="max"):
     """Persistent read-only handle for one statistic's PSD database (saves the
-    ~15ms reopen per zoom). The live DB is never written while serving; ingest
-    builds a fresh file and swaps."""
+    ~15ms reopen per zoom).
+
+    Read-only, so serving can never damage a database. It does NOT mean the file
+    is immutable while the server runs: psd_ingest.py appends to it in place and
+    build_psd_levels.py writes psd_lvl into it, which is why both tell you to
+    stop serve.py first. Only compact_db.py builds a new file and swaps -- and
+    this handle keeps the old inode after that swap, so a compaction under a live
+    server means restarting it to see the result.
+    """
     global _psd_connection, _psd_kind, _psd_lvls
     entry = _psd_dbs.get(stat)
     if entry is not None:
@@ -939,7 +944,7 @@ def _apply_match(img, match, qmin, qmax, offset):
     """Remap img (dBm) onto the summary's dBm ramp -- same numbers as
     np.interp(img, match[0], match[1]), by a faster path.
 
-    img comes from an int8-quantized, max-pooled grid, so however large the
+    img comes from a uint8-quantized, max-pooled grid, so however large the
     tile is it only ever holds the 256 values that quantization allows (plus
     NaN in gap columns). np.interp does a binary search per pixel to place
     each of those into the 65-point match curve; building that mapping once
@@ -1392,8 +1397,11 @@ def _lvl_covers(c, sensor, lvl, t0, t1, stat="max"):
     it with the last value it did have -- stale data presented as current, which
     is worse than the slow path by a wide margin. So check, and fall back.
 
-    Cached per (sensor, bucket): the file is opened read-only and ingest swaps a
-    new one in rather than writing this one, so coverage cannot change under us.
+    Cached per (statistic, sensor, bucket) for the life of the process. Coverage
+    only grows -- build_psd_levels.py appends to psd_lvl and never removes rows --
+    so a cached "covers it" cannot go stale in the unsafe direction. A cached
+    "does not cover it" can, if the levels are rebuilt under a running server;
+    restarting picks it up.
     """
     key = (stat, sensor, lvl)
     with _lvl_cov_lock:
@@ -1499,7 +1507,10 @@ def _psd_window(c, sensor, t0, t1, cols, fi0, fi1,
     # takes a full-span window from ~18 s to well under one, and it is also the
     # more faithful answer: the level row is the max over EVERY capture in its
     # bucket, where the capture path below keeps only every Nth one at these
-    # widths. Sound because the layer is a max -- see build_psd_levels.py.
+    # widths. Sound because the pooling is a max for every statistic -- which
+    # also means a zoomed-out "median" view is a max OF medians, not a median.
+    # build_psd_levels.py's docstring has the measured size of that gap; it is
+    # the one place that number lives.
     ncap = _psd_count(c, sensor, t0, t1, kind)   # metadata only, no BLOBs read
     lvl = _pick_psd_level(t1 - t0, cols, ncap, levels)
     if lvl is not None and not _lvl_covers(c, sensor, lvl, t0, t1, stat):

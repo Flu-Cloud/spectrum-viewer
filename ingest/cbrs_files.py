@@ -4,7 +4,7 @@ cbrs_files.py: finding and reading CBRS export CSVs.
 psd_ingest.py and pfp_ingest.py differ only in the filename pattern they look
 for and the shape of the numbers inside. Walking a directory, grouping matches
 by sensor and day, explaining an empty result, and turning one CSV into
-int8-quantized rows are the same job in both, so they live here once. Each
+uint8-quantized rows are the same job in both, so they live here once. Each
 caller passes its own compiled pattern and its own quantization range.
 
 A matching filename must yield named groups `day`, `sensor` and `stat`.
@@ -234,7 +234,7 @@ def read_quantized(path, csv_connection, nvals, qmin, qmax, unit, what, lead=())
 
     Both deep layers store the same thing in the same way: a timestamp, zero or
     more key columns, then a fixed number of power values per capture, quantized
-    to int8 over a per-layer range. PSD has 2250 bins and no key column; PFP has
+    to uint8 over a per-layer range. PSD has 2250 bins and no key column; PFP has
     560 frame positions keyed by `frequency`. Only those three numbers differ, so
     the reading, the column-count check, the quantization and the out-of-range
     warning are written once here.

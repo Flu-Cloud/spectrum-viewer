@@ -9,8 +9,9 @@ openable -- and never on the exit code alone.
     py examples/test_durability.py                # all cases
     py examples/test_durability.py --case partial_day
 
-Runs on a generated fixture, so it needs no download. Pass --csv to use a real
-export instead.
+Every case generates its own fixture, so this needs no download and no real
+exports. That is deliberate: a fixture can be made to straddle midnight, hold a
+blank cell, or carry a +05:45 offset on demand, and the real exports cannot.
 """
 
 import argparse
@@ -109,7 +110,7 @@ def openable(db):
 
 # ---------------------------------------------------------------- the cases
 
-def case_partial_day(tmp, csv_for):
+def case_partial_day(tmp):
     """A day killed part-way must not be recorded as done.
 
     Measured before the per-day transaction: a SIGKILL 7 s into a three-day
@@ -158,7 +159,7 @@ def case_partial_day(tmp, csv_for):
           f"{n} stored, {distinct} distinct")
 
 
-def case_interrupt_stops(tmp, csv_for):
+def case_interrupt_stops(tmp):
     """Ctrl+C must stop the run, not be counted as one file's error.
 
     DuckDB turns SIGINT into InterruptException, an ordinary Exception, so the
@@ -191,7 +192,7 @@ def case_interrupt_stops(tmp, csv_for):
           n % 400 == 0 and n == distinct, f"{n} stored, {distinct} distinct")
 
 
-def case_blank_cell(tmp, csv_for):
+def case_blank_cell(tmp):
     """A blank value cell must be refused, not stored as full-scale power.
 
     It used to arrive as a masked array whose fill was 0.0 dBm/Hz, which clips to
@@ -216,7 +217,7 @@ def case_blank_cell(tmp, csv_for):
           stored(os.path.join(tmp, "blank", "psd.duckdb"))[0] == 0)
 
 
-def case_blank_timestamp(tmp, csv_for):
+def case_blank_timestamp(tmp):
     """A blank timestamp must be refused: it used to store t = NaN.
 
     psd_meta's range then became NaN, which is not valid JSON, so /api/psd_meta
@@ -238,7 +239,7 @@ def case_blank_timestamp(tmp, csv_for):
           f"exit {rc}")
 
 
-def case_empty_export(tmp, csv_for):
+def case_empty_export(tmp):
     """A header-only export must not count as a day done.
 
     On a compacted database it printed "caps=0 done=1 err=0" and exited 0, so the
@@ -266,7 +267,7 @@ def case_empty_export(tmp, csv_for):
           rc != 0 and "no data rows" in out, f"exit {rc}: {out.splitlines()[-1][:70]}")
 
 
-def case_offset_resume(tmp, csv_for):
+def case_offset_resume(tmp):
     """An export stamped with a non-UTC offset must not re-ingest on resume.
 
     first_capture_time stripped the offset and read the digits as UTC while the
@@ -309,7 +310,7 @@ def case_offset_resume(tmp, csv_for):
           f"resume test says {t}, the database stores {t0}")
 
 
-def case_collision(tmp, csv_for):
+def case_collision(tmp):
     """Two files claiming one sensor-day must be reported, and resolved stably."""
     d = os.path.join(tmp, "coll")
     a, b = os.path.join(d, "A"), os.path.join(d, "B")
@@ -333,7 +334,7 @@ def case_collision(tmp, csv_for):
     check("the winner is deterministic", len(picks) == 1, str(picks))
 
 
-def case_swap_wal(tmp, csv_for):
+def case_swap_wal(tmp):
     """A .wal beside the build file must block the swap.
 
     On a nearly-full volume DuckDB could not checkpoint on close and did not
@@ -367,7 +368,7 @@ def case_swap_wal(tmp, csv_for):
     os.remove(built + ".wal")
 
 
-def case_live_wal(tmp, csv_for):
+def case_live_wal(tmp):
     """The live database's own .wal must travel with it, not be left behind.
 
     Left beside the NEW file it replays into it and the database becomes
@@ -393,7 +394,7 @@ def case_live_wal(tmp, csv_for):
           not os.path.exists(live + ".wal"))
 
 
-def case_stale_build(tmp, csv_for):
+def case_stale_build(tmp):
     """A build file from an older, smaller source must not roll data back.
 
     Interrupt compaction, ingest another day, compact again: the old build file's
@@ -423,11 +424,13 @@ def case_stale_build(tmp, csv_for):
     after = stored(live)[0]
     check("a stale build file does not roll the live database back",
           after >= before, f"{before} captures before compaction, {after} after")
+    check("and the live database still holds both days in full",
+          after == n1 + n2, f"{after} captures stored, {n1} + {n2} in the csvs")
     check("the stale build file was recognised as stale",
           "stale" in out.lower(), out.splitlines()[0][:70] if out else "")
 
 
-def case_double_compact(tmp, csv_for):
+def case_double_compact(tmp):
     """Compacting twice must be a no-op, byte for byte."""
     d = os.path.join(tmp, "twice")
     src = os.path.join(d, "src")
@@ -446,7 +449,7 @@ def case_double_compact(tmp, csv_for):
           f"{stored(live)[0]} of {want}")
 
 
-def case_mixed_shape_served(tmp, csv_for):
+def case_mixed_shape_served(tmp):
     """A database holding BOTH shapes must not be served as if the chunks were all.
 
     serve.py picked the shape by table PRESENCE, so an empty psd_chunk beside a
@@ -485,7 +488,7 @@ def case_mixed_shape_served(tmp, csv_for):
           got.get("has") is True, str(got)[:120])
 
 
-def case_corrupt_summary(tmp, csv_for):
+def case_corrupt_summary(tmp):
     """A corrupt spectrum.duckdb must not take the whole server down.
 
     That open was at module scope with no try, so a truncated or non-DuckDB
@@ -522,7 +525,7 @@ def case_corrupt_summary(tmp, csv_for):
           "could not be read" in out, out.splitlines()[0][:80] if out else "")
 
 
-def case_summary_rebuild(tmp, csv_for):
+def case_summary_rebuild(tmp):
     """A failed summaries rebuild must not destroy the working summary layer.
 
     build_db.py deleted spectrum.duckdb and then rebuilt it, so from the moment
@@ -572,8 +575,24 @@ def case_summary_rebuild(tmp, csv_for):
           openable(live) and os.path.getsize(live) == good,
           f"{os.path.getsize(live)} bytes vs {good} before")
 
+    # A backup is worth keeping only if it holds something. An earlier failed run
+    # can leave a stub here, and backing THAT up litters the folder with a file
+    # whose name promises a database and delivers nothing.
+    stub = os.path.join(d, "spectrum.duckdb")
+    os.replace(live, os.path.join(d, "keep.duckdb"))
+    for leftover in (live + ".bak", live + ".bak.wal"):
+        if os.path.exists(leftover):      # a killed run above may have swapped
+            os.remove(leftover)
+    import duckdb as _dd
+    _dd.connect(stub).close()                       # a 12 KB empty database
+    rc, out = run([os.path.join(ING, "build_db.py"), "--csv-dir", csvd], env)
+    check("replacing an EMPTY summary database keeps no backup",
+          rc == 0 and not os.path.exists(live + ".bak")
+          and "no backup kept" in out,
+          f"exit {rc}; .bak exists: {os.path.exists(live + '.bak')}")
 
-def case_summaries_scan_cost(tmp, csv_for):
+
+def case_summaries_scan_cost(tmp):
     """build_db.py must not OPEN a file to learn it is not a Summaries export.
 
     It used to hand every .csv under the scan root to DuckDB to discover its
@@ -660,7 +679,6 @@ CASES = {
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--case", nargs="*", default=None, choices=list(CASES))
-    ap.add_argument("--csv", default=None, help="use a real export instead")
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
 
@@ -670,7 +688,7 @@ def main():
         for name in (args.case or CASES):
             print(f"\n-- {name}", flush=True)
             try:
-                CASES[name](tmp, args.csv)
+                CASES[name](tmp)
             except Exception as e:                         # noqa: BLE001
                 import traceback
                 check(f"{name} ran", False, f"{type(e).__name__}: {e}")

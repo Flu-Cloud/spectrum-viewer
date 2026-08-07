@@ -125,7 +125,7 @@ ingest/             fetch + database-build tooling, all resumable
 
 `serve.py` renders WebP tiles from the coarsest stored level that still has
 detail for the window, reading the DuckDB files read-only. Spectra are quantized
-**int8** in zlib-compressed chunks. This repo contains **only code**, no
+**uint8** in zlib-compressed chunks. This repo contains **only code**, no
 spectrum data.
 
 # Detailed manual

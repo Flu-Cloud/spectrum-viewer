@@ -375,7 +375,7 @@ def main():
                                 "&vmin=-100&vmax=-20").headers["X-Meta"])
         check("iq_layer honours the colour lock",
               (meta["vmin"], meta["vmax"]) == (-100.0, -20.0), str(meta)[:80])
-        r = c.get(f"/api/iq_layer?id=no-such-capture&t0=0&t1=1")
+        r = c.get("/api/iq_layer?id=no-such-capture&t0=0&t1=1")
         check("iq_layer for an unknown capture is a clean 404",
               r.status_code == 404 and "error" in r.get_json())
         r = c.get(f"/api/iq_layer?id={cid}&t0=1&t1=1")

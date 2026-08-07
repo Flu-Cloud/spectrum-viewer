@@ -1,7 +1,7 @@
 # NIST I/Q datasets: format notes for iq_ingest.py
 
 Ingest: `py iq_ingest.py <folder> --dataset <name>` → iq.duckdb (STFT pyramid,
-int8, fixed per-capture qmin/qmax). Formats handled by sigmf_io.open_capture:
+uint8, fixed per-capture qmin/qmax). Formats handled by sigmf_io.open_capture:
 SigMF (.sigmf-meta/.sigmf-data), NI TDMS (.tdms), .npy. Special cases found by
 probing the PDR records (data.nist.gov/rmm/records/<id>):
 

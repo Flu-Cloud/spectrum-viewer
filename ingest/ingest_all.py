@@ -26,9 +26,13 @@ WHAT "ANY DATA" HONESTLY MEANS, in three parts.
 
 Bin count IS checked. The viewer's PSD path is built around 2250 bins and PFP
 around 560 frame positions; those numbers live in serve.py and in the stored
-schema, not just here. Preflight reads each export's header through the same
-reader the ingest uses and reports a mismatch before anything runs, so you learn
-it from the plan instead of halfway through a long job. Note the limit of that:
+schema, not just here. Preflight counts the columns in a SAMPLE of each
+(sensor, stat) group -- PREFLIGHT_SAMPLE files, or all of them with
+ATLAS_PREFLIGHT_ALL=1 -- and reports a mismatch before anything runs, so you
+learn it from the plan instead of halfway through a long job. It reads one header
+line with Python's csv module rather than opening the file with DuckDB the way
+the ingest does: on an on-demand filesystem every open is a download, and doing
+it the thorough way cost 40 minutes before a single capture was stored. Note the limit of that:
 preflight is a REPORT, not a gate -- the per-layer ingest scripts scan their own
 --root and will still meet the file and reject it themselves. What preflight
 buys you is the reason, up front, per file.
@@ -105,7 +109,7 @@ def notable_lines(text):
 
 
 def run(argv, label, env=None, expected_bad=0):
-    """-> (state, tail) where state is "ok" | "partial" | "failed".
+    """-> (state, output) where state is "ok" | "partial" | "failed".
 
     Never raises: a failing step is data, not an exception.
 
@@ -135,24 +139,23 @@ def run(argv, label, env=None, expected_bad=0):
         print(f"    | {line.rstrip()}", flush=True)
     p.wait()
     both = "".join(lines)
-    tail = both
     for line in notable_lines(both):
         log(f"  ! {line}")
     if p.returncode == 0:
         # pfp_ingest and iq_ingest exit 0 even when some files could not be read,
         # so a clean exit code is not the same as a clean run. Say so.
         if any("failed to read" in ln for ln in notable_lines(both)):
-            return "partial", tail
-        return "ok", tail
+            return "partial", both
+        return "ok", both
     m = UNREADABLE_RE.search(both)
     if m and expected_bad and int(m.group(1)) <= expected_bad and "Done in" in both:
         log(f"  partial: {label} -- ingested everything usable; "
             f"{m.group(1)} file(s) named above cannot be read")
-        return "partial", tail
+        return "partial", both
     log(f"  FAILED {label} (exit {p.returncode})")
     for line in both.strip().splitlines()[-3:]:
         log(f"    {line}")
-    return "failed", tail
+    return "failed", both
 
 
 # ---- what is in the folder -------------------------------------------------
@@ -331,11 +334,16 @@ def build_plan(found, dest_env, scan_root):
                           atlas.script("pfp_ingest.py", sensor, "--stat", stat,
                                        "--root", d), dest_env, len(bad)))
 
-    # ONE summaries step, pointed at the scan root. build_db.py DELETES the
-    # database and rebuilds it, so one step per directory meant every directory
-    # but the last was thrown away -- two months of summaries became one, while
-    # PSD and PFP correctly accumulated. It already walks recursively and skips
-    # non-Summaries CSVs with a reason, so the root is the right argument.
+    # ONE summaries step, pointed at the scan root. build_db.py REPLACES the
+    # summary database rather than appending to it, so one step per directory
+    # meant every directory but the last was thrown away -- two months of
+    # summaries became one, while PSD and PFP correctly accumulated.
+    #
+    # The root is a cheap argument now, and only now: build_db.py classifies
+    # candidates by FILENAME through atlas.kind_of, so the ~44,600 PSD and PFP
+    # exports under a real dataset root cost nothing. Handing it the root while it
+    # still opened every .csv to read its columns was what made this step appear
+    # to hang for over an hour on a Box Drive folder -- every open is a download.
     if found["summaries"]:
         dirs = sorted(found["summaries"])
         if len(dirs) > 1:

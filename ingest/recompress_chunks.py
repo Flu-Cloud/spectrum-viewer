@@ -33,7 +33,7 @@ from chunk_io import Z  # the level we're upgrading TO
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-DB_DIR = os.environ.get("ATLAS_DB_DIR") or ROOT
+DB_DIR = os.path.abspath(os.environ.get("ATLAS_DB_DIR") or ROOT)
 
 try:
     sys.stdout.reconfigure(line_buffering=True)

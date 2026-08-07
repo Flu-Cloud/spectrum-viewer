@@ -73,3 +73,7 @@ docs/MODULE_MAP.md
 # ---- More OS junk ----
 .DS_Store
 nohup.out
+
+# Machine-specific: TRANSFER.md names real drive letters and home paths, so it is
+# useful on one disk and noise in the history.
+TRANSFER.md

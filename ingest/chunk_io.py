@@ -41,6 +41,40 @@ LAYOUT = {
 }
 
 
+def tables(connection):
+    """Every table name in this database.
+
+    One definition rather than four: compact_db.py, build_psd_levels.py,
+    recompress_chunks.py and serve.py each had their own copy of this query, and
+    the point of `schema_of` below is that "what shape is this file in" has a
+    single answer.
+    """
+    return {r[0] for r in connection.execute(
+        "SELECT table_name FROM information_schema.tables").fetchall()}
+
+
+def rollback_day(connection, appenders):
+    """Undo the day in progress: the transaction AND any buffered captures.
+
+    `appenders` is one ChunkAppender, an iterable of them, or None. Both ingests
+    need exactly this, and getting only half of it right is a data bug: captures
+    left in a buffer are written out with the NEXT day's flush, inside the next
+    day's transaction, so a rolled-back day comes back to life attached to a day
+    that succeeded.
+    """
+    if appenders is not None:
+        if isinstance(appenders, ChunkAppender):
+            appenders = [appenders]
+        elif isinstance(appenders, dict):
+            appenders = appenders.values()
+        for app in appenders:
+            app.reset()
+    try:
+        connection.execute("ROLLBACK")
+    except Exception:                                      # noqa: BLE001
+        pass                       # no transaction open; nothing to undo
+
+
 def schema_of(connection, base):
     """Which shape this database is in: 'chunk', 'rows', or 'empty'.
 
@@ -188,9 +222,10 @@ class ChunkAppender:
     """Buffer captures and flush them as whole chunks, as compact_db would.
 
     Appends only: chunks already in the table are never rewritten, so a resumed
-    run costs nothing for the days it already has. The final partial chunk is
-    written on exit, which leaves one short chunk per run -- harmless to read,
-    and a later `compact_db.py` pass tidies it.
+    run costs nothing for the days it already has. The callers flush at the end
+    of each DAY, inside that day's transaction, so a day that did not finish
+    contributes nothing -- which leaves one short chunk per day rather than per
+    run. Harmless to read, and a later `compact_db.py` pass repacks them.
     """
 
     def __init__(self, connection, base, sensor, payload_col, key=None):
@@ -201,7 +236,7 @@ class ChunkAppender:
         self.ts, self.buf, self.total = [], [], 0
 
     def add(self, times, payloads):
-        """`times` epoch seconds, `payloads` int8 arrays, one per capture."""
+        """`times` epoch seconds, `payloads` uint8 arrays, one per capture."""
         for t, p in zip(times, payloads):
             self.ts.append(float(t))
             self.buf.append(p.tobytes() if hasattr(p, "tobytes") else p)

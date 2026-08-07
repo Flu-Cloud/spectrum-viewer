@@ -7,7 +7,13 @@ require the verifier to catch each one -- and to name a check that plausibly
 owns the damage, not merely to exit non-zero for some unrelated reason.
 
     py examples/test_verify_1to1.py                       # own fixture
-    py examples/test_verify_1to1.py --csv <file>.csv --sensor HU --stat max
+    py examples/test_verify_1to1.py --csv <file>.csv --sensor HU --stat max \
+        --cross <same-day-other-stat>.csv       # adds the wrong-statistic case
+
+Two kinds of case, and the distinction matters: MUST_CATCH must make the verifier
+FAIL, and MUST_REPORT must leave it passing while still saying something (a
+missing coarse pyramid is a legitimate install, not damage). The counts are
+printed at the end rather than written here, so they cannot drift.
 
 The cases that matter most are the ones an earlier version of the verifier
 missed: a round-half-up quantizer (invisible to a half-step tolerance), a
@@ -323,7 +329,6 @@ def main():
                 bad += 1
 
         # -- a blank value cell has no correct byte; the CSV side must refuse it.
-        blank = os.path.join(tmp, f"2025-07-09_{args.sensor}_{args.stat}.csv")
         with open(csv) as fh:
             lines = fh.read().splitlines()
         parts = lines[2].split(",")
@@ -339,7 +344,11 @@ def main():
         if not ok:
             bad += 1
 
-        print(f"\n{'ALL MUTATIONS CAUGHT' if not bad else f'{bad} CASE(S) FAILED'}")
+        total = len(MUST_CATCH) + len(MUST_REPORT) + 1 + (2 if args.cross else 0)
+        print(f"\n{len(MUST_CATCH)} damage case(s) that must be caught, "
+              f"{len(MUST_REPORT)} legitimate state(s) that must still pass, "
+              f"{total} case(s) run")
+        print('ALL CASES BEHAVED' if not bad else f'{bad} CASE(S) FAILED')
         return 1 if bad else 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -1,7 +1,7 @@
 """
 psd_ingest.py: ingest PSD numbers into a compact, fast store.
 
-Each capture's 2250-bin spectrum is quantized to int8 (0.35 dB steps over
+Each capture's 2250-bin spectrum is quantized to uint8 (0.35 dB steps over
 [-180,-90] dBm/Hz) and stored as one BLOB row: (sensor, t, spec). That's ~1
 row per capture (~180k) instead of 398M long-form rows, so ingest skips the
 expensive UNPIVOT, the DB is ~4x smaller, and rendering is just a fetch + numpy
@@ -55,7 +55,7 @@ PSD_DB = os.environ.get("PSD_DB") or os.path.join(DB_DIR, "psd.duckdb")
 F0 = 3530040000.0    # first PSD bin (Hz)
 DF = 80000.0         # bin spacing (Hz)
 NF = 2250            # bins
-QMIN, QMAX = -180.0, -90.0   # int8 quantization range (dBm/Hz)
+QMIN, QMAX = -180.0, -90.0   # uint8 quantization range (dBm/Hz)
 
 # <YYYY-MM-DD>_<sensor>_<stat>.csv . The sensor match is lazy and the stat has
 # no underscore, so sensor names containing underscores still resolve.
@@ -89,13 +89,7 @@ def open_db(path):
 
 
 def _rollback(connection, app):
-    """Undo the day in progress: the transaction AND the appender's buffer."""
-    if app is not None:
-        app.reset()
-    try:
-        connection.execute("ROLLBACK")
-    except Exception:                                      # noqa: BLE001
-        pass                       # no transaction open; nothing to undo
+    return chunk_io.rollback_day(connection, app)
 
 
 def main():
@@ -152,7 +146,7 @@ def main():
 
     by_day = found[sensor]
     days = sorted(by_day)
-    print(f"{sensor}: {len(days)} day(s) on disk (compact int8 BLOB)")
+    print(f"{sensor}: {len(days)} day(s) on disk (compact uint8 BLOB)")
 
     connection = open_db(PSD_DB)
     connection.execute("CREATE TABLE IF NOT EXISTS psd (sensor VARCHAR, t DOUBLE, spec BLOB)")
@@ -167,31 +161,22 @@ def main():
     kind = chunk_io.schema_of(connection, "psd")
     if kind == "chunk":
         print("  this database is compacted; appending new days as chunks")
-    # Resumable: skip days already ingested, in UTC on both sides. t is the
-    # epoch second of a UTC capture and the filename's day is that same UTC day,
-    # but to_timestamp() renders in the machine's local zone -- west of
-    # Greenwich a 00:30 UTC capture buckets to the previous date. A day whose
-    # captures are all early UTC morning then never matches its own filename, so
-    # it is re-read and inserted again on every resume (duplicate rows), while a
-    # day that does match can be reported skipped without ever being compared.
-    # Which days are already in: tested against each file's OWN first capture,
-    # not against the day its name carries. A CBRS export runs from just after
-    # midnight to just after the NEXT one, so the day-name test marked day D+1
-    # complete as soon as day D was read, and D+1 was then skipped whole --
-    # measured on real exports as a third of the captures silently missing.
-    # Falls back to the day test for a file whose stamp will not parse, which
-    # keeps the old behaviour rather than risking duplicate rows (the append has
-    # no per-day delete).
+    # Resumable: which days are already stored. The rule is subtler than it
+    # looks -- UTC bucketing on both sides, and each file tested against its OWN
+    # first capture rather than the day its name carries, because a CBRS export
+    # runs past the next midnight. chunk_io.day_is_ingested and .already_have
+    # carry the full argument and what each shortcut costs; do not reason about
+    # this from here.
     times = chunk_io.stored_times(connection, "psd", sensor, kind)
     stored_ms = {int(round(t * 1000)) for t in times}
     per_day = chunk_io.captures_per_day(times)
     todo = [d for d in days
             if not chunk_io.day_is_ingested(d, per_day, stored_ms,
                                             lambda: cbrs_files.first_capture_time(by_day[d]))]
-    # Count the days this run is actually skipping, not every day the sensor
-    # has in the DB: `existing` spans the whole table, including days that are
-    # not under this --root at all. Reporting len(existing) is how "1 day on
-    # disk / 2 day(s) already ingested" -- more skipped than found -- happened.
+    # Count the days THIS RUN is skipping, not every day the sensor has stored:
+    # the database spans days that are not under this --root at all, and counting
+    # those is how "1 day on disk / 2 day(s) already ingested" -- more skipped
+    # than found -- came about.
     if len(todo) < len(days):
         print(f"  resuming: {len(days) - len(todo)} of {len(days)} day(s) "
               f"already ingested, skipping those")

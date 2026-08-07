@@ -66,9 +66,11 @@ import _require  # noqa: F401  -- deps message instead of a traceback
 import duckdb
 import numpy as np
 
+import chunk_io                                      # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-DB_DIR = os.environ.get("ATLAS_DB_DIR") or ROOT
+DB_DIR = os.path.abspath(os.environ.get("ATLAS_DB_DIR") or ROOT)
 PSD_DB = os.environ.get("PSD_DB") or os.path.join(DB_DIR, "psd.duckdb")
 
 NF = 2250
@@ -96,9 +98,7 @@ def log(m):
     print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
 
 
-def _tables(connection):
-    return {r[0] for r in connection.execute(
-        "SELECT table_name FROM information_schema.tables").fetchall()}
+_tables = chunk_io.tables      # one definition, in the module that owns the schema
 
 
 def _iter_captures(connection, sensor, kind, since):

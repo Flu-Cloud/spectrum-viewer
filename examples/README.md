@@ -3,12 +3,14 @@
 ## Zero-download demo
 
 The real datasets are multi-GB and not included in this repo. This example
-fabricates one small synthetic IQ capture and runs the normal ingest pipeline
-so you can see the viewer work without downloading anything.
+fabricates synthetic CBRS exports and one IQ capture, then runs the normal ingest
+pipeline over them, so you can see every viewer mode work without downloading
+anything.
 
 ```bash
 pip install -r requirements.txt
-python examples/make_sample.py     # writes examples/sample_data/ + iq.duckdb
+python examples/make_sample.py     # all four databases
+python examples/make_sample.py --iq    # just iq.duckdb, if that is all you want
 python serve.py                    # open http://127.0.0.1:8090
 ```
 

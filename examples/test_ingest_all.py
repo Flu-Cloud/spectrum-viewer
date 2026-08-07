@@ -89,7 +89,7 @@ def summaries_csv(path, days):
 
 
 def case_summaries_in_two_directories(tmp):
-    """build_db.py DELETES the database and rebuilds it, so one step per
+    """build_db.py REPLACES the summary database wholesale, so one step per
     directory threw away every directory but the last: two months of summaries
     became one, while PSD and PFP correctly accumulated."""
     src, dest = os.path.join(tmp, "sum_src"), os.path.join(tmp, "sum_db")
@@ -211,7 +211,7 @@ def case_stale_build_file(tmp, _unused_dest):
     c.execute("CREATE TABLE psd_meta (sensor VARCHAR, f0 DOUBLE, df DOUBLE, nf INT, "
               "qmin DOUBLE, qmax DOUBLE, t_min DOUBLE, t_max DOUBLE, captures BIGINT)")
     c.execute("CREATE TABLE done (k VARCHAR)")
-    c.execute("INSERT INTO done VALUES ('meta'), ('S1')")   # claims S1 is finished
+    c.execute("INSERT INTO done VALUES ('S1')")   # claims S1 is finished
     c.close()
     env = {**os.environ, "ATLAS_DB_DIR": dest}
     subprocess.run([sys.executable, os.path.join(ROOT, "ingest", "compact_db.py")],

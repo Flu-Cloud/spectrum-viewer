@@ -44,7 +44,8 @@ read-only, so it is safe to run against the databases the viewer is serving.
 
 Exit code is 0 only if every check passed. A check that had nothing to look at
 fails rather than passes -- see test_verify_1to1.py, which damages a real
-database twenty ways and requires every one to be caught.
+database every way the ingest could plausibly get one wrong and requires each to
+be caught by a check that owns it, not incidentally by an unrelated one.
 """
 
 import argparse

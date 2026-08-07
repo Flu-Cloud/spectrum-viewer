@@ -445,7 +445,7 @@ def main():
               and res.get("pfp_frame", [0])[0] == 200,
               f"psd={res.get('psd_layer')} pfp={res.get('pfp_frame')}")
 
-        # Rebuilding on top of real CBRS data would delete spectrum.duckdb and
+        # Rebuilding on top of real CBRS data would replace spectrum.duckdb and
         # merge demo sensors into psd/pfp, so it has to refuse by default.
         rc, out = run([sys.executable, os.path.join(HERE, "make_sample.py"),
                        "--cbrs"], denv)

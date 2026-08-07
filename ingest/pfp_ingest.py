@@ -3,7 +3,7 @@ pfp_ingest.py: ingest PFP (periodic-frame-power) numbers into a compact store.
 
 PFP = power across a 10 ms frame (560 positions, ~17.86 us each) per 10 MHz
 channel, one trace per sweep (the SEA schedule sweeps every ~90 s, dwelling 4 s
-on each of the 18 channels). We store one int8-quantized BLOB per
+on each of the 18 channels). We store one uint8-quantized BLOB per
 (channel, capture): (sensor, freq, t, frame). Re-render any channel/time window
 crisply, like the PSD layer.
 
@@ -53,7 +53,7 @@ PFP_DB = os.environ.get("PFP_DB") or os.path.join(DB_DIR, "pfp.duckdb")
 
 NPOS = 560
 FRAME_MS = 10.0
-QMIN, QMAX = -130.0, -10.0   # int8 range (dBm), ~0.47 dB/step
+QMIN, QMAX = -130.0, -10.0   # uint8 range (dBm), ~0.47 dB/step
 
 # PFP_<YYYY-MM-DD>_<sensor>_<stat>.csv , where stat may itself contain one
 # underscore (max_peak, mean_rms). The lazy sensor match resolves the rest.
@@ -72,13 +72,7 @@ def discover(root, stat=None, collisions=None):
 
 
 def _rollback(connection, apps):
-    """Undo the day in progress: the transaction AND every appender buffer."""
-    for app in apps.values():
-        app.reset()
-    try:
-        connection.execute("ROLLBACK")
-    except Exception:                                      # noqa: BLE001
-        pass
+    return chunk_io.rollback_day(connection, apps)
 
 
 def stats_present(root):
@@ -149,18 +143,11 @@ def main():
     kind = chunk_io.schema_of(connection, "pfp")
     if kind == "chunk":
         print("  this database is compacted; appending new days as chunks")
-    # Resumable: skip days already ingested, in UTC on both sides.
-    # to_timestamp() renders in the machine's local zone while the filename's
-    # day is UTC, so west of Greenwich an early-UTC-morning day never matches
-    # its own filename and is re-read and re-inserted on every resume. And count
-    # the days this run is actually skipping rather than every day the sensor has
-    # in the table -- `existing` spans days that are not under this --root at
-    # all, which is how "1 day(s) on disk / 2 day(s) already ingested" came about.
-    # Tested against each file's OWN first capture, not the day its name
-    # carries: a CBRS export runs past the next midnight, so the day-name test
-    # marked day D+1 complete as soon as day D was read and then skipped D+1
-    # whole. Falls back to the day test when a stamp will not parse, since the
-    # append has no per-day delete and a wrong "not ingested" duplicates rows.
+    # Resumable, by exactly the rule psd_ingest.py uses -- see
+    # chunk_io.day_is_ingested. Count the days THIS RUN skips rather than every
+    # day the sensor has stored: the table spans days that are not under this
+    # --root at all, and counting those is how "1 day(s) on disk / 2 day(s)
+    # already ingested" came about.
     times = chunk_io.stored_times(connection, "pfp", sensor, kind)
     stored_ms = {int(round(t * 1000)) for t in times}
     per_day = chunk_io.captures_per_day(times)
@@ -179,8 +166,9 @@ def main():
     done = err = nrows = 0
     errors = []
     # A chunk is one channel's consecutive frames, so the appenders are keyed by
-    # frequency and kept open across days -- a day holds only a handful of frames
-    # per channel, and closing per day would leave a chunk table of stubs.
+    # frequency. They are kept ACROSS days but flushed at the end of each one --
+    # see below. Keeping them open across days without flushing packed fuller
+    # chunks, and cost atomicity to do it.
     apps = {}
     # One transaction per day, and the appenders are flushed inside it. DuckDB
     # autocommits per parameter set, so an interrupted day used to leave an
@@ -256,7 +244,10 @@ def main():
               file=sys.stderr)
     print("next: python serve.py     (optional: python ingest/compact_db.py "
           "first, to shrink the file)")
-    return 1 if err and nrows == 0 else 0
+    # Non-zero for ANY unread file, matching psd_ingest. `err and nrows == 0`
+    # reported success for a run that stored some days and dropped others, and
+    # ingest_all.py branches on this to decide whether a step is done.
+    return 1 if err else 0
 
 
 if __name__ == "__main__":

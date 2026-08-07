@@ -28,7 +28,7 @@ import sigmf_io
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
-DB_DIR = os.environ.get("ATLAS_DB_DIR") or ROOT
+DB_DIR = os.path.abspath(os.environ.get("ATLAS_DB_DIR") or ROOT)
 IQ_DB = os.environ.get("IQ_DB") or os.path.join(DB_DIR, "iq.duckdb")
 
 NFFT = 1024

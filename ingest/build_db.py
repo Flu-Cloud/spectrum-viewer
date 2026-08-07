@@ -28,6 +28,7 @@ import duckdb
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import cbrs_files                                    # noqa: E402
+import chunk_io                                      # noqa: E402
 import atlas                                         # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,8 +37,10 @@ CSV_DIR = os.path.join(HERE, "csv")
 DB_DIR = os.path.abspath(os.environ.get("ATLAS_DB_DIR") or ROOT)
 DB_PATH = os.environ.get("SPECTRUM_DB") or os.path.join(DB_DIR, "spectrum.duckdb")
 
-# Summaries CSVs carry these columns; anything else in the folder is skipped
-# with a reason rather than aborting the whole run.
+# The columns a Summaries CSV carries. This is MESSAGE TEXT, not the filter --
+# find_csvs decides by filename through atlas.kind_of, so a PSD or PFP export
+# never reaches the reader at all. It is quoted when a folder turns out to hold
+# nothing usable, so the reader learns what was actually wanted.
 NEEDED = ("sensor_name", "channel_frequency_mhz", "timestamp",
           "max", "median", "mean")
 
@@ -49,6 +52,22 @@ LEVELS = [
     ("lvl_h6", 21600),     # 6 hours
     ("lvl_d1", 86400),     # 1 day
 ]
+
+
+def _has_rows(path):
+    """Does this database actually hold summary rows? False if unreadable."""
+    try:
+        c = duckdb.connect(path, read_only=True)
+    except Exception:                                      # noqa: BLE001
+        return False
+    try:
+        if "raw" not in chunk_io.tables(c):
+            return False
+        return bool(c.execute("SELECT count(*) FROM raw").fetchone()[0])
+    except Exception:                                      # noqa: BLE001
+        return False
+    finally:
+        c.close()
 
 
 def find_csvs(csv_dir):
@@ -173,8 +192,11 @@ def main():
                                           'max':'DOUBLE','median':'DOUBLE','mean':'DOUBLE'})
             """, [f])
         except duckdb.Error as e:
-            # A PSD or PFP export sitting in the same folder is not a Summaries
-            # CSV. Say so and keep going rather than aborting the whole build.
+            # find_csvs already excluded PSD and PFP exports by filename, so a
+            # failure here is a MALFORMED summaries file -- a truncated download,
+            # a changed column name, a stray CSV whose header happened to mention
+            # both sensor_name and channel_frequency_mhz. Say which file and keep
+            # going: one bad month should not cost the other twenty-three.
             skipped += 1
             first = str(e).strip().splitlines()[0]
             print(f"  [{i:2}/{len(files)}] {name:18}  skipped: {first}")
@@ -249,15 +271,26 @@ def main():
               file=sys.stderr)
         return 1
     if os.path.exists(DB_PATH):
-        bak = DB_PATH + ".bak"
-        if os.path.exists(bak):
-            os.remove(bak)
-        os.replace(DB_PATH, bak)
-        for w in (DB_PATH + ".wal",):
-            if os.path.exists(w):
-                os.replace(w, bak + ".wal")
-        print(f"  previous {os.path.basename(DB_PATH)} kept as "
-              f"{os.path.basename(bak)}")
+        # Keep the outgoing file only if it HOLDS something. A failed earlier run
+        # can leave a 12 KB stub here, and backing that up just litters the folder
+        # with a file whose name promises a database and delivers nothing -- while
+        # a real 2 GB summary layer is exactly what you want a backup of.
+        if _has_rows(DB_PATH):
+            bak = DB_PATH + ".bak"
+            if os.path.exists(bak):
+                os.remove(bak)
+            os.replace(DB_PATH, bak)
+            if os.path.exists(DB_PATH + ".wal"):
+                os.replace(DB_PATH + ".wal", bak + ".wal")
+            print(f"  previous {os.path.basename(DB_PATH)} "
+                  f"({os.path.getsize(bak)/1e9:.2f} GB) kept as "
+                  f"{os.path.basename(bak)} -- delete it when you are happy")
+        else:
+            os.remove(DB_PATH)
+            if os.path.exists(DB_PATH + ".wal"):
+                os.remove(DB_PATH + ".wal")
+            print(f"  replaced an empty {os.path.basename(DB_PATH)} "
+                  f"(no backup kept: it held no rows)")
     os.replace(build_path, DB_PATH)
     size_gb = os.path.getsize(DB_PATH) / 1e9
     print(f"\nDone in {time.time()-t0:.0f}s. Database: {DB_PATH} ({size_gb:.2f} GB)")

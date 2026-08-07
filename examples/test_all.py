@@ -17,8 +17,10 @@ What each one covers:
     test_durability.py  the ways an interrupted or damaged run used to lose
                     data silently: partial days, orphaned WALs, stale build
                     files, blank cells, non-UTC stamps
-    test_verify_1to1.py  damages a real database twenty ways and requires the
-                    1:1 CSV verifier to catch every one
+    test_verify_1to1.py  damages a real database every way the ingest could
+                    plausibly get one wrong -- including a round-half-up
+                    quantizer, which a half-step tolerance cannot see -- and
+                    requires each to be caught by a check that owns it
     test_repeat.py  re-running the ingest months later: additive, idempotent,
                     and safe on an already-compacted database
     test_ingest_all.py  the one-command ingest over an unfamiliar folder, and

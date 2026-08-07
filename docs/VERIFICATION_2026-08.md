@@ -1,12 +1,19 @@
 # ATLAS: 30-combination data verification and adverse-condition testing
 
+What this records: the August 2026 verification of the CBRS PSD databases against
+the physical NASCTN exports, and the adverse-condition testing that went with it.
+Kept because it is the evidence behind "the data is 1:1", it names the eight cells
+where that is not literally true, and it lists the findings that were deliberately
+NOT changed together with the reasoning — which is otherwise unrecoverable without
+re-running the whole exercise.
+
 Two questions were asked. Is the data 1:1 with the physical CSVs, for all ten
 sensors in all three statistics? And does a clean install hold up under bad
 conditions?
 
 Short answers: **the data is right**, and **the pipeline was not durable** — five
-separate ways a re-run could lose or corrupt data, all now fixed and regression-
-tested. One of them was happening on your machine while this ran.
+separate ways a re-run could lose or corrupt data, all now fixed and covered by
+`examples/test_durability.py`.
 
 ---
 
@@ -103,9 +110,10 @@ break my verifier — and it did (see below).
 The first version reported 30/30 while being unable to detect a round-half-up
 quantizer, blessing 173 of 173 wrong pyramid rows, and never exercising which CSV
 fed which database. All three are fixed, and `examples/test_verify_1to1.py` now
-damages a real database **24 ways** — including that exact rounding bug — and
-requires each one to be caught *by a check that plausibly owns it*, not
-incidentally. All 24 caught. The 30/30 above is from the hardened version.
+damages a real database every way the ingest could plausibly get one wrong —
+including that exact rounding bug — and requires each to be caught *by a check
+that owns it*, not incidentally by an unrelated one. The 30/30 above is from the
+hardened version.
 
 ---
 
@@ -240,65 +248,15 @@ None of your current exports contain blanks; this was latent.
 
 ---
 
-## Part 3 — what is happening on your machine, and what to do
-
-`C:\Users\pipyt\ATLAS\spectrum.duckdb` is **12,288 bytes**, last written
-03:43 UTC — over an hour ago, with a 217-byte WAL beside it and nothing since.
-Your PSD databases grew correctly (`psd.duckdb` 5.32 → 5.49 GB), so the PSD
-backfill worked. What has stalled is the summaries step.
-
-**Nothing measured is lost.** The summary layer is derived data — the Summaries
-CSVs on Box are the source, and it rebuilds. It is a time cost, not a data loss.
-
-The 12 KB stub with a 217-byte WAL means `build_db.py` created the database and
-committed its `CREATE TABLE`, and then wrote nothing. That is the signature of
-reading from Box Drive with nothing landing on disk — the same shape as the
-40-minute stall you hit before. The Summaries folder is ~9 GB across 24 monthly
-files, several around 500 MB, and Box Drive hydrates them on demand.
-
-**Do this:**
-
-1. **Look at the console.** If it has not printed a new `[ n/24]` line in the
-   last twenty minutes, it is stuck. Ctrl+C it.
-2. **The fixed files are already in place** — I wrote all 14 into
-   `C:\Users\pipyt\ATLAS` and verified every checksum. Nothing else to move.
-3. **Pre-hydrate the Summaries folder before re-running.** In File Explorer,
-   right-click `Box\SEA-DATA\Summaries` → *Make Available Offline*, and wait for
-   it. Or copy it to a local folder. Reading 9 GB on demand is what stalls;
-   reading it off local disk does not. Then:
-
-   ```powershell
-   cd C:\Users\pipyt\ATLAS
-   python ingest\build_db.py --csv-dir "C:\Users\pipyt\Box\SEA-DATA\Summaries"
-   ```
-
-   With the fix in place this builds `spectrum.duckdb.build` and only swaps it
-   into position when it is complete — so if it fails again, you lose nothing,
-   and if it succeeds your previous file is kept as `spectrum.duckdb.bak`.
-   Budget an extra 0.5 GB of disk for that backup.
-4. **Then check it yourself**, on your real 22 GB databases rather than a rebuild:
-
-   ```powershell
-   python examples\verify_all_stats.py --root "C:\Users\pipyt\Box\SEA-DATA\PSD" ^
-       --db-dir C:\Users\pipyt\ATLAS --days 2 --expect 30
-   ```
-
-   That opens your databases **read-only** and runs the same 1:1 comparison
-   against the CSVs, printing a per-combination verdict. `--days 2` keeps it to a
-   couple of days per sensor; drop it for the full set.
-5. **Still to do from before:** `git push origin HEAD:main` (7 commits now), and
-   `_to_delete` / `_stat_build` are still reclaimable disk.
-
----
-
 ## Test status
 
 `python examples\test_all.py` — **11 of 11 suites pass**, 325 s, including a real
 Chromium run of the viewer. Two suites are new:
 
-- `test_durability.py` — 14 cases, every one a measured failure from this
+- `test_durability.py`, every one a measured failure from this
   session: partial days under SIGKILL and SIGINT, orphaned WALs, stale build
   files, a destroyed summary rebuild, blank cells, blank timestamps, non-UTC
   offsets, sensor-day collisions, double compaction, mixed schemas, a corrupt
   summary database.
-- `test_verify_1to1.py` — 24 mutations of a real database, all caught.
+- `test_verify_1to1.py` — a real database damaged every way that matters, each
+  damage required to be caught by a check that owns it.

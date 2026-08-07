@@ -28,6 +28,8 @@ import _require  # noqa: F401  -- deps message instead of a traceback
 import duckdb
 import numpy as np
 
+import chunk_io                                      # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 # Where the .duckdb files live; override to compact a copy elsewhere.
@@ -325,10 +327,7 @@ def _already_compact(connection, rows_table, label):
     return False
 
 
-def _tables(connection):
-    """Table names in an open database, for optional-table checks."""
-    return {r[0] for r in connection.execute(
-        "SELECT table_name FROM information_schema.tables").fetchall()}
+_tables = chunk_io.tables      # one definition, in the module that owns the schema
 
 
 def _copy_meta(dst, src_path, table, rows_table=None):
@@ -360,8 +359,8 @@ def _copy_meta(dst, src_path, table, rows_table=None):
                         f"(SELECT DISTINCT sensor FROM msrc.{rows_table})")
             log(f"  dropped {len(orphans)} {table} row(s) with no {rows_table} "
                 f"data behind them: {', '.join(sorted(orphans))}")
-            log(f"  re-run the matching ingest for those sensors if that is "
-                f"not what you expected.")
+            log("  re-run the matching ingest for those sensors if that is "
+                "not what you expected.")
     dst.execute("DETACH msrc")
     # Deliberately NOT recorded in `done`. Marking it made a resumed compaction
     # skip the copy, so a build file started last month carried last month's
@@ -459,7 +458,7 @@ def compact_psd(name="psd"):
     # sensor and time -- it describes the same measurements whichever on-disk
     # shape holds them, so compaction has no reason to invalidate it. It used to
     # be dropped silently: build the levels and then compact (the order
-    # ingest_all_stats.py used) and every level row was discarded, leaving wide
+    # an earlier one-command script used) and every level row was discarded, leaving wide
     # windows to the slow capture path with nothing on screen to say why. Copying
     # it makes the two steps order-independent, which is the real fix -- a
     # pipeline should not have a correct order you can only learn by measuring.
@@ -602,8 +601,8 @@ def swap_in(name):
     if os.path.exists(built + ".wal"):
         log(f"  REFUSING to swap {name}_c.duckdb in: {name}_c.duckdb.wal still "
             f"exists, so part of the compacted data is not in the file yet.")
-        log(f"    Nothing has been changed. Re-run compact_db.py once there is "
-            f"free disk space; the build file resumes where it stopped.")
+        log("    Nothing has been changed. Re-run compact_db.py once there is "
+            "free disk space; the build file resumes where it stopped.")
         return False
     # The live database's own .wal has to travel WITH it. Left behind, it either
     # replays into the NEW file and fails ('Table "psd_meta" already exists',

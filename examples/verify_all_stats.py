@@ -21,6 +21,7 @@ clean "0/0 verified" and exits 0.
 
 import argparse
 import concurrent.futures as cf
+import gzip
 import os
 import re
 import shutil
@@ -55,7 +56,15 @@ def discover(root):
     return found
 
 
-def one(sensor, stat, paths, cross, root, db_dir, samples, nbytes, seed, keep):
+def csv_rows(path):
+    """How many data rows an export holds, without parsing its values."""
+    opener = gzip.open if path.lower().endswith(".gz") else open
+    with opener(path, "rb") as fh:
+        return max(sum(1 for line in fh if line.strip()) - 1, 0)
+
+
+def one(sensor, stat, paths, all_paths, cross, root, db_dir, samples, nbytes,
+        seed, keep):
     """Verify one (sensor, statistic). Returns (label, ok, text, seconds)."""
     t0 = time.time()
     label = f"{sensor:22} {stat:6}"
@@ -70,7 +79,6 @@ def one(sensor, stat, paths, cross, root, db_dir, samples, nbytes, seed, keep):
             tmp = tempfile.mkdtemp(prefix=f"v30-{stat}-")
             dbpath, _log = V.build_isolated(paths, sensor, stat, tmp, root=root)
         blocks, ok = [], True
-        total_rows = 0
         for i, p in enumerate(paths):
             rng = np.random.default_rng(seed + i)
             rep, _picks = V.verify(p, sensor, stat, dbpath, rng, samples,
@@ -79,11 +87,14 @@ def one(sensor, stat, paths, cross, root, db_dir, samples, nbytes, seed, keep):
                                    cross=cross.get(os.path.basename(p), ()))
             ok = ok and not rep.bad
             blocks.append(rep.text(verbose=True))
-            total_rows += len(V.read_csv_independently(p)[0])
+
         if not db_dir:
             # Built from exactly these files, so the database must hold exactly
             # their captures -- containment alone would let a duplicated chunk or
-            # a re-ingest through.
+            # a re-ingest through. Counted over EVERY day of the combination, not
+            # the subset being verified: with --root the ingest reads all of them,
+            # and comparing against a --days-capped subset failed on correct data.
+            total_rows = sum(csv_rows(p) for p in all_paths)
             import duckdb
             c = duckdb.connect(dbpath, read_only=True)
             try:
@@ -98,7 +109,7 @@ def one(sensor, stat, paths, cross, root, db_dir, samples, nbytes, seed, keep):
             blocks.append(
                 f"{'PASS' if exact else 'FAIL'}  {sensor} / {stat} / totals\n"
                 f"    {'ok  ' if exact else 'FAIL'} database holds exactly the "
-                f"{len(paths)} export(s)' captures  -- stored {len(dts):,}, "
+                f"{len(all_paths)} export(s)' captures  -- stored {len(dts):,}, "
                 f"meta {meta[0] if meta else 'none'}, csv total {total_rows:,}")
         return label, ok, "\n".join(blocks), time.time() - t0
     except Exception:
@@ -157,9 +168,8 @@ def main():
             if not days:
                 skipped.append(f"{s}/{st}")
                 continue
-            paths = [days[d] for d in sorted(days)]
-            if args.days:
-                paths = paths[:args.days]
+            all_paths = [days[d] for d in sorted(days)]
+            paths = all_paths[:args.days] if args.days else all_paths
             # the same days of the OTHER statistics: this database must not match
             cross = {}
             for p in paths:
@@ -167,14 +177,14 @@ def main():
                 cross[os.path.basename(p)] = tuple(
                     found[(s, o)][day] for o in STATS
                     if o != st and (s, o) in found and day in found[(s, o)])
-            combos.append((s, st, paths, cross))
+            combos.append((s, st, paths, all_paths, cross))
 
     if not combos:
         print("nothing to verify: no (sensor, statistic) combination matched",
               file=sys.stderr)
         return 2
 
-    nfiles = sum(len(p) for _s, _t, p, _c in combos)
+    nfiles = sum(len(p) for _s, _t, p, _a, _c in combos)
     print(f"{len(combos)} combination(s) over {len(sensors)} sensor(s), "
           f"{nfiles} export file(s), {args.jobs} parallel job(s)"
           + (f", against existing databases in {args.db_dir}" if args.db_dir
@@ -188,10 +198,11 @@ def main():
     t0 = time.time()
     results = []
     with cf.ProcessPoolExecutor(max_workers=args.jobs) as ex:
-        futs = {ex.submit(one, s, st, p, c, None if args.db_dir else args.root,
-                          args.db_dir, args.samples, args.nbytes, args.seed,
+        futs = {ex.submit(one, s, st, p, a, c,
+                          None if args.db_dir else args.root, args.db_dir,
+                          args.samples, args.nbytes, args.seed,
                           args.keep): (s, st)
-                for s, st, p, c in combos}
+                for s, st, p, a, c in combos}
         for fut in cf.as_completed(futs):
             label, ok, text, secs = fut.result()
             results.append((label, ok, text, secs))
