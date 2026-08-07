@@ -25,15 +25,25 @@ import io
 import json
 import math
 import os
+import sys
 import threading
 import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 
-import duckdb
-import numpy as np
-from PIL import Image
-from flask import Flask, Response, jsonify, make_response, request, send_file
+# Before the third-party imports: serve.py is the script the ingest tells the
+# user to run next ("next: python serve.py"), and it was the one entry point with
+# no dependency guard -- a half-populated venv answered with a raw
+# ModuleNotFoundError while every ingest script printed an actionable message.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "ingest"))
+import _require  # noqa: F401,E402
+
+import duckdb                                             # noqa: E402
+import numpy as np                                        # noqa: E402
+from PIL import Image                                     # noqa: E402
+from flask import (Flask, Response, jsonify, make_response, request,  # noqa: E402
+                   send_file)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Each database path is overridable, like IQ_DB below, so a test run or a
@@ -56,6 +66,28 @@ LEVELS = [
 ]
 
 app = Flask(__name__)
+
+
+@app.errorhandler(Exception)
+def _degrade(exc):
+    """Answer a storage or memory failure with 503, never a 500.
+
+    A DuckDB OutOfMemoryException from the tile path reached Flask as a 500, and
+    a 500 is the one answer the viewer can do nothing with -- it cannot tell
+    "retry a narrower window" from "this build is broken". 503 says try again,
+    which is exactly right for pressure that passes. Anything that is not a
+    storage or memory failure is re-raised so real bugs still surface loudly in
+    the log and in the tests.
+    """
+    from werkzeug.exceptions import HTTPException
+    if isinstance(exc, HTTPException):
+        return exc
+    if isinstance(exc, (MemoryError, duckdb.Error)):
+        app.logger.warning("degrading to 503: %r", exc)
+        return jsonify({"error": "the server is short of memory or cannot read "
+                                 "the database right now; try a narrower window"
+                        }), 503
+    raise exc
 
 # Each request gets its own DuckDB cursor off the shared connection rather than
 # taking a lock around the shared one. A single lock meant a cheap request --
@@ -107,15 +139,26 @@ def _cbrs_sensors():
     return [merged[k] for k in sorted(merged)]
 
 
+connection, freqs = None, []
 if os.path.exists(DB_PATH):
-    connection = duckdb.connect(DB_PATH, read_only=True)
-    # Static per-boot metadata (sensor list + channel freqs): computed once so
-    # /api/meta never rescans the 47M-row raw table per page load.
-    freqs = [r[0] for r in connection.execute(
-        "SELECT DISTINCT freq FROM raw ORDER BY freq").fetchall()]
-else:
-    connection = None
-    freqs = []          # no channel summaries; the PSD layer carries its own axis
+    # Wrapped, unlike before: this open is at module scope, so a truncated,
+    # zero-byte or non-DuckDB spectrum.duckdb killed the process with a raw
+    # traceback BEFORE the port was bound -- and took the PSD, PFP and IQ layers
+    # down with it, none of which had anything wrong. Every other layer already
+    # degrades to "not there" on a bad file; this one now does too, which is
+    # exactly the state a missing spectrum.duckdb produces and which is known to
+    # serve everything else correctly.
+    try:
+        connection = duckdb.connect(DB_PATH, read_only=True)
+        # Static per-boot metadata (sensor list + channel freqs): computed once so
+        # /api/meta never rescans the 47M-row raw table per page load.
+        freqs = [r[0] for r in connection.execute(
+            "SELECT DISTINCT freq FROM raw ORDER BY freq").fetchall()]
+    except Exception as e:                                 # noqa: BLE001
+        connection, freqs = None, []
+        print(f"[serve] {os.path.basename(DB_PATH)} could not be read ({e}); "
+              "serving without the channel-summary layer. The PSD, PFP and IQ "
+              "layers are unaffected.")
 
 
 def _dbm_div():
@@ -605,6 +648,14 @@ _psd_lvls = []
 _psd_init = threading.Lock()
 
 
+def _rows(c, table):
+    """How many rows a table holds; 0 when it cannot be counted."""
+    try:
+        return c.execute(f"SELECT count(*) FROM {table}").fetchone()[0] or 0
+    except Exception:                                      # noqa: BLE001
+        return 0
+
+
 def table_names(c):
     try:
         return {r[0] for r in c.execute(
@@ -620,6 +671,9 @@ def table_names(c):
 # unmodified, and a stat the user never ingested simply is not there.
 PSD_LAYER_STATS = ("max", "median", "mean")
 _psd_dbs = {}           # stat -> {"connection", "kind", "levels"} once opened
+_psd_retry = {}         # stat -> monotonic time before which not to retry a
+                        # failed open (an ingest holding the write lock)
+OPEN_RETRY = 20.0
 
 
 def psd_db_path(stat):
@@ -640,6 +694,9 @@ def psd_connection(stat="max"):
     path = psd_db_path(stat)
     if stat not in PSD_LAYER_STATS or not os.path.exists(path):
         return None
+    until = _psd_retry.get(stat)
+    if until is not None and time.monotonic() < until:
+        return None                 # a recent open failed; do not hammer it
     with _psd_init:                 # two requests can race here on first load
         entry = _psd_dbs.get(stat)
         if entry is not None:
@@ -653,15 +710,41 @@ def psd_connection(stat="max"):
             # compact_db still holding the write lock, and a file that is not a
             # DuckDB database -- both worth naming.
             print(f"[serve] cannot open {os.path.basename(path)}: {e}")
-            print(f"[serve]   -- the PSD {stat} layer will not be available.")
-            _psd_dbs[stat] = {"connection": None, "kind": None, "levels": []}
+            print(f"[serve]   -- the PSD {stat} layer will not be available "
+                  f"(retrying in {OPEN_RETRY:.0f}s).")
+            # NOT cached permanently. The usual cause is an ingest or compaction
+            # holding the write lock for a few minutes, and caching the failure
+            # meant a server that merely STARTED at the wrong moment served
+            # {"has": false} for the rest of its life -- the databases were fine
+            # and the viewer was told there was no data. Retried after a
+            # cooldown, so a genuinely broken file still costs one open per
+            # cooldown rather than one per request.
+            _psd_retry[stat] = time.monotonic() + OPEN_RETRY
             return None
         # Two on-disk shapes are valid: the compact chunk schema written by
         # compact_db.py, and the row-per-capture schema psd_ingest.py writes.
         # Reading both means compaction is a size optimisation, not a step you
         # can forget and end up with a viewer that renders nothing.
         t = table_names(connection)
-        kind = "chunk" if "psd_chunk" in t else ("rows" if "psd" in t else None)
+        # By row COUNT, not by table presence. chunk_io.schema_of has always
+        # decided it this way and its docstring claims to mirror this line; it
+        # did not. Two states show the difference. An EMPTY psd_chunk beside a
+        # full psd row table advertised the layer and then 404'd every tile. And
+        # a database holding data in BOTH -- which a re-ingest after compaction
+        # or a hand-merged file produces -- served only the chunked part as if it
+        # were everything: measured 6 of 818 captures behind the picture, gap
+        # false, 23.7 dB out, with nothing anywhere saying so.
+        kind = None
+        if "psd_chunk" in t and _rows(connection, "psd_chunk"):
+            kind = "chunk"
+            if "psd" in t and _rows(connection, "psd"):
+                print(f"[serve] WARNING {os.path.basename(path)} holds data in "
+                      f"BOTH the psd_chunk and psd shapes. Serving psd_chunk; "
+                      f"the row table's captures are NOT drawn. Run "
+                      f"ingest/compact_db.py, which refuses this state and "
+                      f"explains it.")
+        elif "psd" in t and _rows(connection, "psd"):
+            kind = "rows"
         levels = []
         if "psd_lvl" in t:
             try:
@@ -1020,7 +1103,10 @@ MEM_BUCKET = 3600
 # set, against ~66 MB before.
 _MEM_PER_STAT = 2
 _MEM_MAX = _MEM_PER_STAT
-_memlvl = {}              # (stat, sensor) -> dict | 'queued' | 'building' | 'failed'
+_lvl_short = set()        # (stat, sensor) whose on-disk pyramid did not cover a
+                          # window we were asked for: build the in-RAM one anyway
+_memlvl = {}              # (stat, sensor) -> dict | 'queued' | 'building'
+                          #                 | ('failed', monotonic)
 _mem_queue = []           # (stat, sensor) waiting, in arrival order
 _mem_workers = 0          # live build threads; see _memlvl_worker
 _mem_lock = threading.Lock()
@@ -1094,7 +1180,7 @@ def _memlvl_build(sensor, stat="max"):
             time.sleep(min(0.25, (time.monotonic() - t_batch) * MEM_THROTTLE))
         if not buckets:
             with _mem_lock:
-                _memlvl[(stat, sensor)] = "failed"
+                _memlvl[(stat, sensor)] = _failed()
             return
         ks = np.array(sorted(buckets), np.int64)
         built = {"t": ks * MEM_BUCKET,
@@ -1110,7 +1196,7 @@ def _memlvl_build(sensor, stat="max"):
     except Exception as e:
         print(f"[serve] could not build the in-RAM PSD {stat} index for {sensor}: {e}")
         with _mem_lock:
-            _memlvl[(stat, sensor)] = "failed"
+            _memlvl[(stat, sensor)] = _failed()
             _memlvl_evict()
 
 
@@ -1134,6 +1220,28 @@ def _index_workers():
     return max(1, min(len(PSD_LAYER_STATS), (os.cpu_count() or 2) - 1))
 
 
+# A failed build used to be a permanent verdict. One transient cause -- the
+# database write-locked for a moment by an ingest, a momentary allocation failure
+# -- disabled the in-RAM index for that (stat, sensor) for the life of the
+# process, and with a single sensor and statistic the marker was never even
+# evicted (len 1 is under the cap). Correctness was never affected, but every
+# wide window silently went back to the slow path with nothing to say why. So the
+# marker expires and the work is retried.
+MEM_FAIL_COOLDOWN = 120.0
+
+
+def _failed():
+    return ("failed", time.monotonic())
+
+
+def _is_failed(v):
+    return isinstance(v, tuple) and v and v[0] == "failed"
+
+
+def _failed_expired(v):
+    return _is_failed(v) and (time.monotonic() - v[1]) > MEM_FAIL_COOLDOWN
+
+
 def _memlvl_evict(keep=None):
     """Trim _memlvl to _MEM_MAX. Call with _mem_lock held.
 
@@ -1147,6 +1255,9 @@ def _memlvl_evict(keep=None):
     say) filled the dict past its cap with 'failed' markers that nothing would
     ever clear.
     """
+    for k in [k for k, v in _memlvl.items()
+              if k != keep and _failed_expired(v)]:
+        _memlvl.pop(k, None)                  # cooled off: retriable again
     while len(_memlvl) > _MEM_MAX:
         victim = next((k for k, v in _memlvl.items()
                        if k != keep and v != "building"), None)
@@ -1190,7 +1301,7 @@ def _memlvl_worker():
             finally:
                 with _mem_lock:
                     if _memlvl.get(key) == "building":
-                        _memlvl[key] = "failed"     # died without a verdict
+                        _memlvl[key] = _failed()    # died without a verdict
                     _memlvl_evict()
     finally:
         # Under the lock, so a warm racing this either sees the lower count and
@@ -1210,11 +1321,15 @@ def memlvl_warm(sensor, stat="max", urgent=False):
     """
     global _mem_workers
     connection_s, kind_s, levels_s = psd_stat_info(stat)
-    if not sensor or connection_s is None or kind_s is None or levels_s:
-        return                        # on-disk levels present: nothing to do
+    if not sensor or connection_s is None or kind_s is None:
+        return
     key = (stat, sensor)
+    if levels_s and key not in _lvl_short:
+        return                        # on-disk levels present and sufficient
     start = 0
     with _mem_lock:
+        if _failed_expired(_memlvl.get(key)):
+            _memlvl.pop(key, None)            # the cooldown has passed; retry it
         if key in _memlvl:
             if urgent and _memlvl.get(key) == "queued" and _mem_queue and _mem_queue[0] != key:
                 _mem_queue.remove(key)          # already waiting: jump the queue
@@ -1242,10 +1357,17 @@ def memlvl_warm(sensor, stat="max", urgent=False):
         try:
             threading.Thread(target=_memlvl_worker, daemon=True,
                              name="psdlvl").start()
-        except RuntimeError as e:      # out of threads: degrade, never 500
+        except BaseException as e:     # out of threads or RAM: degrade, never 500
+            # BaseException, not RuntimeError. Under memory pressure
+            # Thread.start() raises MemoryError, which escaped -- the request
+            # became a 500 and, worse, _mem_workers stayed incremented forever.
+            # On a 2-core machine _index_workers() is 1, so start was then always
+            # 0 and no worker was ever launched again: entries sat "queued" in
+            # _memlvl for the life of the process and the whole in-RAM index
+            # subsystem was dead. Measured: 0 builds over 46 requests.
             with _mem_lock:
                 _mem_workers -= 1
-            print(f"[serve] could not start a PSD index worker: {e}")
+            print(f"[serve] could not start a PSD index worker: {e!r}")
 
 
 def memlvl_ready(sensor, t0, t1, stat="max"):
@@ -1382,6 +1504,15 @@ def _psd_window(c, sensor, t0, t1, cols, fi0, fi1,
     lvl = _pick_psd_level(t1 - t0, cols, ncap, levels)
     if lvl is not None and not _lvl_covers(c, sensor, lvl, t0, t1, stat):
         lvl = None                             # levels are behind the captures
+        # Remember it. memlvl_warm's only test was "does psd_lvl exist", so a
+        # PARTIAL pyramid -- one interrupted build, or an ingest since the last
+        # build_psd_levels run -- suppressed the in-RAM index while the on-disk
+        # one was refused for the window at hand. What answered instead was the
+        # strided capture path: measured 1.70 dB mean and 13.1 dB worst error with
+        # 89% of pixels under-read, against 0.22 dB and 0% when psd_lvl was
+        # absent entirely. A partial pyramid was worse than none.
+        with _mem_lock:
+            _lvl_short.add((stat, sensor))
     rows = None
     if lvl is not None:
         rows = c.execute("SELECT t, smax FROM psd_lvl WHERE sensor=? AND bucket=? "

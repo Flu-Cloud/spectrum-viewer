@@ -23,6 +23,24 @@ Two things worth being precise about:
     each derived exactly from the one below it, no re-reading. A mean or median
     layer could NOT be built this way.
 
+WHAT `--stat median` AND `--stat mean` ACTUALLY BUILD, because the name misleads:
+a level row is the MAX OVER THE BUCKET of the per-sweep medians (or means), not
+the median or mean over the bucket. Pooling is max for every statistic, here and
+in serve.py's own per-pixel pooling -- the stored per-capture values are the
+medians, and keeping the strongest capture visible is the display convention the
+capture path uses too. So it is consistent, not a bug, but it is not the
+statistic the button is labelled with, and the gap is large: measured on real
+exports at the 1-day bucket, the median layer reads +2.9 to +10.6 dB above the
+true day median typically, worst bin +21.9 dB, and it grows with bucket width
+(+1.6 dB at 10 min, +4.4 at 1 h, +7.8 at 6 h, +10.6 at 1 day for NIT median).
+
+Turning the pyramid off does not restore median semantics -- the capture path it
+falls back to is a max over a thinned subsample, measured at +8.5 dB on the same
+window, so the pyramid accounts for only ~2 dB of that. And where the server
+reads every capture (narrow windows) it refuses the level entirely, so the exact
+answer is never degraded. The number on screen is exact at PSD zoom; it is a
+max-of-medians when zoomed out.
+
 Additive and INCREMENTAL: each sensor records how far through time it has been
 summarised, so running this again after next month's ingest reads only the new
 captures instead of the whole sensor. Re-run it after every ingest -- serve.py

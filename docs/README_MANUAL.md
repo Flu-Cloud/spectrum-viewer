@@ -305,6 +305,17 @@ python ingest/build_psd_levels.py --stat mean
 `ingest/ingest_all.py <folder>` does all of that for every sensor and statistic
 it finds, in one pass, and is safe to re-run when new exports arrive.
 
+One thing to know about the median and mean layers when zoomed out. Every stored
+value is the export's own number, exact to within one quantization step, and that
+is what you see at PSD zoom. But a pixel wider than one capture is a **max** over
+the captures inside it, for all three statistics alike — so a zoomed-out "median"
+view shows the largest per-sweep median in each column, not the median over that
+span. Measured on real exports at a one-day-per-pixel width that reads roughly 3
+to 11 dB above the true span median, worst bin about 22 dB. It is a deliberate
+display convention (keeping the strongest capture visible rather than averaging
+it away, the same rule the max layer uses), and it is consistent whether or not
+`build_psd_levels.py` has been run. Zoom in and the numbers are exact.
+
 ```bash
 python ingest/fetch.py mds2-3177 --list
 python ingest/fetch.py mds2-3177 --filter 1.4MHz/config_0 --dest iqdata/mds2-3177

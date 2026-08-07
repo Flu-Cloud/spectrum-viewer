@@ -14,6 +14,11 @@ What each one covers:
     test_fetch.py   downloading: source parsing, host policy, resume,
                     checksums, and the HTTP 403 that bot protection causes
     test_ingest.py  the CBRS path end to end, compacted and uncompacted
+    test_durability.py  the ways an interrupted or damaged run used to lose
+                    data silently: partial days, orphaned WALs, stale build
+                    files, blank cells, non-UTC stamps
+    test_verify_1to1.py  damages a real database twenty ways and requires the
+                    1:1 CSV verifier to catch every one
     test_repeat.py  re-running the ingest months later: additive, idempotent,
                     and safe on an already-compacted database
     test_ingest_all.py  the one-command ingest over an unfamiliar folder, and
@@ -42,6 +47,8 @@ SUITES = [
     ("test_fetch.py", "downloading, including the 403 path"),
     ("test_ingest.py", "the CBRS ingest path"),
     ("test_repeat.py", "re-running the ingest as new data arrives"),
+    ("test_durability.py", "interrupted runs, full disks and damaged files"),
+    ("test_verify_1to1.py", "the 1:1 verifier can actually fail"),
     ("test_ingest_all.py", "one command over any folder, and re-running it"),
     ("test_atlas.py", "atlas.py get, on data and on records"),
     ("test_cli.py", "every command, flag and menu choice"),

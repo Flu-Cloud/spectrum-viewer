@@ -31,7 +31,10 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 # Where the .duckdb files live; override to compact a copy elsewhere.
-DB_DIR = os.environ.get("ATLAS_DB_DIR") or ROOT
+# abspath, matching serve.py: a RELATIVE ATLAS_DB_DIR resolves against each
+# step's cwd, so the ingest wrote ./mydb/psd.duckdb and this script looked in a
+# different ./mydb, said "not found -- build it first", and exited 0.
+DB_DIR = os.path.abspath(os.environ.get("ATLAS_DB_DIR") or ROOT)
 Z = 9                # zlib level -- decompression cost is the same at every
                      # level, so max level is a free size win. Measured on live
                      # PFP chunks: 2.6% smaller than z6, identical read speed.
@@ -46,6 +49,34 @@ except Exception:
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _finish(dst):
+    """Flush a build file to its own .duckdb and close it.
+
+    DuckDB writes into a WAL and checkpoints on close -- but a close that CANNOT
+    checkpoint (no space left) does not raise, so the function above reported the
+    build "complete" while its rows were still only in <name>_c.duckdb.wal. The
+    row-count guard was then fooled too, because opening the build file
+    read-only replays that same WAL and counts them. swap_in renamed the .duckdb
+    and orphaned the .wal, and the live database ended up with ZERO tables --
+    exit code 0, "DONE ALL". An explicit CHECKPOINT turns that into an exception
+    here, where it can be reported and nothing has been swapped yet.
+    """
+    dst.execute("CHECKPOINT")
+    dst.close()
+
+
+def _q(path):
+    """A path safe to interpolate into DuckDB SQL.
+
+    ATTACH takes the file as a string literal, and the path was interpolated
+    raw -- so a single quote anywhere in it (`~/Sean's data`, `/Users/o'brien`)
+    aborted compaction with a ParserException after the ingest had already
+    written correct data, leaving a permanently uncompacted database and an
+    unactionable traceback.
+    """
+    return path.replace("'", "''")
 
 
 def _prep(dst, ddl):
@@ -85,10 +116,9 @@ def compact_spectrum():
     _drop_stale_build("spectrum", scaled=True)
     dst = duckdb.connect(os.path.join(DB_DIR, "spectrum_c.duckdb"))
     dst.execute("CREATE TABLE IF NOT EXISTS done (k VARCHAR)")
-    dst.execute(f"ATTACH '{src_p}' AS s (READ_ONLY)")
-    if not _skip(dst, "meta"):
-        dst.execute("CREATE TABLE meta AS SELECT * FROM s.meta")
-        dst.execute("INSERT INTO done VALUES ('meta')")
+    dst.execute(f"ATTACH '{_q(src_p)}' AS s (READ_ONLY)")
+    dst.execute("DROP TABLE IF EXISTS meta")
+    dst.execute("CREATE TABLE meta AS SELECT * FROM s.meta")
     for t in ("lvl_d1", "lvl_h6", "lvl_h1", "lvl_m10", "raw"):
         if _skip(dst, t):
             continue
@@ -104,7 +134,7 @@ def compact_spectrum():
             FROM s.{t} ORDER BY sensor, t""")
         dst.execute("INSERT INTO done VALUES (?)", [t])
         log(f"  spectrum.{t} in {time.time()-t0:.0f}s")
-    dst.close()
+    _finish(dst)
     log("spectrum_c.duckdb complete")
     return True
 
@@ -132,6 +162,64 @@ def _spectrum_is_scaled(path):
         c.close()
 
 
+def _src_stamp(path, rows_table):
+    """A fingerprint of the source database this build file was started from.
+
+    Just enough to notice the source has changed: how many rows the source table
+    held and its newest timestamp. Cheap, and both move whenever a month is
+    added.
+    """
+    try:
+        c = duckdb.connect(path, read_only=True)
+    except Exception:                                      # noqa: BLE001
+        return None
+    try:
+        if rows_table not in _tables(c):
+            return None
+        r = c.execute(f"SELECT count(*), max(t) FROM {rows_table}").fetchone()
+        return f"src:{rows_table}:{r[0]}:{r[1]}"
+    except Exception:                                      # noqa: BLE001
+        return None
+    finally:
+        c.close()
+
+
+def _stamp_build(dst, stamp):
+    if stamp and not _skip(dst, stamp):
+        dst.execute("DELETE FROM done WHERE k LIKE 'src:%'")
+        dst.execute("INSERT INTO done VALUES (?)", [stamp])
+
+
+def _stamp_mismatch(built, stamp):
+    """True when this build file was started from a DIFFERENT source than now.
+
+    `_live_moved_on` only recognises "the live database is already chunked". It
+    cannot see the case that actually happens: compaction is interrupted, the
+    normal monthly ingest then ADDS a day to the still-row-shaped live database,
+    and the old build file's `done` table makes the next compaction skip every
+    sensor it already has, call itself complete, and swap the new days away.
+    Measured: 21,904 captures down to 20,348, exit code 0.
+    """
+    if stamp is None:
+        return False
+    try:
+        c = duckdb.connect(built, read_only=True)
+    except Exception:                                      # noqa: BLE001
+        return False
+    try:
+        if "done" not in _tables(c):
+            return False
+        rows = [r[0] for r in c.execute(
+            "SELECT k FROM done WHERE k LIKE 'src:%'").fetchall()]
+        if not rows:
+            return True        # from before stamping; cannot be trusted to match
+        return rows[0] != stamp
+    except Exception:                                      # noqa: BLE001
+        return False
+    finally:
+        c.close()
+
+
 def _drop_stale_build(name, scaled=False, rows_table=None):
     """Remove a leftover <name>_c.duckdb that the live database has moved past.
 
@@ -145,13 +233,17 @@ def _drop_stale_build(name, scaled=False, rows_table=None):
 
     A build file is left alone only when it could still be a legitimate resume.
     """
-    built = os.path.join(DB_DIR, f"{name}_c.duckdb")
+    built = _built_path(name)
     if not os.path.exists(built):
         return
-    live = os.path.join(DB_DIR, f"{name}.duckdb")
+    live = _live_path(name)
     if not os.path.exists(live):
         return
-    stale = _spectrum_is_scaled(live) if scaled else _live_moved_on(live, rows_table)
+    if scaled:
+        stale = _spectrum_is_scaled(live)
+    else:
+        stale = (_live_moved_on(live, rows_table)
+                 or _stamp_mismatch(built, _src_stamp(live, rows_table)))
     if stale:
         try:
             os.remove(built)
@@ -255,7 +347,7 @@ def _copy_meta(dst, src_path, table, rows_table=None):
     meta row is dropped rather than blessed and carried into the compacted
     file.
     """
-    dst.execute(f"ATTACH '{src_path}' AS msrc (READ_ONLY)")
+    dst.execute(f"ATTACH '{_q(src_path)}' AS msrc (READ_ONLY)")
     dst.execute(f"DROP TABLE IF EXISTS {table}")
     dst.execute(f"CREATE TABLE {table} AS SELECT * FROM msrc.{table}")
     if rows_table:
@@ -271,7 +363,42 @@ def _copy_meta(dst, src_path, table, rows_table=None):
             log(f"  re-run the matching ingest for those sensors if that is "
                 f"not what you expected.")
     dst.execute("DETACH msrc")
-    dst.execute("INSERT INTO done VALUES ('meta')")
+    # Deliberately NOT recorded in `done`. Marking it made a resumed compaction
+    # skip the copy, so a build file started last month carried last month's
+    # psd_meta forward over this month's data -- stale t_max, stale capture
+    # counts, for every sensor at once. Copying a metadata table is cheap; the
+    # only thing the `done` marker bought was that staleness.
+
+
+def _live_path(name):
+    """The live database for one layer, honouring PSD_DB for the psd family."""
+    if name.startswith("psd"):
+        return _psd_path(name)
+    return os.path.join(DB_DIR, f"{name}.duckdb")
+
+
+def _built_path(name):
+    """The build file, always beside the live database it was made from."""
+    return os.path.join(os.path.dirname(_live_path(name)) or DB_DIR,
+                        f"{name}_c.duckdb")
+
+
+def _psd_path(name):
+    """Where this statistic's database lives.
+
+    psd_ingest.py and build_psd_levels.py both honour PSD_DB; this script only
+    looked at ATLAS_DB_DIR, so with PSD_DB set the ingest wrote 60 captures to
+    the custom path, the levels were built there, and compaction printed
+    "psd.duckdb not found ... build it first" and exited 0 -- advising the user
+    to do the thing they had just done.
+    """
+    override = os.environ.get("PSD_DB")
+    if override and name == "psd":
+        return os.path.abspath(override)
+    if override:
+        base = os.path.dirname(os.path.abspath(override)) or DB_DIR
+        return os.path.join(base, f"{name}.duckdb")
+    return os.path.join(DB_DIR, f"{name}.duckdb")
 
 
 def compact_psd(name="psd"):
@@ -281,7 +408,7 @@ def compact_psd(name="psd"):
     `psd_median` / `psd_mean` for the sibling databases psd_ingest.py --stat
     writes. Same schema inside, so one implementation compacts them all.
     """
-    src_p = os.path.join(DB_DIR, f"{name}.duckdb")
+    src_p = _psd_path(name)
     if _missing(src_p):
         return False
     src = duckdb.connect(src_p, read_only=True)
@@ -294,11 +421,11 @@ def compact_psd(name="psd"):
     src.close()
     _drop_stale_build(name, rows_table="psd")
     src = duckdb.connect(src_p, read_only=True)
-    dst = duckdb.connect(os.path.join(DB_DIR, f"{name}_c.duckdb"))
+    dst = duckdb.connect(_built_path(name))
     _prep(dst, """CREATE TABLE IF NOT EXISTS psd_chunk (
         sensor VARCHAR, t0 DOUBLE, t1 DOUBLE, n INT, times BLOB, specs BLOB)""")
-    if not _skip(dst, "meta"):
-        _copy_meta(dst, src_p, "psd_meta", "psd")
+    _stamp_build(dst, _src_stamp(src_p, "psd"))
+    _copy_meta(dst, src_p, "psd_meta", "psd")
     sensors = [r[0] for r in src.execute("SELECT DISTINCT sensor FROM psd ORDER BY 1").fetchall()]
     bad = []
     for s in sensors:
@@ -339,12 +466,12 @@ def compact_psd(name="psd"):
     for t in ("psd_lvl", "psd_lvl_done"):
         if t in _tables(src):
             dst.execute(f"DROP TABLE IF EXISTS {t}")
-            dst.execute(f"ATTACH '{src_p}' AS lsrc (READ_ONLY)")
+            dst.execute(f"ATTACH '{_q(src_p)}' AS lsrc (READ_ONLY)")
             dst.execute(f"CREATE TABLE {t} AS SELECT * FROM lsrc.{t}")
             dst.execute("DETACH lsrc")
             n = dst.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
             log(f"  {name} {t}: carried {n:,} row(s) across")
-    src.close(); dst.close()
+    src.close(); _finish(dst)
     if bad:
         log(f"{name}_c.duckdb INCOMPLETE for {', '.join(bad)}; not swapping it in")
         return False
@@ -370,8 +497,8 @@ def compact_pfp():
     dst = duckdb.connect(os.path.join(DB_DIR, "pfp_c.duckdb"))
     _prep(dst, """CREATE TABLE IF NOT EXISTS pfp_chunk (
         sensor VARCHAR, freq DOUBLE, t0 DOUBLE, t1 DOUBLE, n INT, times BLOB, frames BLOB)""")
-    if not _skip(dst, "meta"):
-        _copy_meta(dst, src_p, "pfp_meta", "pfp")
+    _stamp_build(dst, _src_stamp(src_p, "pfp"))
+    _copy_meta(dst, src_p, "pfp_meta", "pfp")
     sensors = [r[0] for r in src.execute("SELECT DISTINCT sensor FROM pfp ORDER BY 1").fetchall()]
     bad = []
     for s in sensors:
@@ -412,7 +539,7 @@ def compact_pfp():
             continue
         dst.execute("INSERT INTO done VALUES (?)", [s])
         log(f"  pfp {s}: {total} frames in {time.time()-t0:.0f}s")
-    src.close(); dst.close()
+    src.close(); _finish(dst)
     if bad:
         log(f"pfp_c.duckdb INCOMPLETE for {', '.join(bad)}; not swapping it in")
         return False
@@ -462,10 +589,36 @@ def swap_in(name):
     the original under a different name is how a run ends up "finished" while
     the server still reads the old file.
     """
-    built = os.path.join(DB_DIR, f"{name}_c.duckdb")
-    live = os.path.join(DB_DIR, f"{name}.duckdb")
+    built = _built_path(name)
+    live = _live_path(name)
     if not os.path.exists(built):
         return False
+    # A .wal beside the build file means its contents are NOT all in the .duckdb
+    # yet. Renaming just the .duckdb strands them: measured on a nearly-full
+    # volume, the live database ended up with zero tables while 2,349 captures
+    # sat in an orphaned psd_c.duckdb.wal -- and the run said "DONE ALL", exit 0.
+    # _finish's CHECKPOINT should make this unreachable; this is the backstop,
+    # and the file's mere presence is an exact discriminator.
+    if os.path.exists(built + ".wal"):
+        log(f"  REFUSING to swap {name}_c.duckdb in: {name}_c.duckdb.wal still "
+            f"exists, so part of the compacted data is not in the file yet.")
+        log(f"    Nothing has been changed. Re-run compact_db.py once there is "
+            f"free disk space; the build file resumes where it stopped.")
+        return False
+    # The live database's own .wal has to travel WITH it. Left behind, it either
+    # replays into the NEW file and fails ('Table "psd_meta" already exists',
+    # database unopenable) or it is discarded and the .bak is a stub holding none
+    # of the data it is supposed to be a backup of.
+    live_wal = live + ".wal"
+    if os.path.exists(live_wal):
+        try:
+            duckdb.connect(live).close()          # checkpoint it away
+        except Exception as e:                                 # noqa: BLE001
+            log(f"  REFUSING to swap {name}_c.duckdb in: {name}.duckdb has an "
+                f"un-checkpointed .wal that could not be flushed ({e}).")
+            log("    Nothing has been changed. Stop any other process holding "
+                "the database and re-run.")
+            return False
     # Never trade data for no data. The per-sensor row-count checks above verify
     # what was copied, but they say nothing when NOTHING was copied: a build file
     # with zero rows is "complete" by that standard, and swapping it in silently
@@ -483,6 +636,8 @@ def swap_in(name):
             if os.path.exists(bak):
                 os.remove(bak)
             os.replace(live, bak)
+            if os.path.exists(live_wal):       # checkpoint above did not remove it
+                os.replace(live_wal, bak + ".wal")
         os.replace(built, live)
     except OSError as e:
         log(f"  could not swap {name}_c.duckdb -> {name}.duckdb: {e}")
@@ -502,19 +657,33 @@ if __name__ == "__main__":
                          "moving them into place")
     args = ap.parse_args()
 
-    log("compacting spectrum.duckdb ...")
-    ok = {"spectrum": compact_spectrum()}
-    log("compacting psd.duckdb ...")
-    ok["psd"] = compact_psd()
+    def attempt(label, fn, *a):
+        """Run one layer's compaction; a failure must not take the others down.
+
+        An ENOSPC or a lock error inside compact_psd used to propagate out of
+        __main__, so the run died before psd_median, psd_mean and pfp were even
+        looked at -- the same collateral damage _already_compact was written to
+        stop for CatalogException. Nothing has been swapped at this point, so a
+        failed layer simply stays uncompacted.
+        """
+        log(f"compacting {label} ...")
+        try:
+            return fn(*a)
+        except Exception as e:                             # noqa: BLE001
+            log(f"  {label} FAILED: {e}")
+            log(f"    {label} was left exactly as it was; the other layers "
+                f"still run. Re-run to retry it.")
+            return False
+
+    ok = {"spectrum": attempt("spectrum.duckdb", compact_spectrum)}
+    ok["psd"] = attempt("psd.duckdb", compact_psd)
     for extra in ("psd_median", "psd_mean"):
-        if os.path.exists(os.path.join(DB_DIR, f"{extra}.duckdb")):
-            log(f"compacting {extra}.duckdb ...")
-            ok[extra] = compact_psd(extra)
-    log("compacting pfp.duckdb (the big one) ...")
-    ok["pfp"] = compact_pfp()
-    for f in ("spectrum_c.duckdb", "psd_c.duckdb", "psd_median_c.duckdb",
-              "psd_mean_c.duckdb", "pfp_c.duckdb"):
-        p = os.path.join(DB_DIR, f)    # where this run actually wrote them
+        if os.path.exists(_live_path(extra)):
+            ok[extra] = attempt(f"{extra}.duckdb", compact_psd, extra)
+    ok["pfp"] = attempt("pfp.duckdb (the big one)", compact_pfp)
+    for n in ("spectrum", "psd", "psd_median", "psd_mean", "pfp"):
+        p = _built_path(n)             # where this run actually wrote them
+        f = os.path.basename(p)
         if os.path.exists(p):
             log(f"  {f}: {os.path.getsize(p)/1e9:.2f} GB")
     if args.no_swap:

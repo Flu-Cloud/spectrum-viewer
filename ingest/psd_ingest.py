@@ -45,7 +45,11 @@ ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 # --root; defaults to ./SEA-DATA in the repo so a fresh clone never points at
 # someone else's disk.
 DATA_ROOT = os.environ.get("SEA_DATA_ROOT", os.path.join(ROOT, "SEA-DATA"))
-DB_DIR = os.environ.get("ATLAS_DB_DIR") or ROOT
+# abspath, as serve.py already does: a RELATIVE ATLAS_DB_DIR resolves against
+# whatever directory each step happens to be run from, so the ingest wrote
+# ./mydb/psd.duckdb and compact_db.py looked for it under a different cwd,
+# reported "not found -- build it first", and exited 0. Same variable, two files.
+DB_DIR = os.path.abspath(os.environ.get("ATLAS_DB_DIR") or ROOT)
 PSD_DB = os.environ.get("PSD_DB") or os.path.join(DB_DIR, "psd.duckdb")
 
 F0 = 3530040000.0    # first PSD bin (Hz)
@@ -65,8 +69,8 @@ except Exception:
     pass
 
 
-def discover(root, stat=None):
-    return cbrs_files.discover(root, NAME_RE, stat)
+def discover(root, stat=None, collisions=None):
+    return cbrs_files.discover(root, NAME_RE, stat, collisions)
 
 
 def stats_present(root):
@@ -78,6 +82,20 @@ def read_specs(path, csv_connection):
     ts, _keys, Q = cbrs_files.read_quantized(
         path, csv_connection, NF, QMIN, QMAX, "dBm/Hz", "spectrum")
     return ts, Q
+
+
+def open_db(path):
+    return cbrs_files.open_db(path, duckdb)
+
+
+def _rollback(connection, app):
+    """Undo the day in progress: the transaction AND the appender's buffer."""
+    if app is not None:
+        app.reset()
+    try:
+        connection.execute("ROLLBACK")
+    except Exception:                                      # noqa: BLE001
+        pass                       # no transaction open; nothing to undo
 
 
 def main():
@@ -99,7 +117,9 @@ def main():
     if not os.path.isdir(root):
         sys.exit(cbrs_files.missing_root(root))
 
-    found = discover(root, args.stat)
+    collisions = {}
+    found = discover(root, args.stat, collisions)
+    cbrs_files.report_collisions(collisions, "sensor-day")
     if not found:
         sys.exit(cbrs_files.no_data(root, args.stat, NAME_RE,
                                     PATTERN, "PSD"))
@@ -134,7 +154,7 @@ def main():
     days = sorted(by_day)
     print(f"{sensor}: {len(days)} day(s) on disk (compact int8 BLOB)")
 
-    connection = duckdb.connect(PSD_DB)
+    connection = open_db(PSD_DB)
     connection.execute("CREATE TABLE IF NOT EXISTS psd (sensor VARCHAR, t DOUBLE, spec BLOB)")
     connection.execute("""CREATE TABLE IF NOT EXISTS psd_meta (
         sensor VARCHAR, f0 DOUBLE, df DOUBLE, nf INT, qmin DOUBLE, qmax DOUBLE,
@@ -162,17 +182,12 @@ def main():
     # Falls back to the day test for a file whose stamp will not parse, which
     # keeps the old behaviour rather than risking duplicate rows (the append has
     # no per-day delete).
-    stored_ms = {int(round(t * 1000)) for t in
-                 chunk_io.stored_times(connection, "psd", sensor, kind)}
-    existing = chunk_io.existing_days(connection, "psd", sensor, kind)
-    todo = []
-    for d in days:
-        first = cbrs_files.first_capture_time(by_day[d])
-        if first is None:
-            if d not in existing:
-                todo.append(d)
-        elif not chunk_io.already_have(stored_ms, first):
-            todo.append(d)
+    times = chunk_io.stored_times(connection, "psd", sensor, kind)
+    stored_ms = {int(round(t * 1000)) for t in times}
+    per_day = chunk_io.captures_per_day(times)
+    todo = [d for d in days
+            if not chunk_io.day_is_ingested(d, per_day, stored_ms,
+                                            lambda: cbrs_files.first_capture_time(by_day[d]))]
     # Count the days this run is actually skipping, not every day the sensor
     # has in the DB: `existing` spans the whole table, including days that are
     # not under this --root at all. Reporting len(existing) is how "1 day on
@@ -192,18 +207,50 @@ def main():
     errors = []
     app = (chunk_io.ChunkAppender(connection, "psd", sensor, "specs")
            if kind == "chunk" else None)
+    # A day is written inside ONE transaction, and that is load-bearing rather
+    # than tidiness. DuckDB autocommits per parameter set, so an interrupted
+    # executemany left an arbitrary PREFIX of the day committed -- and the resume
+    # check then sees hundreds of captures on that UTC day and calls it done, so
+    # the rest is skipped forever. Measured: a SIGKILL, a Ctrl+C, or a full disk
+    # partway through turned 2,349 captures into 1,637 and the NEXT run reported
+    # "3 of 3 day(s) already ingested", exit code 0. Both resume tests ask "was
+    # this file started", never "was it finished"; wrapping the day makes those
+    # the same question, because a day that did not finish contributes nothing.
+    interrupts = tuple(x for x in (KeyboardInterrupt,
+                                   getattr(duckdb, "InterruptException", None))
+                       if x is not None)
     for i, day in enumerate(todo, 1):
         path = by_day[day]
         try:
+            connection.execute("BEGIN TRANSACTION")
             ts, Q = read_specs(path, csv_connection)
+            if not len(ts):
+                # A header-only export used to count as a day done (err=0,
+                # exit 0) whenever the database was already compacted, so the
+                # real file for that day could never be picked up again.
+                raise ValueError("the file has a header but no data rows")
             if app is not None:
                 app.add(ts, [Q[j] for j in range(len(ts))])
+                app.flush()          # inside this day's transaction
             else:
                 connection.executemany(
                     "INSERT INTO psd VALUES (?,?,?)",
                     [(sensor, float(ts[j]), Q[j].tobytes()) for j in range(len(ts))])
+            connection.execute("COMMIT")
             done += 1; caps += len(ts)
+        except interrupts:
+            # DuckDB turns Ctrl+C into InterruptException, which is an Exception,
+            # so the handler below used to swallow it and carry on to the next
+            # day -- Ctrl+C did not stop the run, and landing inside a chunk
+            # flush instead committed a partial day.
+            _rollback(connection, app)
+            print(f"\ninterrupted during {os.path.basename(path)}; that day was "
+                  f"rolled back. Re-run to continue where this left off.",
+                  file=sys.stderr)
+            connection.close()
+            return 130
         except Exception as e:
+            _rollback(connection, app)
             err += 1
             errors.append(f"{os.path.basename(path)}: {e}")
             print(f"  ERR {os.path.basename(path)}: {e}")
@@ -211,8 +258,6 @@ def main():
             rate = i / max(time.time() - t0, 1e-6)
             print(f"  [{i}/{len(todo)}] caps={caps:,} done={done} err={err} "
                   f"{rate:.1f} days/s")
-    if app is not None:
-        app.flush()
 
     rng = chunk_io.stored_span(connection, "psd", sensor,
                                chunk_io.schema_of(connection, "psd"))

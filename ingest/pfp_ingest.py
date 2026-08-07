@@ -45,7 +45,10 @@ ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 # --root; defaults to ./SEA-DATA in the repo so a fresh clone never points at
 # someone else's disk.
 DATA_ROOT = os.environ.get("SEA_DATA_ROOT", os.path.join(ROOT, "SEA-DATA"))
-DB_DIR = os.environ.get("ATLAS_DB_DIR") or ROOT
+# abspath for the same reason serve.py does it: a relative ATLAS_DB_DIR resolves
+# against each step's cwd, so the ingest and compact_db.py silently worked on
+# two different files.
+DB_DIR = os.path.abspath(os.environ.get("ATLAS_DB_DIR") or ROOT)
 PFP_DB = os.environ.get("PFP_DB") or os.path.join(DB_DIR, "pfp.duckdb")
 
 NPOS = 560
@@ -64,8 +67,18 @@ except Exception:
     pass
 
 
-def discover(root, stat=None):
-    return cbrs_files.discover(root, NAME_RE, stat)
+def discover(root, stat=None, collisions=None):
+    return cbrs_files.discover(root, NAME_RE, stat, collisions)
+
+
+def _rollback(connection, apps):
+    """Undo the day in progress: the transaction AND every appender buffer."""
+    for app in apps.values():
+        app.reset()
+    try:
+        connection.execute("ROLLBACK")
+    except Exception:                                      # noqa: BLE001
+        pass
 
 
 def stats_present(root):
@@ -99,7 +112,9 @@ def main():
     if not os.path.isdir(root):
         sys.exit(cbrs_files.missing_root(root))
 
-    found = discover(root, args.stat)
+    collisions = {}
+    found = discover(root, args.stat, collisions)
+    cbrs_files.report_collisions(collisions, "sensor-day")
     if not found:
         sys.exit(cbrs_files.no_data(root, args.stat, NAME_RE,
                                     PATTERN, "PFP"))
@@ -123,7 +138,7 @@ def main():
     days = sorted(by_day)
     print(f"{sensor} PFP ({args.stat}): {len(days)} day(s) on disk")
 
-    connection = duckdb.connect(PFP_DB)
+    connection = cbrs_files.open_db(PFP_DB, duckdb)
     connection.execute("CREATE TABLE IF NOT EXISTS pfp (sensor VARCHAR, freq DOUBLE, t DOUBLE, frame BLOB)")
     connection.execute("""CREATE TABLE IF NOT EXISTS pfp_meta (
         sensor VARCHAR, stat VARCHAR, npos INT, frame_ms DOUBLE, qmin DOUBLE, qmax DOUBLE,
@@ -146,14 +161,13 @@ def main():
     # marked day D+1 complete as soon as day D was read and then skipped D+1
     # whole. Falls back to the day test when a stamp will not parse, since the
     # append has no per-day delete and a wrong "not ingested" duplicates rows.
-    stored_ms = {int(round(t * 1000)) for t in
-                 chunk_io.stored_times(connection, "pfp", sensor, kind)}
-    existing = chunk_io.existing_days(connection, "pfp", sensor, kind)
+    times = chunk_io.stored_times(connection, "pfp", sensor, kind)
+    stored_ms = {int(round(t * 1000)) for t in times}
+    per_day = chunk_io.captures_per_day(times)
 
     def have(d):
-        first = cbrs_files.first_capture_time(by_day[d])
-        return (d in existing) if first is None else \
-            chunk_io.already_have(stored_ms, first)
+        return chunk_io.day_is_ingested(
+            d, per_day, stored_ms, lambda: cbrs_files.first_capture_time(by_day[d]))
 
     skipping = sum(1 for d in days if have(d))
     if skipping:
@@ -168,13 +182,26 @@ def main():
     # frequency and kept open across days -- a day holds only a handful of frames
     # per channel, and closing per day would leave a chunk table of stubs.
     apps = {}
+    # One transaction per day, and the appenders are flushed inside it. DuckDB
+    # autocommits per parameter set, so an interrupted day used to leave an
+    # arbitrary prefix committed -- and `have()` then counts those frames, calls
+    # the day done, and skips the rest forever. Flushing per day costs slightly
+    # shorter chunks (compact_db.py repacks them) and buys atomicity: a day that
+    # did not finish contributes nothing, so "was it started" and "was it
+    # finished" become the same question.
+    interrupts = tuple(x for x in (KeyboardInterrupt,
+                                   getattr(duckdb, "InterruptException", None))
+                       if x is not None)
     for i, day in enumerate(days, 1):
         if have(day):
             done += 1
             continue
         path = by_day[day]
         try:
+            connection.execute("BEGIN TRANSACTION")
             ts, freq, Q = read_frames(path, csv_connection)
+            if not len(ts):
+                raise ValueError("the file has a header but no data rows")
             if kind == "chunk":
                 for f in np.unique(np.asarray(freq, dtype=np.float64)):
                     sel = np.flatnonzero(np.asarray(freq, dtype=np.float64) == f)
@@ -188,16 +215,25 @@ def main():
                     "INSERT INTO pfp VALUES (?,?,?,?)",
                     [(sensor, float(freq[j]), float(ts[j]), Q[j].tobytes())
                      for j in range(len(ts))])
+            for app in apps.values():
+                app.flush()          # inside this day's transaction
+            connection.execute("COMMIT")
             done += 1; nrows += len(ts)
+        except interrupts:
+            _rollback(connection, apps)
+            print(f"\ninterrupted during {os.path.basename(path)}; that day was "
+                  f"rolled back. Re-run to continue where this left off.",
+                  file=sys.stderr)
+            connection.close()
+            return 130
         except Exception as e:
+            _rollback(connection, apps)
             err += 1
             errors.append(f"{os.path.basename(path)}: {e}")
             print(f"  ERR {os.path.basename(path)}: {e}")
         if i % 10 == 0 or i == len(days):
             print(f"  [{i}/{len(days)}] rows={nrows:,} done={done} err={err} "
                   f"{i/max(time.time()-t0,1e-6):.2f} days/s")
-    for app in apps.values():
-        app.flush()
 
     r = chunk_io.stored_span(connection, "pfp", sensor, chunk_io.schema_of(connection, "pfp"))
     total = r[2] or 0

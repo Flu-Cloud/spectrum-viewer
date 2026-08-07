@@ -26,12 +26,14 @@ import _require  # noqa: F401  -- deps message instead of a traceback
 import duckdb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import cbrs_files                                    # noqa: E402
+import atlas                                         # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # repo root (scripts live in ingest/)
 CSV_DIR = os.path.join(HERE, "csv")
-DB_DIR = os.environ.get("ATLAS_DB_DIR") or ROOT
+DB_DIR = os.path.abspath(os.environ.get("ATLAS_DB_DIR") or ROOT)
 DB_PATH = os.environ.get("SPECTRUM_DB") or os.path.join(DB_DIR, "spectrum.duckdb")
 
 # Summaries CSVs carry these columns; anything else in the folder is skipped
@@ -50,7 +52,36 @@ LEVELS = [
 
 
 def find_csvs(csv_dir):
-    return cbrs_files.walk_ext(csv_dir, (".csv",))
+    """Every CSV under csv_dir that is actually a Summaries export.
+
+    The filter is the point, and it is a NAME filter first. This used to return
+    every .csv underneath and hand each one to DuckDB's read_csv_auto to discover
+    its columns, skipping the ones that turned out to be PSD or PFP exports. That
+    is fine on a folder of summaries and catastrophic on a whole dataset root: on
+    a network or on-demand filesystem -- Box Drive, OneDrive, a mounted share --
+    opening a file is a DOWNLOAD, and the real CBRS tree holds ~44,600 PSD and
+    PFP exports against 24 summaries files. Worse, they sort first, so every one
+    of them was downloaded before the first usable file was reached. Measured:
+    over an hour with zero bytes written and a 12 KB database, indistinguishable
+    from a hang.
+
+    atlas.kind_of decides PSD and PFP by filename and only reads a header for a
+    CSV whose name matches neither -- so the ~44,600 cost nothing and just the
+    two dozen candidates are opened. It is also the same classification
+    ingest_all.py uses, so the two agree about what a summaries file is.
+    """
+    paths = cbrs_files.walk_ext(csv_dir, (".csv",))
+    keep, other = [], []
+    for p in paths:
+        if atlas.kind_of(os.path.dirname(p), os.path.basename(p)) == "summaries":
+            keep.append(p)
+        else:
+            other.append(p)
+    if other:
+        print(f"  {len(other):,} CSV file(s) under {os.path.abspath(csv_dir)} are "
+              f"not Summaries exports (PSD and PFP exports have their own "
+              f"scripts); {len(keep)} to read.", flush=True)
+    return keep, other
 
 
 def no_data(csv_dir):
@@ -78,23 +109,36 @@ def main():
                     help=f"directory of Summaries CSVs (default {CSV_DIR})")
     args = ap.parse_args()
 
-    files = find_csvs(args.csv_dir)
+    files, other = find_csvs(args.csv_dir)
     if not files:
+        if other:
+            print(f"None of the {len(other):,} CSV file(s) under "
+                  f"{os.path.abspath(args.csv_dir)} are Summaries exports.\n"
+                  f"  A Summaries CSV has the columns: {', '.join(NEEDED)}.\n"
+                  "  PSD and PFP exports belong to psd_ingest.py / pfp_ingest.py "
+                  "instead.", file=sys.stderr)
+            return 1
         return no_data(args.csv_dir)
 
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
-    # A WAL left behind by a previous run that crashed or was killed mid-build
-    # survives the os.remove above (it's a separate file) and DuckDB replays it
-    # automatically on connect -- against the brand-new, empty database this
-    # run just created. That replay re-issues the old run's CREATE TABLE raw
-    # and collides with the one below ("Table with name \"raw\" already
-    # exists!"), leaving spectrum.duckdb unreadable. Deleting the stale WAL
-    # alongside the database file is what actually starts clean.
-    wal_path = DB_PATH + ".wal"
-    if os.path.exists(wal_path):
-        os.remove(wal_path)
-    connection = duckdb.connect(DB_PATH)
+    # Build to a NEW file and swap it in at the end, rather than deleting the
+    # live one first. Deleting first means the working summary layer is gone from
+    # the moment this starts: on the real dataset the rebuild reads ~9 GB of
+    # monthly CSVs off a network drive, and for that whole window -- and forever,
+    # if the run is interrupted -- the viewer has no zoomed-out layer and a 12 KB
+    # stub where a 0.5 GB database was. Nothing about this step needs the old
+    # file gone; it only needed somewhere to write. compact_db.py has always
+    # worked this way.
+    build_path = DB_PATH + ".build"
+    for stale in (build_path, build_path + ".wal"):
+        if os.path.exists(stale):
+            os.remove(stale)
+    # A WAL left behind by a previous run that crashed or was killed mid-build is
+    # a separate file, and DuckDB replays it automatically on connect -- against
+    # the brand-new, empty database this run just created. That replay re-issues
+    # the old run's CREATE TABLE raw and collides with the one below ("Table with
+    # name \"raw\" already exists!"), leaving the file unreadable. Starting from a
+    # path with neither is what actually starts clean.
+    connection = duckdb.connect(build_path)
     # Be polite with RAM on a laptop; DuckDB will spill to disk if needed.
     connection.execute("PRAGMA memory_limit='3GB'")
     connection.execute("PRAGMA threads=4")
@@ -141,7 +185,9 @@ def main():
 
     if used == 0:
         connection.close()
-        os.remove(DB_PATH)
+        os.remove(build_path)
+        if os.path.exists(build_path + ".wal"):
+            os.remove(build_path + ".wal")
         print(f"\nNone of the {len(files)} CSV file(s) under "
               f"{os.path.abspath(args.csv_dir)} are Summaries exports.\n"
               f"  A Summaries CSV has the columns: {', '.join(NEEDED)}.\n"
@@ -192,7 +238,27 @@ def main():
         "SELECT DISTINCT freq FROM raw ORDER BY freq").fetchall()]
     print(f"\nFrequencies (MHz): {freqs}")
 
+    connection.execute("CHECKPOINT")     # so nothing is left only in the WAL
     connection.close()
+    if os.path.exists(build_path + ".wal"):
+        # Same hazard compact_db.py guards: renaming the .duckdb while its WAL
+        # sits beside it either strands the data or makes the file unopenable.
+        print(f"\nNOT replacing {os.path.basename(DB_PATH)}: "
+              f"{os.path.basename(build_path)}.wal still exists, so part of the "
+              f"build is not in the file yet. The previous database is untouched.",
+              file=sys.stderr)
+        return 1
+    if os.path.exists(DB_PATH):
+        bak = DB_PATH + ".bak"
+        if os.path.exists(bak):
+            os.remove(bak)
+        os.replace(DB_PATH, bak)
+        for w in (DB_PATH + ".wal",):
+            if os.path.exists(w):
+                os.replace(w, bak + ".wal")
+        print(f"  previous {os.path.basename(DB_PATH)} kept as "
+              f"{os.path.basename(bak)}")
+    os.replace(build_path, DB_PATH)
     size_gb = os.path.getsize(DB_PATH) / 1e9
     print(f"\nDone in {time.time()-t0:.0f}s. Database: {DB_PATH} ({size_gb:.2f} GB)")
     print("next: python serve.py")

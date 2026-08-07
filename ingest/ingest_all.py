@@ -72,6 +72,12 @@ import psd_ingest                                        # noqa: E402
 # anything else is named in the report instead of built.
 PSD_STATS = ("max", "median", "mean")
 
+# How many exports per sensor-and-statistic the geometry preflight opens. Two is
+# enough to catch a dataset in the wrong shape; ATLAS_PREFLIGHT_ALL=1 checks every
+# file, which is thorough and, on an on-demand filesystem, very slow.
+PREFLIGHT_SAMPLE = 2
+PREFLIGHT_ALL = os.environ.get("ATLAS_PREFLIGHT_ALL") == "1"
+
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -112,11 +118,23 @@ def run(argv, label, env=None, expected_bad=0):
     not a failure. A HIGHER count means something new went wrong and is still a
     failure, which is the distinction worth drawing.
     """
+    # Streamed, not captured. capture_output=True meant a step that runs for an
+    # hour printed absolutely nothing until it finished, so there was no way to
+    # tell progress from a hang -- and the summaries step, reading gigabytes off a
+    # network drive, is exactly that step. The output is still collected for the
+    # notable-line scan below; it is just also echoed as it arrives.
     try:
-        p = subprocess.run(argv, cwd=ROOT, env=env, capture_output=True, text=True)
+        p = subprocess.Popen(argv, cwd=ROOT, env=env, text=True,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, bufsize=1)
     except OSError as e:                                  # noqa: BLE001
         return "failed", str(e)
-    both = p.stdout + p.stderr
+    lines = []
+    for line in p.stdout:
+        lines.append(line)
+        print(f"    | {line.rstrip()}", flush=True)
+    p.wait()
+    both = "".join(lines)
     tail = both
     for line in notable_lines(both):
         log(f"  ! {line}")
@@ -164,15 +182,29 @@ _CSV_CON = None
 def csv_width(path):
     """-> (column count, None) or (None, why it cannot be read).
 
-    Asked of the SAME reader the ingest uses, not of a comma count. Splitting
-    the header on "," disagreed with read_csv_auto on two shapes that occur in
-    real exports: a quoted header field containing a comma (counted one column
-    too many, so a perfectly good file was reported as refused) and a
-    semicolon-delimited file (counted 0 columns, reported with a diagnosis that
-    was not the actual condition). LIMIT 0 fetches no rows, so this stays cheap
-    on a 12 MB export.
+    Reads ONE line and counts fields with the csv module, which handles a quoted
+    field containing a comma the same way the reader does. Splitting on "," got
+    that wrong (it reported a good file as refused); handing every file to
+    DuckDB's read_csv_auto got it right but cost ~1.8 s per 2251-column export
+    even on a local disk, because the sniffer samples rows to infer types. The
+    header is all this needs.
+
+    DuckDB is still the arbiter for the one case a comma count cannot judge: a
+    file whose delimiter is not a comma looks like a single column, and DuckDB
+    sniffs the real delimiter. That is rare, so paying for it there is fine.
     """
     global _CSV_CON
+    import csv
+    try:
+        with open(path, "r", errors="replace", newline="") as f:
+            head = f.readline()
+    except OSError as e:
+        return None, str(e)
+    if not head.strip():
+        return None, "file is empty"
+    n = len(next(csv.reader([head])))
+    if n > 1:
+        return n, None
     import duckdb
     if _CSV_CON is None:
         _CSV_CON = duckdb.connect()
@@ -182,8 +214,6 @@ def csv_width(path):
         return len(res.description), None
     except Exception as e:                                 # noqa: BLE001
         first = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
-        if not os.path.getsize(path):
-            return None, "file is empty"
         return None, f"unreadable as CSV: {first[:120]}"
 
 
@@ -197,7 +227,16 @@ def preflight(kind, directory, names):
     want = psd_ingest.NF if kind == "psd" else pfp_ingest.NPOS
     lead = 1 if kind == "psd" else 2          # timestamp [+ frequency for PFP]
     ok, bad = [], []
-    for n in sorted(names):
+    # SAMPLED, not exhaustive. Bin count is a property of the export product, not
+    # of one file, so reading a couple per group answers "is this dataset the
+    # shape the viewer draws" -- which is the actual question. Reading every file
+    # answered it ~9,500 times, and on a network or on-demand filesystem (Box
+    # Drive, OneDrive, a mounted share) each open is a download: measured 40
+    # minutes before the first capture was ingested. The ingest itself still
+    # rejects any individual bad file when it reaches it, with the same message.
+    todo = sorted(names)
+    checked = todo if PREFLIGHT_ALL else todo[:PREFLIGHT_SAMPLE]
+    for n in checked:
         cols, err = csv_width(os.path.join(directory, n))
         if cols is None:
             bad.append((n, err)); continue
@@ -207,6 +246,10 @@ def preflight(kind, directory, names):
                            f"needs exactly {want}"))
         else:
             ok.append(n)
+    # Files not sampled are assumed usable: the ingest is the authority, this is
+    # a heads-up. Without this they would look "unusable" and the group would be
+    # skipped entirely.
+    ok += [n for n in todo if n not in set(checked)]
     return ok, bad
 
 

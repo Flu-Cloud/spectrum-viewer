@@ -82,6 +82,55 @@ def stored_times(connection, base, sensor, kind):
     return np.concatenate(parts) if parts else np.empty(0, np.float64)
 
 
+def captures_per_day(times):
+    """{'YYYY-MM-DD': how many captures are stored on that UTC day}."""
+    if not len(times):
+        return {}
+    days, counts = np.unique((np.asarray(times) // 86400).astype(np.int64),
+                             return_counts=True)
+    return {str(np.datetime64(int(d), "D")): int(n)
+            for d, n in zip(days, counts)}
+
+
+# A day that a previous file only STRADDLED into holds a capture or two just
+# after midnight; a day that was really ingested holds hundreds (the real exports
+# carry 700-800). So the count alone decides almost every case, and the file only
+# has to be opened for the handful in between.
+STRADDLE_MAX = 4
+
+
+def day_is_ingested(day, per_day, stored_ms, first_time):
+    """Is this day's export already stored? `first_time` is called only if needed.
+
+    Reading each candidate file's own first capture is the exact test (see
+    already_have), but "exact" was costing far too much: on a network or
+    on-demand filesystem -- Box Drive, OneDrive, a mounted share -- opening a
+    file is a download, and this ran for every one of ~9,500 exports BEFORE the
+    first capture was ingested. Measured: 40 minutes with zero bytes written.
+
+    The count of stored captures on that day settles it without opening
+    anything:
+
+      0 captures            -> not ingested. Nothing to read.
+      more than STRADDLE_MAX -> ingested for real; a straddle cannot make
+                               hundreds of captures. Nothing to read.
+      1..STRADDLE_MAX       -> genuinely ambiguous, and the only case that
+                               reads the file.
+
+    So a fresh database opens nothing, a normal resume opens nothing, and the
+    exact check still runs exactly where the straddle bug lived.
+    """
+    n = per_day.get(day, 0)
+    if n == 0:
+        return False
+    if n > STRADDLE_MAX:
+        return True
+    t = first_time()
+    if t is None:
+        return True          # cannot tell; treat as done rather than duplicate
+    return already_have(stored_ms, t)
+
+
 def already_have(stored_ms, t):
     """Is this exact capture instant already stored? (milliseconds, as a set.)
 
@@ -158,6 +207,16 @@ class ChunkAppender:
             self.buf.append(p.tobytes() if hasattr(p, "tobytes") else p)
             if len(self.buf) >= self.limit:
                 self.flush()
+
+    def reset(self):
+        """Throw away whatever is buffered but not yet written.
+
+        Used on the rollback path: a day that failed must contribute nothing, and
+        captures still sitting in this buffer would otherwise be written out with
+        the NEXT day's flush -- inside the next day's transaction, so a rolled
+        back day would come back to life attached to a day that succeeded.
+        """
+        self.ts, self.buf = [], []
 
     def flush(self):
         if not self.buf:
